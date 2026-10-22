@@ -1,0 +1,79 @@
+# jjh7757/TIL — AWS배포환경/templates/deploy.yml 기반. APP_NAME 만 바꿨다.
+name: deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  APP_NAME: mahjong-recognizer
+  INSTANCE_ID: i-05ee0665bbba15a52
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS 자격증명 (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::403187831140:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR 로그인
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 빌드 & ECR 푸시
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$APP_NAME"
+          docker build --platform linux/arm64 --build-arg GIT_SHA="$SHA" -t "$IMAGE:$SHA" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$SHA"
+          docker push "$IMAGE:latest"
+
+      - name: SSM으로 배포
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "deploy $APP_NAME" \
+            --parameters "commands=[\"/usr/local/bin/deploy-app $APP_NAME $SHA\"]" \
+            --query "Command.CommandId" --output text)
+          echo "CommandId: $CMD_ID"
+          sleep 5
+          aws ssm wait command-executed \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" || true
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query Status --output text)
+          echo "----- 서버 출력 -----"
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardErrorContent --output text >&2
+          echo "---------------------"
+          if [ "$STATUS" != "Success" ]; then
+            echo "배포 실패: $STATUS"
+            exit 1
+          fi
+          echo "배포 성공"

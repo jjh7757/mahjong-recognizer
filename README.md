@@ -1,48 +1,57 @@
 # mahjong-recognizer
 
-리치마작 손패 사진에서 패를 검출해 돌려주는 서버. [mahjong_calc](../mahjong_calc) 앱의 2단계(사진 인식) 백엔드다.
+리치마작 손패 사진에서 패를 읽어 돌려주는 서버. [mahjong_calc](../mahjong_calc) 앱의 2단계(사진 인식) 백엔드.
+인식은 Gemini 비전 모델(기본 `gemini-3.8-flash`)이 하고, 이 서버는 키 보관·전처리·요청 제한을 맡는다.
 점수 계산은 하지 않는다 — 앱이 한다.
 
-- FastAPI + ONNX Runtime(CPU). 모델은 YOLO11n 을 ONNX 로 내보낸 것.
 - 배포: [jjh7757/TIL — AWS배포환경](https://github.com/jjh7757/TIL/tree/master/AWS배포환경)
   (GitHub Actions → ECR → SSM → EC2 t4g.small, Caddy 뒤에서 `mahjong-recognizer:8000`).
+- 주소: https://mahjong.ai-agent-develop.cloud
 
 ## API
 
 ```
-GET  /                      → {"status":"ok","model":"model"|null}
-POST /v1/recognize          multipart `image` (JPEG/PNG, 2MB 이하), 헤더 X-Api-Key
-  → {"tiles":[{"tile":"5m","conf":0.93,"box":[x,y,w,h],"row":0,"group":0}, ...],
-     "count":14, "model_version":"model", "image_size":[w,h], "infer_ms":420}
+GET  /                      → {"status":"ok","backend":"gemini","model":"gemini-3.8-flash"|null}
+POST /v1/recognize          multipart `image` (JPEG/PNG, 4MB 이하), 헤더 X-Api-Key
+  → {"tiles":[{"tile":"5m","conf":0.93}, ...], "count":13, "notes":"", "model":"gemini-3.8-flash", "latency_ms":15000}
 ```
 
-`tiles` 는 줄(row) → 왼쪽부터 순서. 옆 패와 패 폭의 60% 이상 떨어지면 `group` 이 바뀐다
-(손패와 부른 묶음을 띄워 놓으면 자동으로 나뉜다). 뒷면은 `back`.
+`tiles` 는 왼쪽부터 순서. 적도라는 `0m` `0p` `0s`. 자패는 `1z`(동)~`7z`(중).
+응답까지 10~20초 걸린다 — 앱은 진행 표시를 띄워야 한다.
 
-환경 변수: `RECOGNIZER_API_KEY`(비우면 인증 없음), `CONF_THRESHOLD`(기본 0.5), `MAX_UPLOAD_BYTES`.
+| 코드 | 뜻 |
+| --- | --- |
+| 401 | X-Api-Key 틀림 |
+| 413 | 이미지 4MB 초과 |
+| 429 | 분당 요청 한도 초과 (`RATE_PER_MIN`, 기본 20) |
+| 502 | Gemini 호출 실패 |
+| 503 | 서버에 GEMINI_API_KEY 없음 |
+
+## 입력 조건이 정확도를 결정한다
+
+실험([mahjong_calc/experiments/vlm/RESULTS.md](../mahjong_calc/experiments/vlm/RESULTS.md)) 기준:
+
+- 눕힌 손패를 위에서 찍어 손패만 보이게 → 실제 사진 13/13 정답
+- 테이블 전경(버림패·벽패 섞임, 서 있는 손패) → 거의 못 읽음
+
+앱은 가이드 프레임으로 손패 영역만 찍게 하고, 인식 결과는 사용자가 확인·수정하게 한다.
+
+## 환경 변수 (서버 `.env`)
+
+| 이름 | 값 |
+| --- | --- |
+| `RECOGNIZER_API_KEY` | 앱이 보내는 키. 비우면 인증 없음 |
+| `GEMINI_API_KEY` | Google AI Studio 키 |
+| `GEMINI_MODEL` | 기본 `gemini-3.8-flash` |
+| `GEMINI_THINKING` | `default` / `low` / `off` |
+| `RATE_PER_MIN`, `MAX_CONCURRENT`, `MAX_UPLOAD_BYTES` | 요청 제한 |
 
 ## 로컬 실행
 
 ```
 pip install -r requirements.txt
+set GEMINI_API_KEY=...
 uvicorn app.main:app --reload
 curl -F image=@hand.jpg -H "X-Api-Key: ..." http://localhost:8000/v1/recognize
 pytest
 ```
-
-## 모델 학습 (training/)
-
-```
-pip install ultralytics
-python training/gen_dataset.py training/dataset --train 600 --val 100
-python training/train.py training/dataset --epochs 20
-```
-
-`train.py` 가 `models/model.onnx` 와 `models/classes.json` 을 갱신한다. 패 이미지는
-[FluffyStuff/riichi-mahjong-tiles](https://github.com/FluffyStuff/riichi-mahjong-tiles)(CC0).
-실제 사진으로 재학습할 때는 같은 38클래스 라벨 체계를 쓴다.
-
-## 서버 측 설정 (한 번)
-
-`/srv/mahjong-recognizer/docker-compose.yml` 은 TIL 템플릿에 포트 8000, 메모리 상한 512M.
-`.env` 에 `RECOGNIZER_API_KEY` 하나.

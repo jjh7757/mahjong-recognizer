@@ -1,49 +1,73 @@
-"""마작 패 인식 서버.
+"""마작 패 인식 서버 (Gemini 비전).
 
-POST /v1/recognize  (multipart: image)  →  {"tiles": [...], "model_version": "...", "infer_ms": ...}
-GET  /              헬스체크. 모델이 없으면 "model": null 로 응답하되 200.
+POST /v1/recognize  (multipart: image, 헤더 X-Api-Key)
+  → {"tiles":[{"tile":"5m","conf":0.93},...], "count":13, "notes":"", "model":"gemini-3.8-flash", "latency_ms":15000}
+GET  /              헬스체크.
 """
 
 from __future__ import annotations
 
-import io
+import asyncio
 import logging
 import os
 import secrets
-from pathlib import Path
+import threading
+import time
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-from PIL import Image, ImageOps
 
-from .detector import Detector, arrange
+from .recognizer import GeminiRecognizer, prepare_image
 
 log = logging.getLogger("recognizer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-MODEL_DIR = Path(os.environ.get("MODEL_DIR", Path(__file__).resolve().parent.parent / "models"))
-MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 2 * 1024 * 1024))
 API_KEY = os.environ.get("RECOGNIZER_API_KEY", "")
-CONF = float(os.environ.get("CONF_THRESHOLD", 0.5))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low | off
+MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
+RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 20))
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2))
 
-app = FastAPI(title="mahjong-recognizer", version="0.1.0")
-detector: Detector | None = None
+app = FastAPI(title="mahjong-recognizer", version="0.2.0")
+recognizer: GeminiRecognizer | None = None
+_sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+
+class RateLimiter:
+    """분당 요청 수 제한(프로세스 전역). 비용 사고 방지용."""
+
+    def __init__(self, per_min: int):
+        self.per_min = per_min
+        self.calls: list[float] = []
+        self.lock = threading.Lock()
+
+    def allow(self) -> bool:
+        now = time.monotonic()
+        with self.lock:
+            self.calls = [t for t in self.calls if now - t < 60]
+            if len(self.calls) >= self.per_min:
+                return False
+            self.calls.append(now)
+            return True
+
+
+_limiter = RateLimiter(RATE_PER_MIN)
 
 
 @app.on_event("startup")
-def load_model() -> None:
-    global detector
-    model = MODEL_DIR / "model.onnx"
-    classes = MODEL_DIR / "classes.json"
-    if model.exists() and classes.exists():
-        detector = Detector(model, classes, conf=CONF)
-        log.info("model loaded: %s (%d classes, input %d)", model.name, len(detector.classes), detector.size)
+def startup() -> None:
+    global recognizer
+    if GEMINI_API_KEY:
+        recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING)
+        log.info("gemini recognizer ready: model=%s thinking=%s", GEMINI_MODEL, GEMINI_THINKING)
     else:
-        log.warning("model not found in %s — /v1/recognize 는 503 을 돌려준다", MODEL_DIR)
+        log.warning("GEMINI_API_KEY 가 없다 — /v1/recognize 는 503")
 
 
 @app.get("/")
 def health() -> dict:
-    return {"status": "ok", "model": detector.version if detector else None}
+    return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -56,26 +80,32 @@ def _check_key(x_api_key: str | None) -> None:
 @app.post("/v1/recognize")
 async def recognize(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     _check_key(x_api_key)
-    if detector is None:
-        raise HTTPException(status_code=503, detail="model not loaded")
+    if recognizer is None:
+        raise HTTPException(status_code=503, detail="recognizer not configured")
+    if not _limiter.allow():
+        raise HTTPException(status_code=429, detail="too many requests")
 
     data = await image.read()
     if len(data) > MAX_UPLOAD:
         raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
     try:
-        img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img).convert("RGB")
+        jpeg = prepare_image(data)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
 
-    dets, infer_s = detector.detect(img)
-    tiles = arrange(dets)
-    log.info("recognize %s %dx%d -> %d tiles in %.0f ms", image.filename, img.width, img.height,
-             len(tiles), infer_s * 1000)
+    async with _sem:
+        try:
+            result = await asyncio.to_thread(recognizer.recognize, jpeg)
+        except Exception as e:  # noqa: BLE001
+            log.exception("gemini call failed")
+            raise HTTPException(status_code=502, detail=f"recognition failed: {type(e).__name__}") from e
+
+    log.info("recognize %s -> %d tiles in %d ms (tokens %d+%d)", image.filename, len(result.tiles),
+             result.latency_ms, result.input_tokens, result.output_tokens)
     return {
-        "tiles": tiles,
-        "count": len(tiles),
-        "model_version": detector.version,
-        "image_size": [img.width, img.height],
-        "infer_ms": round(infer_s * 1000),
+        "tiles": result.tiles,
+        "count": len(result.tiles),
+        "notes": result.notes,
+        "model": result.model,
+        "latency_ms": result.latency_ms,
     }

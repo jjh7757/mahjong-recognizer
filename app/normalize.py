@@ -158,6 +158,7 @@ def normalize_table(data: dict) -> dict:
             last_conf[it["side"]] = _conf(it.get("confidence", 0))
     return {
         "dora_indicators": _tiles(data.get("dora_indicators")),
+        "ura_dora_indicators": _tiles(data.get("ura_dora_indicators")),
         "riichi": riichi,
         "riichi_conf": riichi_conf,
         "last_discards": last,

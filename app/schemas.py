@@ -138,6 +138,11 @@ TABLE_SCHEMA = {
             "description": "왕패 위에 뒤집혀 앞면이 보이는 도라 표시패. 왼쪽부터. 보통 1장",
             "items": _tile(),
         },
+        "ura_dora_indicators": {
+            "type": "array",
+            "description": "리치 화료 뒤 공개한 뒷도라 표시패(도라 표시패 아랫단을 뒤집은 것). 공개 안 됐으면 빈 배열",
+            "items": _tile(),
+        },
         "riichi": {
             "type": "array",
             "description": "자리별 리치 여부. 강에 옆으로 눕힌 패가 있거나 리치봉 표시등이 켜져 있으면 true",
@@ -166,5 +171,5 @@ TABLE_SCHEMA = {
         },
         "notes": _NOTES,
     },
-    "required": ["dora_indicators", "riichi", "last_discards", "notes"],
+    "required": ["dora_indicators", "ura_dora_indicators", "riichi", "last_discards", "notes"],
 }

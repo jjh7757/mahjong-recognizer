@@ -10,7 +10,8 @@ POST /v1/locate     테이블 전경(긴 변 1024 정도로 줄인 것)
      "rivers":[...], "dead_wall":{"box":[...],"conf":..}|null, "center":{"box":[...]}|null,
      "face_up_sides":["bottom"], ...}
 POST /v1/table      테이블 중앙 크롭(강 4개 + 왕패)
-  → {"dora_indicators":[{"tile":"3p","conf":0.9}], "riichi":{"bottom":true,...}, "riichi_conf":{...},
+  → {"dora_indicators":[{"tile":"3p","conf":0.9}], "ura_dora_indicators":[...](리치 화료 뒤 공개했을 때만),
+     "riichi":{"bottom":true,...}, "riichi_conf":{...},
      "last_discards":{"bottom":"7s","top":null,...}, "last_discards_conf":{...}, ...}
 GET  /              헬스체크.
 
@@ -152,8 +153,9 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
     jpeg = await _accept(image, x_api_key)
     c: GeminiCall = await _call(recognizer.read_table, jpeg)
     d = c.data
-    log.info("table %s -> dora=%s riichi=%s last=%s in %d ms (tokens %d+%d) notes=%r",
+    log.info("table %s -> dora=%s ura=%s riichi=%s last=%s in %d ms (tokens %d+%d) notes=%r",
              image.filename, " ".join(t["tile"] for t in d["dora_indicators"]),
+             " ".join(t["tile"] for t in d["ura_dora_indicators"]),
              [s for s, v in d["riichi"].items() if v], d["last_discards"],
              c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
     return {**d, "model": c.model, "latency_ms": c.latency_ms}

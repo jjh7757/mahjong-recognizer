@@ -40,6 +40,7 @@ class FakeRecognizer:
     def read_table(self, jpeg: bytes) -> GeminiCall:
         return GeminiCall({
             "dora_indicators": [{"tile": "3p", "conf": 0.9}],
+            "ura_dora_indicators": [{"tile": "6m", "conf": 0.8}],
             "riichi": {"bottom": True, "right": False, "top": False, "left": False},
             "riichi_conf": {"bottom": 0.9, "right": 0.5, "top": 0.5, "left": 0.5},
             "last_discards": {"bottom": "7s", "right": None, "top": None, "left": "1z"},
@@ -102,6 +103,7 @@ def test_table(monkeypatch):
     with _client(monkeypatch) as client:
         body = client.post("/v1/table", files=_upload()).json()
         assert body["dora_indicators"] == [{"tile": "3p", "conf": 0.9}]
+        assert body["ura_dora_indicators"] == [{"tile": "6m", "conf": 0.8}]
         assert body["riichi"] == {"bottom": True, "right": False, "top": False, "left": False}
         assert body["last_discards"]["left"] == "1z" and body["last_discards"]["top"] is None
 

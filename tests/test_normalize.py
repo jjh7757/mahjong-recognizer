@@ -63,9 +63,20 @@ def test_table_defaults_every_side():
                           {"side": "right", "code": "??", "confidence": 0.7}],
     })
     assert out["dora_indicators"] == [{"tile": "3p", "conf": 0.9}]
+    assert out["ura_dora_indicators"] == []  # 없으면 빈 배열
     assert out["riichi"] == {"bottom": False, "right": False, "top": False, "left": True}
     assert out["riichi_conf"]["left"] == 0.8
     assert out["last_discards"] == {"bottom": "7s", "right": None, "top": None, "left": None}
+
+
+def test_table_ura_dora():
+    out = normalize_table({
+        "dora_indicators": [{"code": "3p", "confidence": 0.9}],
+        "ura_dora_indicators": [{"code": "0m", "confidence": 0.7}, {"code": "x", "confidence": 1}],
+        "riichi": [],
+        "last_discards": [],
+    })
+    assert out["ura_dora_indicators"] == [{"tile": "0m", "conf": 0.7}]
 
 
 def test_meld_consistency_flags_but_keeps():

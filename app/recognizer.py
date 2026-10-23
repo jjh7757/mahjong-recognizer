@@ -1,7 +1,11 @@
-"""Gemini 비전 모델로 마작 손패 사진에서 패를 읽는다.
+"""Gemini 비전 모델 호출.
 
-입력은 "눕힌 손패를 위에서 찍은 사진" 을 전제로 한다. 테이블 전경처럼 버림패·벽패가 섞인
-사진은 정확도가 크게 떨어진다 (experiments/vlm/RESULTS.md).
+세 가지 읽기가 있다 (설계: mahjong_calc/docs/table_reading_design.md).
+- recognize():  눕힌 손패 크롭 → 손패·울기·화료패
+- locate():     테이블 전경(줄인 것) → 손패·강·왕패 영역 좌표
+- read_table(): 테이블 중앙 크롭 → 도라 표시패·리치·마지막 버림패
+
+패 한 장이 100px 이상 찍혀야 읽힌다 (experiments/vlm/RESULTS.md). 전경 사진을 그대로 읽히면 안 된다.
 """
 
 from __future__ import annotations
@@ -9,52 +13,24 @@ from __future__ import annotations
 import io
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PIL import Image, ImageOps
 
-TILE_CODES = (
-    [f"{n}m" for n in range(1, 10)]
-    + [f"{n}p" for n in range(1, 10)]
-    + [f"{n}s" for n in range(1, 10)]
-    + [f"{n}z" for n in range(1, 8)]
-    + ["0m", "0p", "0s"]
-)
+from .normalize import normalize_hand, normalize_locate, normalize_table
+from .prompts import HAND_PROMPT, LOCATE_PROMPT, TABLE_PROMPT
+from .schemas import HAND_SCHEMA, LOCATE_SCHEMA, TABLE_SCHEMA, TILE_CODES  # noqa: F401  (TILE_CODES 재수출)
 
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "tiles": {
-            "type": "array",
-            "description": "사진에 보이는 패를 왼쪽에서 오른쪽 순서로",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "enum": TILE_CODES},
-                    "confidence": {"type": "number", "description": "0~1 확신도"},
-                },
-                "required": ["code", "confidence"],
-            },
-        },
-        "notes": {"type": "string", "description": "가려짐, 흐림 등 특이사항. 없으면 빈 문자열"},
-    },
-    "required": ["tiles", "notes"],
-}
 
-PROMPT = """이 사진은 리치마작(일본식 마작) 손패를 찍은 것입니다. 사진에 보이는 패를 전부, 왼쪽에서 오른쪽 순서로 읽어 주세요. 두 줄이면 윗줄부터 읽습니다.
+@dataclass
+class GeminiCall:
+    """한 번의 호출 결과. data 는 normalize 를 거친 dict."""
 
-표기법:
-- 만수(萬): 1m~9m. 한자 숫자(一二三四五六七八九) 위에 萬 이 있는 패.
-- 통수(筒): 1p~9p. 동그라미 개수.
-- 삭수(索): 1s~9s. 대나무 막대 개수. 1s 는 새 그림.
-- 자패: 동 1z, 남 2z, 서 3z, 북 4z, 백(빈 패 또는 테두리만) 5z, 발(綠 發) 6z, 중(붉은 中) 7z.
-- 적도라(붉은 5): 0m, 0p, 0s. 5인데 글자나 무늬 전체가 붉게 그려진 패만 해당합니다.
-
-주의:
-- 뒤집힌 패, 옆으로 눕힌 패, 멀리 있는 다른 사람의 패나 버림패는 읽지 않습니다.
-- 같은 패가 여러 장이면 장수만큼 반복해 적습니다.
-- 각 패마다 확신도(0~1)를 적어 주세요. 헷갈리는 패는 낮게 주세요.
-- 보이는 패 수를 먼저 세고, 그 수만큼 정확히 나열하세요. 없는 패를 만들지 마세요."""
+    data: dict
+    latency_ms: int
+    input_tokens: int
+    output_tokens: int
+    model: str
 
 
 @dataclass
@@ -65,6 +41,8 @@ class RecognizeResult:
     input_tokens: int
     output_tokens: int
     model: str
+    melds: list[dict] = field(default_factory=list)
+    win_tile: dict | None = None
 
 
 def prepare_image(data: bytes, max_side: int = 1568) -> bytes:
@@ -91,22 +69,23 @@ class GeminiRecognizer:
         self.thinking = thinking
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout_s * 1000)))
 
-    def _config(self):
+    def _config(self, schema: dict):
         types = self._types
-        kwargs = dict(response_mime_type="application/json", response_schema=RESPONSE_SCHEMA)
+        kwargs = dict(response_mime_type="application/json", response_schema=schema)
         if self.thinking == "off":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         elif self.thinking == "low":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
         return types.GenerateContentConfig(**kwargs)
 
-    def recognize(self, jpeg: bytes) -> RecognizeResult:
+    def call(self, jpeg: bytes, prompt: str, schema: dict) -> GeminiCall:
+        """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전)."""
         types = self._types
         t0 = time.perf_counter()
         response = self.client.models.generate_content(
             model=self.model,
-            contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), PROMPT],
-            config=self._config(),
+            contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
+            config=self._config(schema),
         )
         latency_ms = round((time.perf_counter() - t0) * 1000)
         um = response.usage_metadata
@@ -115,9 +94,20 @@ class GeminiRecognizer:
         if not response.text:
             reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
             raise RuntimeError(f"empty response ({reason})")
-        data = json.loads(response.text)
-        tiles = [
-            {"tile": t["code"], "conf": round(float(t.get("confidence", 0)), 3)}
-            for t in data.get("tiles", []) if t.get("code") in TILE_CODES
-        ]
-        return RecognizeResult(tiles, data.get("notes", ""), latency_ms, inp, out, self.model)
+        return GeminiCall(json.loads(response.text), latency_ms, inp, out, self.model)
+
+    def recognize(self, jpeg: bytes) -> RecognizeResult:
+        c = self.call(jpeg, HAND_PROMPT, HAND_SCHEMA)
+        h = normalize_hand(c.data)
+        return RecognizeResult(h["tiles"], h["notes"], c.latency_ms, c.input_tokens, c.output_tokens, self.model,
+                               melds=h["melds"], win_tile=h["win_tile"])
+
+    def locate(self, jpeg: bytes) -> GeminiCall:
+        c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA)
+        c.data = normalize_locate(c.data)
+        return c
+
+    def read_table(self, jpeg: bytes) -> GeminiCall:
+        c = self.call(jpeg, TABLE_PROMPT, TABLE_SCHEMA)
+        c.data = normalize_table(c.data)
+        return c

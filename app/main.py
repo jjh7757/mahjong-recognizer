@@ -43,7 +43,8 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low 
 LOCATE_THINKING = os.environ.get("LOCATE_THINKING", "default")
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))  # 화료 1회 = 3호출
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 4))
+# 화료 1회 = locate 1 + 판독 최대 10호출(손패·울기·강 4·가운데·왕패)을 동시에 보낸다. 4 로 두면 판독이 줄을 서 2~3배 느려졌다(2026-10-24).
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 16))
 
 app = FastAPI(title="mahjong-recognizer", version="0.3.0")
 recognizer: GeminiRecognizer | None = None
@@ -77,8 +78,8 @@ def startup() -> None:
     if GEMINI_API_KEY:
         recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
                                       locate_thinking=LOCATE_THINKING)
-        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s",
-                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING)
+        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d",
+                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 
@@ -107,7 +108,7 @@ async def _accept(image: UploadFile, x_api_key: str | None) -> bytes:
     if len(data) > MAX_UPLOAD:
         raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
     try:
-        return prepare_image(data)
+        return await asyncio.to_thread(prepare_image, data)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
 

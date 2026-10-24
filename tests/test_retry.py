@@ -1,3 +1,6 @@
+import threading
+import time
+
 import httpx
 import pytest
 from google.genai import errors
@@ -12,18 +15,25 @@ class _Resp:
 
 
 class _Models:
-    def __init__(self, fails):
-        self.fails = list(fails)
-        self.calls = []
+    """요청마다 behaviors 를 하나씩 꺼내 쓴다: 예외면 던지고, 숫자면 그만큼 잠든 뒤 답한다."""
+
+    def __init__(self, behaviors):
+        self.behaviors = list(behaviors)
+        self.calls = 0
+        self.lock = threading.Lock()
 
     def generate_content(self, model, contents, config):
-        self.calls.append(config.http_options.timeout)
-        if self.fails:
-            raise self.fails.pop(0)
+        with self.lock:
+            self.calls += 1
+            b = self.behaviors.pop(0) if self.behaviors else 0
+        assert config.http_options is None  # Gemini 에 기한을 넘기지 않는다
+        if isinstance(b, Exception):
+            raise b
+        time.sleep(b)
         return _Resp()
 
 
-def _rec(fails, attempts=2):
+def _rec(behaviors, attempts=2, hedge_s=0.05):
     r = GeminiRecognizer.__new__(GeminiRecognizer)
     from google.genai import types
 
@@ -31,26 +41,45 @@ def _rec(fails, attempts=2):
     r.model = "fake"
     r.thinking = "default"
     r.locate_thinking = "default"
-    r.call_timeout_s = 20.0
-    r.locate_timeout_s = 40.0
+    r.hedge_s = hedge_s
+    r.locate_hedge_s = 35.0
     r.attempts = attempts
-    r.client = type("C", (), {"models": _Models(fails)})()
+    r.client = type("C", (), {"models": _Models(behaviors)})()
     return r
 
 
-def test_timeout_then_success_retries_once():
-    r = _rec([httpx.ReadTimeout("slow")])
+def _deadline():
+    return errors.ServerError(504, {"error": {"code": 504, "message": "Deadline", "status": "DEADLINE_EXCEEDED"}})
+
+
+def test_slow_first_request_is_hedged_and_fast_one_wins():
+    r = _rec([1.0, 0])
+    t = time.perf_counter()
     c = r.call(b"jpeg", "p", {"type": "object"})
     assert c.data == {"tiles": []}
-    assert r.client.models.calls == [20000, 20000]
+    assert r.client.models.calls == 2
+    assert time.perf_counter() - t < 0.5
 
 
-def test_server_error_retries_then_raises():
-    err = errors.ServerError(504, {"error": {"code": 504, "message": "Deadline", "status": "DEADLINE_EXCEEDED"}})
-    r = _rec([err, err])
+def test_fast_answer_sends_only_one():
+    r = _rec([0])
+    r.call(b"jpeg", "p", {"type": "object"})
+    assert r.client.models.calls == 1
+
+
+def test_server_error_sends_another_at_once():
+    r = _rec([_deadline(), 0], hedge_s=5)
+    t = time.perf_counter()
+    r.call(b"jpeg", "p", {"type": "object"})
+    assert r.client.models.calls == 2
+    assert time.perf_counter() - t < 1
+
+
+def test_timeout_then_failure_raises_last_error():
+    r = _rec([httpx.ReadTimeout("slow"), _deadline()])
     with pytest.raises(errors.ServerError):
         r.call(b"jpeg", "p", {"type": "object"})
-    assert len(r.client.models.calls) == 2
+    assert r.client.models.calls == 2
 
 
 def test_client_error_is_not_retried():
@@ -58,16 +87,20 @@ def test_client_error_is_not_retried():
     r = _rec([err])
     with pytest.raises(errors.ClientError):
         r.call(b"jpeg", "p", {"type": "object"})
-    assert len(r.client.models.calls) == 1
+    assert r.client.models.calls == 1
 
 
-class _LocResp(_Resp):
-    text = '{"hands": [], "rivers": [], "melds": [], "dead_wall": null, "center": null, "notes": ""}'
-
-
-def test_locate_uses_longer_timeout():
+def test_locate_uses_longer_hedge():
     r = _rec([])
-    r.client.models.generate_content = lambda model, contents, config: (
-        r.client.models.calls.append(config.http_options.timeout) or _LocResp())
+    seen = {}
+
+    def fake_call(jpeg, prompt, schema, thinking=None, hedge_s=None):
+        seen["hedge_s"] = hedge_s
+        from app.recognizer import GeminiCall
+
+        return GeminiCall({"hands": [], "rivers": [], "melds": [], "dead_wall": None, "center": None, "notes": ""},
+                          1, 0, 0, "fake")
+
+    r.call = fake_call
     r.locate(b"jpeg")
-    assert r.client.models.calls == [40000]
+    assert seen["hedge_s"] == 35.0

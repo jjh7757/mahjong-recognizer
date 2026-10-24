@@ -14,6 +14,7 @@ import io
 import json
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageOps
@@ -23,6 +24,9 @@ from .prompts import HAND_PROMPT, LOCATE_PROMPT, TABLE_PROMPT
 from .schemas import HAND_SCHEMA, LOCATE_SCHEMA, TABLE_SCHEMA, TILE_CODES  # noqa: F401  (TILE_CODES 재수출)
 
 log = logging.getLogger("recognizer")
+
+# 늦은 요청은 버리지 않고 클라이언트 시간 제한(90초)까지 스레드를 잡고 있으므로 넉넉히 둔다.
+_hedge_pool = ThreadPoolExecutor(max_workers=48, thread_name_prefix="gemini")
 
 
 def _retryable(e: Exception) -> bool:
@@ -72,7 +76,7 @@ def prepare_image(data: bytes, max_side: int = 1568) -> bytes:
 class GeminiRecognizer:
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash", thinking: str = "default",
                  timeout_s: float = 90.0, locate_thinking: str | None = None,
-                 call_timeout_s: float = 20.0, locate_timeout_s: float = 40.0, attempts: int = 2):
+                 hedge_s: float = 12.0, locate_hedge_s: float = 35.0, attempts: int = 2):
         from google import genai
         from google.genai import types
 
@@ -80,19 +84,19 @@ class GeminiRecognizer:
         self.model = model
         self.thinking = thinking
         self.locate_thinking = locate_thinking or thinking
-        # Gemini 호출 하나가 가끔 응답 없이 90초 넘게 멈춘다(2026-10-24 매장 실험, 평소 4~6초).
-        # 호출마다 짧게 끊고 한 번 더 보낸다. locate 는 생각이 길어 평소 15~27초라 따로 둔다.
-        self.call_timeout_s = call_timeout_s
-        self.locate_timeout_s = locate_timeout_s
+        # Gemini 호출 하나가 가끔 응답 없이 90초 넘게 멈춘다(2026-10-24 매장 실험, 평소 4~9초).
+        # [hedge_s] 초 안에 답이 없으면 같은 요청을 하나 더 보내 먼저 온 답을 쓴다. 요청에 기한(HttpOptions timeout)을
+        # 주면 Gemini 가 그 기한에 504 DEADLINE_EXCEEDED 로 끊어 재시도까지 둘 다 실패하는 일이 잦았다(b2d1861).
+        # locate 는 생각이 길어 평소 15~30초라 따로 둔다.
+        self.hedge_s = hedge_s
+        self.locate_hedge_s = locate_hedge_s
         self.attempts = max(1, attempts)
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout_s * 1000)))
 
-    def _config(self, schema: dict, thinking: str | None = None, timeout_s: float | None = None):
+    def _config(self, schema: dict, thinking: str | None = None):
         types = self._types
         thinking = thinking or self.thinking
         kwargs = dict(response_mime_type="application/json", response_schema=schema)
-        if timeout_s:
-            kwargs["http_options"] = types.HttpOptions(timeout=int(timeout_s * 1000))
         if thinking == "off":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         elif thinking == "low":
@@ -100,24 +104,46 @@ class GeminiRecognizer:
         return types.GenerateContentConfig(**kwargs)
 
     def call(self, jpeg: bytes, prompt: str, schema: dict, thinking: str | None = None,
-             timeout_s: float | None = None) -> GeminiCall:
-        """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전). 시간 초과·5xx 면 [attempts] 번까지 다시 보낸다."""
+             hedge_s: float | None = None) -> GeminiCall:
+        """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전).
+
+        [hedge_s] 초 안에 답이 없거나 시간 초과·5xx 로 실패하면 같은 요청을 하나 더 보내(모두 [attempts] 개까지)
+        먼저 성공한 답을 쓴다. 늦은 요청은 끊지 않는다(토큰은 들지만 늦게라도 이길 수 있다).
+        """
         types = self._types
-        timeout_s = timeout_s or self.call_timeout_s
+        hedge_s = hedge_s or self.hedge_s
         t0 = time.perf_counter()
-        for attempt in range(1, self.attempts + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
-                    config=self._config(schema, thinking, timeout_s),
-                )
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt == self.attempts or not _retryable(e):
-                    raise
-                log.warning("gemini call retry %d/%d after %.1fs: %s", attempt, self.attempts,
-                            time.perf_counter() - t0, type(e).__name__)
+
+        def once():
+            return self.client.models.generate_content(
+                model=self.model,
+                contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
+                config=self._config(schema, thinking),
+            )
+
+        pending = {_hedge_pool.submit(once)}
+        sent = 1
+        response = None
+        last_error: Exception | None = None
+        while pending and response is None:
+            done, pending = wait(pending, timeout=hedge_s if sent < self.attempts else None,
+                                 return_when=FIRST_COMPLETED)
+            failed = False
+            for f in done:
+                try:
+                    response = f.result()
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if not _retryable(e):
+                        raise
+                    last_error, failed = e, True
+            if response is None and sent < self.attempts and (failed or not done):
+                log.warning("gemini call hedge %d/%d after %.1fs: %s", sent + 1, self.attempts,
+                            time.perf_counter() - t0, type(last_error).__name__ if failed else "slow")
+                pending.add(_hedge_pool.submit(once))
+                sent += 1
+        if response is None:
+            raise last_error or RuntimeError("no response")
         latency_ms = round((time.perf_counter() - t0) * 1000)
         um = response.usage_metadata
         inp = (um.prompt_token_count or 0) if um else 0
@@ -135,7 +161,7 @@ class GeminiRecognizer:
 
     def locate(self, jpeg: bytes) -> GeminiCall:
         c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA, thinking=self.locate_thinking,
-                      timeout_s=self.locate_timeout_s)
+                      hedge_s=self.locate_hedge_s)
         c.data = normalize_locate(c.data)
         return c
 

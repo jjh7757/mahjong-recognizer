@@ -109,6 +109,19 @@ LOCATE_SCHEMA = {
                 "required": ["side", "box", "confidence"],
             },
         },
+        "melds": {
+            "type": "array",
+            "description": "손패와 따로 놓인 울기 묶음(앞면 3~4장)마다 상자 하나. 테이블 모서리 쪽에 떨어져 있을 수 있음. 없으면 빈 배열",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "side": {"type": "string", "enum": SIDES},
+                    "box": _BOX,
+                    "confidence": {"type": "number"},
+                },
+                "required": ["side", "box", "confidence"],
+            },
+        },
         "dead_wall": {
             "type": "object",
             "description": "뒤집힌 도라 표시패가 있는 왕패(벽패 더미) 영역. 없으면 null",

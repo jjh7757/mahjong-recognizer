@@ -1,6 +1,7 @@
 """관찰 전용 판독(/v2/*). 모델은 보이는 패만 고정된 JSON 으로 적고, 판단은 앱 코드가 한다.
 
 - 손패 크롭 → 깐 손패, 떨어뜨려 놓은 한 장, 울기 묶음(패·옆으로 눕힌 위치·뒤집힌 위치)
+- 울기 크롭(locate 의 melds 상자, 그 자리 방향으로 세운 것) → 묶음 하나
 - 강 크롭(그 자리 사람이 보는 방향으로 세운 것) → 버린 순서대로 패와 가로 여부, 리치봉
 - 가운데·왕패 크롭 → 앞면 표시패 전부, 자리별 리치봉
 
@@ -73,6 +74,22 @@ RIVER_SCHEMA_V2 = {
     "required": ["tiles", "riichi_stick", "notes"],
 }
 
+MELD_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "tiles": {
+            "type": "array",
+            "description": "울기 묶음의 패를 왼쪽부터(3~4장). 뒤집혀 뒷면만 보이는 패는 같은 묶음의 앞면 패와 같은 것으로 적음",
+            "items": {"type": "string", "enum": TILE_CODES},
+        },
+        "sideways": {**_INDEXES, "description": "옆으로(90도) 눕혀 놓은 패의 위치(0부터)"},
+        "face_down": {**_INDEXES, "description": "뒤집혀 뒷면만 보이는 패의 위치(0부터)"},
+        "confidence": {"type": "number"},
+        "notes": _NOTES,
+    },
+    "required": ["tiles", "sideways", "face_down", "confidence", "notes"],
+}
+
 CENTER_SCHEMA_V2 = {
     "type": "object",
     "properties": {
@@ -125,6 +142,16 @@ RIVER_PROMPT_V2 = f"""이 사진은 리치마작 한 플레이어의 버림패 �
 {NOTATION}
 
 보이는 버림패 수를 먼저 세고 그 수만큼 정확히 나열하세요. 각 패의 확신도(0~1)를 적어 주세요."""
+
+MELD_PROMPT_V2 = f"""이 사진은 리치마작 한 플레이어의 울기 묶음(퐁·치·깡) 하나를 그 사람 쪽에서 본 방향으로 세운 것입니다. {_ONLY_SEE}
+
+- tiles: 묶음의 패를 왼쪽부터 3~4장. 뒤집혀 뒷면만 보이는 패는 같은 묶음의 앞면 패와 같은 것으로 적습니다.
+- sideways: 옆으로(90도) 눕혀 놓은 패의 위치(0부터). face_down: 뒤집힌 패의 위치(0부터).
+- 사진 가장자리에 걸친 다른 패(손패, 도라 표시패, 버림패)는 적지 않습니다.
+
+{NOTATION}
+
+확신도(0~1)를 적어 주세요."""
 
 CENTER_PROMPT_V2 = f"""이 사진은 리치마작 자동탁의 가운데(또는 패산 끝의 왕패 부근)를 위에서 찍은 것입니다. {_ONLY_SEE}
 
@@ -190,6 +217,20 @@ def normalize_river_v2(data: dict) -> dict:
         if c:
             tiles.append({**c, "sideways": bool(t.get("sideways", False))})
     return {"tiles": tiles, "riichi_stick": bool(data.get("riichi_stick", False)), "notes": str(data.get("notes") or "")}
+
+
+def normalize_meld_v2(data: dict) -> dict:
+    """→ {tiles:[code], sideways:[int], face_down:[int], conf, notes}. 3~4장이 아니면 tiles 를 비운다."""
+    tiles = [t for t in data.get("tiles") or [] if t in TILE_CODES]
+    if len(tiles) not in (3, 4):
+        tiles = []
+    return {
+        "tiles": tiles,
+        "sideways": _indexes(data.get("sideways"), len(tiles)),
+        "face_down": _indexes(data.get("face_down"), len(tiles)),
+        "conf": _conf(data.get("confidence", 0)),
+        "notes": str(data.get("notes") or ""),
+    }
 
 
 def normalize_center_v2(data: dict) -> dict:

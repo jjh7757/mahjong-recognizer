@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 
 from app import main as server
-from app.observe import normalize_center_v2, normalize_hand_v2, normalize_river_v2
+from app.normalize import normalize_locate
+from app.observe import normalize_center_v2, normalize_hand_v2, normalize_meld_v2, normalize_river_v2
 from app.recognizer import GeminiCall
 from tests.test_api import FakeRecognizer, _upload
 
@@ -60,3 +61,15 @@ def test_v2_endpoints_return_usage(monkeypatch):
     j = r.json()
     assert j["tiles"][0]["tile"] == "2s"
     assert j["usage"] == {"input_tokens": 7, "output_tokens": 3}
+
+
+def test_meld_v2_and_locate_melds():
+    assert normalize_meld_v2({"tiles": ["6z", "6z", "6z"], "sideways": [2], "face_down": [], "confidence": 0.9})["tiles"] == ["6z"] * 3
+    assert normalize_meld_v2({"tiles": ["6z", "6z"], "sideways": [], "face_down": []})["tiles"] == []
+    loc = normalize_locate({
+        "hands": [], "rivers": [], "dead_wall": None, "center": None, "notes": "",
+        "melds": [{"side": "top", "box": [20, 300, 60, 380], "confidence": 0.9},
+                  {"side": "top", "box": [20, 400, 60, 480], "confidence": 0.8},
+                  {"side": "x", "box": [0, 0, 1, 1]}],
+    })
+    assert [m["box"] for m in loc["melds"]] == [[20, 300, 60, 380], [20, 400, 60, 480]]

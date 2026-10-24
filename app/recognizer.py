@@ -113,12 +113,13 @@ class GeminiRecognizer:
         return c
 
     def observe(self, jpeg: bytes, kind: str) -> GeminiCall:
-        """/v2 관찰 전용 판독. kind = hand | river | center."""
+        """/v2 관찰 전용 판독. kind = hand | river | meld | center."""
         from . import observe as ob
 
         prompt, schema, norm = {
             "hand": (ob.HAND_PROMPT_V2, ob.HAND_SCHEMA_V2, ob.normalize_hand_v2),
             "river": (ob.RIVER_PROMPT_V2, ob.RIVER_SCHEMA_V2, ob.normalize_river_v2),
+            "meld": (ob.MELD_PROMPT_V2, ob.MELD_SCHEMA_V2, ob.normalize_meld_v2),
             "center": (ob.CENTER_PROMPT_V2, ob.CENTER_SCHEMA_V2, ob.normalize_center_v2),
         }[kind]
         c = self.call(jpeg, prompt, schema)

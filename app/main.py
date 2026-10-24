@@ -82,7 +82,7 @@ def startup() -> None:
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
-            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/center"]}
+            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center"]}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -185,6 +185,12 @@ async def observe_hand(image: UploadFile = File(...), x_api_key: str | None = He
 async def observe_river(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """강 크롭 하나(그 자리 사람 방향으로 세운 것) → 버린 순서대로 패·가로 여부, 리치봉."""
     return await _observe("river", image, x_api_key)
+
+
+@app.post("/v2/meld")
+async def observe_meld(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """울기 묶음 크롭 하나(그 자리 사람 방향으로 세운 것) → 패·가로 위치·뒤집힌 위치."""
+    return await _observe("meld", image, x_api_key)
 
 
 @app.post("/v2/center")

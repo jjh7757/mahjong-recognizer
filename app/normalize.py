@@ -131,9 +131,16 @@ def normalize_locate(data: dict) -> dict:
         ys = [r["box"][0] for r in rivers] + [r["box"][2] for r in rivers]
         xs = [r["box"][1] for r in rivers] + [r["box"][3] for r in rivers]
         center = {"box": [min(ys), min(xs), max(ys), max(xs)]}
+    melds = []
+    for it in data.get("melds") or []:
+        if isinstance(it, dict) and it.get("side") in SIDES:
+            box = normalize_box(it.get("box"))
+            if box is not None:
+                melds.append({"side": it["side"], "box": box, "conf": _conf(it.get("confidence", 0))})
     return {
         "hands": hands,
         "rivers": rivers,
+        "melds": melds,
         "dead_wall": _boxed(data.get("dead_wall")),
         "center": center,
         "face_up_sides": [h["side"] for h in hands if h["face_up"]],

@@ -39,6 +39,8 @@ API_KEY = os.environ.get("RECOGNIZER_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low | off
+# 구역 나누기(locate)는 낮은 생각에서 모서리 울기·왕패를 자주 놓친다(2026-10-24 매장 실험). 따로 정한다.
+LOCATE_THINKING = os.environ.get("LOCATE_THINKING", "default")
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))  # 화료 1회 = 3호출
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 4))
@@ -73,8 +75,10 @@ _limiter = RateLimiter(RATE_PER_MIN)
 def startup() -> None:
     global recognizer
     if GEMINI_API_KEY:
-        recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING)
-        log.info("gemini recognizer ready: model=%s thinking=%s", GEMINI_MODEL, GEMINI_THINKING)
+        recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
+                                      locate_thinking=LOCATE_THINKING)
+        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s",
+                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 

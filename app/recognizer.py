@@ -60,32 +60,34 @@ def prepare_image(data: bytes, max_side: int = 1568) -> bytes:
 
 class GeminiRecognizer:
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash", thinking: str = "default",
-                 timeout_s: float = 90.0):
+                 timeout_s: float = 90.0, locate_thinking: str | None = None):
         from google import genai
         from google.genai import types
 
         self._types = types
         self.model = model
         self.thinking = thinking
+        self.locate_thinking = locate_thinking or thinking
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout_s * 1000)))
 
-    def _config(self, schema: dict):
+    def _config(self, schema: dict, thinking: str | None = None):
         types = self._types
+        thinking = thinking or self.thinking
         kwargs = dict(response_mime_type="application/json", response_schema=schema)
-        if self.thinking == "off":
+        if thinking == "off":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        elif self.thinking == "low":
+        elif thinking == "low":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
         return types.GenerateContentConfig(**kwargs)
 
-    def call(self, jpeg: bytes, prompt: str, schema: dict) -> GeminiCall:
+    def call(self, jpeg: bytes, prompt: str, schema: dict, thinking: str | None = None) -> GeminiCall:
         """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전)."""
         types = self._types
         t0 = time.perf_counter()
         response = self.client.models.generate_content(
             model=self.model,
             contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
-            config=self._config(schema),
+            config=self._config(schema, thinking),
         )
         latency_ms = round((time.perf_counter() - t0) * 1000)
         um = response.usage_metadata
@@ -103,7 +105,7 @@ class GeminiRecognizer:
                                melds=h["melds"], win_tile=h["win_tile"])
 
     def locate(self, jpeg: bytes) -> GeminiCall:
-        c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA)
+        c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA, thinking=self.locate_thinking)
         c.data = normalize_locate(c.data)
         return c
 

@@ -66,6 +66,7 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `GEMINI_API_KEY` | Google AI Studio 키 |
 | `GEMINI_MODEL` | 기본 `gemini-3.8-flash` |
 | `GEMINI_THINKING` | `default` / `low` / `off` |
+| `LOCATE_THINKING` | 구역 나누기(/v1/locate)만 따로. 기본 `default` — `low` 면 모서리 울기·왕패를 자주 놓친다 |
 | `RATE_PER_MIN`, `MAX_CONCURRENT`, `MAX_UPLOAD_BYTES` | 요청 제한 |
 
 ## 로컬 실행

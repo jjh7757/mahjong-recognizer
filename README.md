@@ -31,7 +31,8 @@ POST /v1/locate      테이블 전경 (앱이 긴 변 1024 정도로 줄여서 �
 POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
   → {"dora_indicators":[{"tile":"3p","conf":0.9}], "ura_dora_indicators":[] (리치 화료 뒤 공개했을 때만),
      "riichi":{"bottom":true,"right":false,"top":false,"left":false}, "riichi_conf":{...},
-     "last_discards":{"bottom":"7s","right":null,...}, "last_discards_conf":{...}, "notes":"", ...}
+     "last_discards":{"bottom":"7s","right":null,...}, "last_discards_conf":{...},
+     "rivers":{"bottom":["1z","9m",...,"7s"],...} (버린 순서), "notes":"", ...}
 ```
 
 `tiles` 는 왼쪽부터 순서. 적도라는 `0m` `0p` `0s`. 자패는 `1z`(동)~`7z`(중).

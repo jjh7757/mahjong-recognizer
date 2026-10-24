@@ -108,6 +108,11 @@ async def _accept(image: UploadFile, x_api_key: str | None) -> bytes:
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
 
 
+def _usage(input_tokens: int, output_tokens: int) -> dict:
+    """토큰 수. 앱이 촬영 기록에 남겨 비용을 집계한다."""
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
 async def _call(fn: Callable[[bytes], object], jpeg: bytes):
     async with _sem:
         try:
@@ -134,6 +139,7 @@ async def recognize(image: UploadFile = File(...), x_api_key: str | None = Heade
         "notes": result.notes,
         "model": result.model,
         "latency_ms": result.latency_ms,
+        "usage": _usage(result.input_tokens, result.output_tokens),
     }
 
 
@@ -145,7 +151,7 @@ async def locate(image: UploadFile = File(...), x_api_key: str | None = Header(d
     log.info("locate %s -> hands=%s face_up=%s rivers=%d dead_wall=%s in %d ms (tokens %d+%d) notes=%r",
              image.filename, [h["side"] for h in d["hands"]], d["face_up_sides"], len(d["rivers"]),
              d["dead_wall"] is not None, c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
-    return {**d, "model": c.model, "latency_ms": c.latency_ms}
+    return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
 
 
 @app.post("/v1/table")
@@ -158,4 +164,4 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
              " ".join(t["tile"] for t in d["ura_dora_indicators"]),
              [s for s, v in d["riichi"].items() if v], d["last_discards"],
              c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
-    return {**d, "model": c.model, "latency_ms": c.latency_ms}
+    return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}

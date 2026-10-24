@@ -156,6 +156,10 @@ def normalize_table(data: dict) -> dict:
         if isinstance(it, dict) and it.get("side") in SIDES and it.get("code") in TILE_CODES:
             last[it["side"]] = it["code"]
             last_conf[it["side"]] = _conf(it.get("confidence", 0))
+    rivers: dict[str, list[str]] = {s: [] for s in SIDES}
+    for it in data.get("rivers") or []:
+        if isinstance(it, dict) and it.get("side") in SIDES:
+            rivers[it["side"]] = [c for c in it.get("codes") or [] if c in TILE_CODES]
     return {
         "dora_indicators": _tiles(data.get("dora_indicators")),
         "ura_dora_indicators": _tiles(data.get("ura_dora_indicators")),
@@ -163,5 +167,6 @@ def normalize_table(data: dict) -> dict:
         "riichi_conf": riichi_conf,
         "last_discards": last,
         "last_discards_conf": last_conf,
+        "rivers": rivers,
         "notes": str(data.get("notes") or ""),
     }

@@ -169,6 +169,18 @@ TABLE_SCHEMA = {
                 "required": ["side", "code", "confidence"],
             },
         },
+        "rivers": {
+            "type": "array",
+            "description": "자리별 버림패(강) 전체를 버린 순서대로. 강이 안 보이는 자리는 생략",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "side": {"type": "string", "enum": SIDES},
+                    "codes": {"type": "array", "items": {"type": "string", "enum": TILE_CODES}},
+                },
+                "required": ["side", "codes"],
+            },
+        },
         "notes": _NOTES,
     },
     "required": ["dora_indicators", "ura_dora_indicators", "riichi", "last_discards", "notes"],

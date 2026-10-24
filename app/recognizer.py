@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -20,6 +21,16 @@ from PIL import Image, ImageOps
 from .normalize import normalize_hand, normalize_locate, normalize_table
 from .prompts import HAND_PROMPT, LOCATE_PROMPT, TABLE_PROMPT
 from .schemas import HAND_SCHEMA, LOCATE_SCHEMA, TABLE_SCHEMA, TILE_CODES  # noqa: F401  (TILE_CODES 재수출)
+
+log = logging.getLogger("recognizer")
+
+
+def _retryable(e: Exception) -> bool:
+    """다시 보내 볼 만한 실패: 시간 초과, Gemini 5xx(504 DEADLINE_EXCEEDED 등)."""
+    import httpx
+    from google.genai import errors
+
+    return isinstance(e, (httpx.TimeoutException, errors.ServerError, TimeoutError))
 
 
 @dataclass
@@ -60,7 +71,8 @@ def prepare_image(data: bytes, max_side: int = 1568) -> bytes:
 
 class GeminiRecognizer:
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash", thinking: str = "default",
-                 timeout_s: float = 90.0, locate_thinking: str | None = None):
+                 timeout_s: float = 90.0, locate_thinking: str | None = None,
+                 call_timeout_s: float = 20.0, locate_timeout_s: float = 40.0, attempts: int = 2):
         from google import genai
         from google.genai import types
 
@@ -68,27 +80,44 @@ class GeminiRecognizer:
         self.model = model
         self.thinking = thinking
         self.locate_thinking = locate_thinking or thinking
+        # Gemini 호출 하나가 가끔 응답 없이 90초 넘게 멈춘다(2026-10-24 매장 실험, 평소 4~6초).
+        # 호출마다 짧게 끊고 한 번 더 보낸다. locate 는 생각이 길어 평소 15~27초라 따로 둔다.
+        self.call_timeout_s = call_timeout_s
+        self.locate_timeout_s = locate_timeout_s
+        self.attempts = max(1, attempts)
         self.client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=int(timeout_s * 1000)))
 
-    def _config(self, schema: dict, thinking: str | None = None):
+    def _config(self, schema: dict, thinking: str | None = None, timeout_s: float | None = None):
         types = self._types
         thinking = thinking or self.thinking
         kwargs = dict(response_mime_type="application/json", response_schema=schema)
+        if timeout_s:
+            kwargs["http_options"] = types.HttpOptions(timeout=int(timeout_s * 1000))
         if thinking == "off":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         elif thinking == "low":
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="low")
         return types.GenerateContentConfig(**kwargs)
 
-    def call(self, jpeg: bytes, prompt: str, schema: dict, thinking: str | None = None) -> GeminiCall:
-        """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전)."""
+    def call(self, jpeg: bytes, prompt: str, schema: dict, thinking: str | None = None,
+             timeout_s: float | None = None) -> GeminiCall:
+        """이미지 + 프롬프트 → 스키마대로 파싱한 dict (normalize 전). 시간 초과·5xx 면 [attempts] 번까지 다시 보낸다."""
         types = self._types
+        timeout_s = timeout_s or self.call_timeout_s
         t0 = time.perf_counter()
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
-            config=self._config(schema, thinking),
-        )
+        for attempt in range(1, self.attempts + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
+                    config=self._config(schema, thinking, timeout_s),
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == self.attempts or not _retryable(e):
+                    raise
+                log.warning("gemini call retry %d/%d after %.1fs: %s", attempt, self.attempts,
+                            time.perf_counter() - t0, type(e).__name__)
         latency_ms = round((time.perf_counter() - t0) * 1000)
         um = response.usage_metadata
         inp = (um.prompt_token_count or 0) if um else 0
@@ -105,7 +134,8 @@ class GeminiRecognizer:
                                melds=h["melds"], win_tile=h["win_tile"])
 
     def locate(self, jpeg: bytes) -> GeminiCall:
-        c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA, thinking=self.locate_thinking)
+        c = self.call(jpeg, LOCATE_PROMPT, LOCATE_SCHEMA, thinking=self.locate_thinking,
+                      timeout_s=self.locate_timeout_s)
         c.data = normalize_locate(c.data)
         return c
 

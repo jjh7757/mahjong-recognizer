@@ -111,3 +111,16 @@ class GeminiRecognizer:
         c = self.call(jpeg, TABLE_PROMPT, TABLE_SCHEMA)
         c.data = normalize_table(c.data)
         return c
+
+    def observe(self, jpeg: bytes, kind: str) -> GeminiCall:
+        """/v2 관찰 전용 판독. kind = hand | river | center."""
+        from . import observe as ob
+
+        prompt, schema, norm = {
+            "hand": (ob.HAND_PROMPT_V2, ob.HAND_SCHEMA_V2, ob.normalize_hand_v2),
+            "river": (ob.RIVER_PROMPT_V2, ob.RIVER_SCHEMA_V2, ob.normalize_river_v2),
+            "center": (ob.CENTER_PROMPT_V2, ob.CENTER_SCHEMA_V2, ob.normalize_center_v2),
+        }[kind]
+        c = self.call(jpeg, prompt, schema)
+        c.data = norm(c.data)
+        return c

@@ -82,7 +82,7 @@ def startup() -> None:
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
-            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table"]}
+            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/center"]}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -165,3 +165,29 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
              [s for s, v in d["riichi"].items() if v], d["last_discards"],
              c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
     return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+
+
+async def _observe(kind: str, image: UploadFile, x_api_key: str | None) -> dict:
+    jpeg = await _accept(image, x_api_key)
+    c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind), jpeg)
+    log.info("observe/%s %s -> %s in %d ms (tokens %d+%d)", kind, image.filename,
+             str({k: v for k, v in c.data.items() if k != "notes"})[:300], c.latency_ms, c.input_tokens, c.output_tokens)
+    return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+
+
+@app.post("/v2/hand")
+async def observe_hand(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """화료자 손패 크롭(그 자리 사람 방향으로 세운 것) → 깐 손패·떨어진 한 장·울기 묶음."""
+    return await _observe("hand", image, x_api_key)
+
+
+@app.post("/v2/river")
+async def observe_river(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """강 크롭 하나(그 자리 사람 방향으로 세운 것) → 버린 순서대로 패·가로 여부, 리치봉."""
+    return await _observe("river", image, x_api_key)
+
+
+@app.post("/v2/center")
+async def observe_center(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """가운데 또는 왕패 크롭 → 앞면 표시패 전부, 자리별 리치봉."""
+    return await _observe("center", image, x_api_key)

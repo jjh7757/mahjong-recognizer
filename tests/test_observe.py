@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 from app import main as server
 from app.normalize import normalize_locate
 from app.observe import (
+    agree_seats,
     normalize_center_v2,
     normalize_corner_v2,
     normalize_dora_v2,
@@ -10,6 +11,7 @@ from app.observe import (
     normalize_last_v2,
     normalize_meld_v2,
     normalize_river_v2,
+    normalize_seat_v2,
     normalize_sticks_v2,
 )
 from app.recognizer import GeminiCall
@@ -56,7 +58,11 @@ def test_center_v2_all_sides():
 
 
 class FakeObserver(FakeRecognizer):
-    def observe(self, jpeg: bytes, kind: str) -> GeminiCall:
+    def __init__(self):
+        self.ultra = {}
+
+    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False) -> GeminiCall:
+        self.ultra[kind] = ultra_high
         data = {"river": {"tiles": [{"tile": "2s", "conf": 0.9, "sideways": False}], "riichi_stick": False, "notes": ""}}
         return GeminiCall(data.get(kind, {"notes": ""}), 20, 7, 3, "fake")
 
@@ -113,10 +119,99 @@ def test_new_v2_routes(monkeypatch):
     monkeypatch.setattr(server, "recognizer", FakeObserver())
     monkeypatch.setattr(server, "API_KEY", "")
     client = TestClient(server.app)
-    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora"):
+    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat"):
         assert client.post(path, files=_upload()).status_code == 200
+    # 자리 구역만 이미지 해상도를 ULTRA_HIGH 로 읽는다.
+    assert server.recognizer.ultra == {"corner": False, "last": False, "sticks": False, "dora": False, "seat": True}
 
 
 def test_dora_v2_indicators():
     out = normalize_dora_v2({"indicators": [{"code": "4p", "confidence": 0.9}, {"code": "7m", "confidence": 0.8}, {}]})
     assert [t["tile"] for t in out["indicators"]] == ["4p", "7m"]
+
+
+def test_seat_v2_face_down_clears_hand():
+    data = {
+        "face_up": True,
+        "tiles": [{"code": "1m", "confidence": 0.9}],
+        "separate_tile": {"code": "2z", "confidence": 0.9},
+        "melds": [{"tiles": ["6m", "7m", "8m"], "sideways": [0], "face_down": [], "confidence": 0.9}],
+        "loose": [{"code": "7m", "confidence": 0.8}],
+    }
+    out = normalize_seat_v2(data)
+    assert out["face_up"] and out["tiles"][0]["tile"] == "1m" and out["separate_tile"]["tile"] == "2z"
+    assert out["melds"][0]["tiles"] == ["6m", "7m", "8m"] and out["loose"] == [{"tile": "7m", "conf": 0.8}]
+    down = normalize_seat_v2({**data, "face_up": False})
+    assert down["tiles"] == [] and down["separate_tile"] is None and down["melds"]
+
+
+def _seat(hand: str, melds: tuple[str, ...] = (), face_up: bool = True, conf: float = 0.8) -> dict:
+    return normalize_seat_v2({
+        "face_up": face_up,
+        "tiles": [{"code": t, "confidence": conf} for t in hand.split()],
+        "separate_tile": None,
+        "melds": [{"tiles": m.split(), "sideways": [0], "face_down": [], "confidence": conf} for m in melds],
+        "loose": [],
+    })
+
+
+def test_agree_seats_unanimous_keeps_highest_conf():
+    out = agree_seats([_seat("1s 2s 3s", ("6z 6z 6z",), conf=0.7), _seat("3s 2s 1s", ("6z 6z 6z",), conf=0.95),
+                       _seat("1s 2s 3s", ("6z 6z 6z",), conf=0.8)])
+    assert out["agreement"] == {"reads": 3, "agree": 3, "unanimous": True, "alternatives": []}
+    assert [t["tile"] for t in out["tiles"]] == ["1s", "2s", "3s"]   # 먼저 온 답의 순서
+    assert {t["conf"] for t in out["tiles"]} == {0.95} and out["melds"][0]["conf"] == 0.95
+
+
+def test_agree_seats_majority_zeroes_disputed_tiles():
+    # E 장면처럼 셋 중 하나가 3삭을 2삭으로: 다수 답을 고르고, 다른 답에 없는 3삭만 확신도 0.
+    out = agree_seats([_seat("1s 2s 2s 7s"), _seat("1s 2s 3s 7s"), _seat("1s 2s 3s 7s")])
+    assert [t["tile"] for t in out["tiles"]] == ["1s", "2s", "3s", "7s"]
+    assert [t["conf"] for t in out["tiles"]] == [0.8, 0.8, 0.0, 0.8]
+    assert out["agreement"]["agree"] == 2 and not out["agreement"]["unanimous"]
+    assert out["agreement"]["alternatives"] == ["1s 2s 2s 7s"]
+
+
+def test_agree_seats_disputed_meld_and_face_down():
+    out = agree_seats([_seat("7z 1m", ("9s 9s 9s",)), _seat("7z 1m", ("6s 6s 6s",)), _seat("", face_up=False)])
+    assert out["melds"][0]["tiles"] == ["9s", "9s", "9s"] and out["melds"][0]["conf"] == 0.0   # 셋 다 달라 먼저 온 답
+    assert [t["conf"] for t in out["tiles"]] == [0.0, 0.0]   # 앞면 아님 답에는 손패가 없다
+    assert "(앞면 아님)" in " ".join(out["agreement"]["alternatives"])
+
+
+def test_zoom_strips_overlap_at_full_resolution():
+    import io
+
+    from PIL import Image
+
+    from app.recognizer import zoom_strips
+    buf = io.BytesIO()
+    Image.new("RGB", (1000, 300), "white").save(buf, format="JPEG")
+    sizes = [Image.open(io.BytesIO(s)).size for s in zoom_strips(buf.getvalue(), 3)]
+    assert sizes == [(400, 300), (400, 300), (400, 300)]   # 0~400, 300~700, 600~1000
+
+
+def test_seat_reads_fan_out_and_agree(monkeypatch):
+    from app import recognizer as rec
+    r = object.__new__(rec.GeminiRecognizer)
+    r.seat_reads, r.model = 3, "fake"
+    answers = iter(["1s 2s 3s", "1s 2s 3s", "1s 2s 2s"])
+    seen = []
+
+    def fake_call(jpeg, prompt, schema, media_resolution=None, extra_images=()):
+        seen.append((media_resolution, [res for _, res in extra_images]))
+        hand = next(answers)
+        return GeminiCall({"face_up": True, "tiles": [{"code": t, "confidence": 0.9} for t in hand.split()],
+                           "separate_tile": None, "melds": [], "loose": []}, 10, 100, 20, "fake")
+
+    monkeypatch.setattr(r, "call", fake_call, raising=False)
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (900, 300), "white").save(buf, format="JPEG")
+    c = r.observe(buf.getvalue(), "seat", ultra_high=True)
+    # 확대 토막 3장은 ULTRA_HIGH, 참고표는 기본 해상도. 세 번 보냄.
+    assert seen == [("MEDIA_RESOLUTION_ULTRA_HIGH", ["MEDIA_RESOLUTION_ULTRA_HIGH"] * 3 + [None])] * 3
+    assert c.input_tokens == 300 and c.output_tokens == 60
+    assert c.data["agreement"]["agree"] == 2 and not c.data["agreement"]["unanimous"]

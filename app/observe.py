@@ -8,11 +8,15 @@
 - 강 끝 크롭(가운데 칸에서 한 자리 쪽, 그 자리 방향으로 세운 것) → 그 자리 강의 마지막 패 한 장
 - 리치봉 크롭(자동탁 가운데 기기) → 자리별 리치봉
 - 도라 크롭(격자 가운데 칸) → 강 밖 펠트 위에 따로 놓인 앞면 패(도라 표시패)
+- 자리 크롭(격자 5구역의 한 자리 = 그 사람 앞 손패 + 오른쪽 모서리, 그 사람 방향으로 세운 것)
+  → 손패가 앞면인지, 깐 손패·떨어진 한 장·울기 묶음 전부·따로 놓인 앞면 패
 
 울기 종류(치·퐁·깡), 리치, 강 끝 패, 도라·뒷도라 구분, 론/쯔모는 여기서 정하지 않는다.
 """
 
 from __future__ import annotations
+
+from collections import Counter
 
 from .prompts import NOTATION, SIDE_NOTE
 from .schemas import SIDES, TILE_CODES, _NOTES, _tile
@@ -165,6 +169,23 @@ DORA_SCHEMA_V2 = {
     "required": ["indicators", "notes"],
 }
 
+SEAT_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "face_up": {"type": "boolean", "description": "손패 줄의 그림이 보이면 true"},
+        "tiles": {**HAND_SCHEMA_V2["properties"]["tiles"], "description": "face_up 일 때 앞면으로 깐 손패 줄의 패를 왼쪽부터. 아니면 빈 배열"},
+        "separate_tile": HAND_SCHEMA_V2["properties"]["separate_tile"],
+        "melds": {**HAND_SCHEMA_V2["properties"]["melds"], "description": "손패 줄 오른쪽(테이블 모서리까지)에 놓인 앞면 3~4장 울기 묶음 전부. 없으면 빈 배열"},
+        "loose": {
+            "type": "array",
+            "description": "손패 줄·울기 묶음에 속하지 않고 1~3장만 따로 놓인 앞면 패(도라 표시패 등). 없으면 빈 배열",
+            "items": _tile(),
+        },
+        "notes": _NOTES,
+    },
+    "required": ["face_up", "tiles", "separate_tile", "melds", "loose", "notes"],
+}
+
 STICKS_SCHEMA_V2 = {
     "type": "object",
     "properties": {
@@ -252,6 +273,38 @@ LAST_PROMPT_V2 = f"""이 사진은 리치마작 테이블 가운데의 버림패
 {NOTATION}
 
 확신도(0~1)를 적어 주세요."""
+
+# 자리 판독은 사진 5장을 한 번에 보낸다: 자리 전체, 같은 사진을 왼쪽부터 세 토막(폭 40%, 30% 간격, 원본 해상도),
+# 통수·삭수 1~9 실물 참고표(assets/ref_sheet_ps.jpg). 갤러리 장면 5개 × 60회 측정(mahjong_calc/experiments/speed, 2026-10-25):
+# 사진 한 장 50% → 토막 83% → 토막 + 참고표 93%. 참고표는 매장과 다른 패 세트(집 패 정면 사진) 것이어도 같은 효과였다.
+# face_up 을 "그림이 보이면 true" 로 둔 것: "세워져 있으면 false" 로 쓰면 비스듬한 사진에서 눕힌 패의 연보라 두께를 보고
+# 세웠다며 손패를 비웠다(300회 중 12회 → 0/120). loose 는 놓인 곳과 관계없이 모두(도라 표시패를 적을지 고민하던 것).
+SEAT_ZOOM_STRIPS = 3
+SEAT_PROMPT_V2 = f"""이 사진은 리치마작 테이블을 위에서 찍은 것으로, 한 플레이어 자리(앞의 손패와 그 오른쪽 테이블 모서리까지)를 그 사람 쪽에서 본 방향으로 세운 것입니다. {_ONLY_SEE}
+
+- face_up: 이 사람의 손패 줄(보통 10~14장)의 그림(글자·동그라미·막대)이 사진에 보이면 true.
+  비스듬히 찍혀 패 윗변이나 옆에 연보라 두께가 함께 보여도 그림이 보이면 true 입니다(위에서 찍은 사진에서 그림이 보이는 손패는 공개한 손패입니다).
+  손패 줄의 그림이 하나도 안 보이고 연보라 뒷면만 보이면 false 이고, 그때 tiles·separate_tile 은 비웁니다.
+- tiles: 앞면 손패 줄. 왼쪽부터. 떨어진 한 장과 울기 묶음은 제외합니다.
+- separate_tile: 손패 줄 끝에서 조금 떨어뜨려 놓은 한 장(없으면 null).
+- melds: 손패 줄 오른쪽, 테이블 모서리까지 따로 놓인 앞면 3~4장 묶음 전부(퐁·치·깡). 묶음마다 패를 왼쪽부터 적고,
+  옆으로 눕힌 패의 위치(sideways)와 뒤집힌 패의 위치(face_down)를 0부터 적습니다. 뒤집힌 패는 같은 묶음의 앞면 패와 같은 것으로 적습니다.
+- loose: 손패 줄·떨어진 한 장·울기 묶음이 아닌 앞면 패는 놓인 곳(패산 옆, 펠트 위, 모서리)과 상관없이 모두 적습니다.
+  도라 표시패인지 버림패인지는 가리지 않습니다(앱이 정합니다). 뒷면(연보라)만 보이는 패와 사진 가장자리에서 반 이상 잘린 패만 적지 않습니다.
+
+장수: 앞면 손패라면 tiles 와 울기 묶음(깡은 4장이지만 3장으로 셈)을 합치면 반드시 13장이고,
+화료패 1장(separate_tile)을 더하면 14장입니다. 다 적은 뒤 합이 맞는지 확인하고, 안 맞으면 사진을 다시 세어 고칩니다.
+
+{NOTATION}
+
+보이는 패 수를 먼저 세고 그 수만큼 정확히 나열하세요. 각 패의 확신도(0~1)를 적어 주세요.
+
+사진이 여러 장입니다. 첫 사진은 자리 전체이고, 그 다음 {SEAT_ZOOM_STRIPS}장은 같은 사진을 왼쪽부터 {SEAT_ZOOM_STRIPS}토막으로 나눠(이웃 토막과 조금씩 겹침)
+원본 해상도로 크게 보여 준 것입니다. 패 종류(특히 통수·삭수의 무늬 개수)는 확대 토막에서 직접 세어 읽고,
+장수·순서·앞면 여부·울기 묶음의 위치는 전체 사진으로 정합니다. 겹친 부분의 패를 두 번 세지 않습니다.
+
+마지막 사진은 이 패 세트의 통수(1p~9p)·삭수(1s~9s) 실물 참고표입니다(이름표가 위에 있음). 통수·삭수는 참고표와 무늬 개수·배치를 비교해 정합니다.
+참고표의 패는 이 자리의 패가 아닙니다."""
 
 DORA_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데를 위에서 찍은 것입니다. 가운데 기기 둘레에 네 자리의 버림패(강)가 6장씩 줄지어 있습니다. {_ONLY_SEE}
 
@@ -392,4 +445,79 @@ def normalize_dora_v2(data: dict) -> dict:
     return {
         "indicators": [t for t in (_code(x) for x in data.get("indicators") or []) if t],
         "notes": str(data.get("notes") or ""),
+    }
+
+
+def normalize_seat_v2(data: dict) -> dict:
+    """→ {face_up, tiles:[{tile,conf}], separate_tile, melds:[...], loose:[{tile,conf}], notes}. 앞면이 아니면 손패를 비운다."""
+    h = normalize_hand_v2(data)
+    face_up = bool(data.get("face_up", False))
+    return {
+        "face_up": face_up,
+        "tiles": h["tiles"] if face_up else [],
+        "separate_tile": h["separate_tile"] if face_up else None,
+        "melds": h["melds"],
+        "loose": [t for t in (_code(x) for x in data.get("loose") or []) if t],
+        "notes": h["notes"],
+    }
+
+
+def seat_key(seat: dict) -> tuple:
+    """두 자리 판독이 같은 손패인지 비교하는 키: 앞면 여부, 손패 + 떨어진 한 장(순서 무시), 울기 묶음(순서 무시).
+    따로 놓인 패(loose)는 도라 후보일 뿐이라 비교하지 않는다."""
+    hand = [t["tile"] for t in seat["tiles"]] + ([seat["separate_tile"]["tile"]] if seat["separate_tile"] else [])
+    return seat["face_up"], tuple(sorted(hand)), tuple(sorted(tuple(sorted(m["tiles"])) for m in seat["melds"]))
+
+
+def agree_seats(reads: list[dict]) -> dict:
+    """같은 자리를 여러 번 읽은 결과(normalize_seat_v2, 먼저 온 순서)를 하나로.
+
+    모두 같으면 그 답(패 확신도는 읽은 것 중 가장 높은 값). 다르면 가장 많이 나온 답(같으면 먼저 온 것)을 고르고,
+    다른 답에 없는 손패(장수 기준)와 다른 답에 없는 울기 묶음의 확신도를 0 으로 낮춰 앱이 확인을 묻게 한다.
+    → {...고른 답, "agreement": {"reads": n, "agree": 고른 답과 같은 수, "unanimous": bool, "alternatives": [다른 답 요약]}}
+    """
+    keys = [seat_key(r) for r in reads]
+    counts = Counter(keys)
+    best = max(range(len(reads)), key=lambda i: (counts[keys[i]], -i))
+    chosen = reads[best]
+    same = [r for r, k in zip(reads, keys) if k == keys[best]]
+    others = [r for r, k in zip(reads, keys) if k != keys[best]]
+    unanimous = not others
+
+    def tile_list(r: dict) -> list[dict]:
+        return list(r["tiles"]) + ([r["separate_tile"]] if r["separate_tile"] else [])
+
+    # 같은 답끼리는 위치가 같다고 보고 가장 높은 확신도를 쓴다.
+    best_conf = [max(tile_list(r)[i]["conf"] for r in same) for i in range(len(tile_list(chosen)))]
+    if others:
+        # 다른 답 모두에 있는 만큼만 믿는다(장수 기준). 넘치는 패는 확신도 0.
+        trusted = Counter(t["tile"] for t in tile_list(chosen))
+        for r in others:
+            trusted &= Counter(t["tile"] for t in tile_list(r))
+        for i, t in enumerate(tile_list(chosen)):
+            if trusted[t["tile"]] > 0:
+                trusted[t["tile"]] -= 1
+            else:
+                best_conf[i] = 0.0
+    n_tiles = len(chosen["tiles"])
+    tiles = [{**t, "conf": c} for t, c in zip(chosen["tiles"], best_conf[:n_tiles])]
+    separate = {**chosen["separate_tile"], "conf": best_conf[n_tiles]} if chosen["separate_tile"] else None
+    other_melds = [Counter(tuple(sorted(m["tiles"])) for m in r["melds"]) for r in others]
+    melds = []
+    for m in chosen["melds"]:
+        k = tuple(sorted(m["tiles"]))
+        confs = [x["conf"] for r in same for x in r["melds"] if tuple(sorted(x["tiles"])) == k]
+        melds.append({**m, "conf": max(confs) if all(c[k] > 0 for c in other_melds) else 0.0})
+
+    def summary(r: dict) -> str:
+        return " ".join(t["tile"] for t in tile_list(r)) + "".join(f" [{' '.join(m['tiles'])}]" for m in r["melds"]) \
+            + ("" if r["face_up"] else " (앞면 아님)")
+
+    return {
+        **chosen,
+        "tiles": tiles,
+        "separate_tile": separate,
+        "melds": melds,
+        "agreement": {"reads": len(reads), "agree": len(same), "unanimous": unanimous,
+                      "alternatives": sorted({summary(r) for r in others})},
     }

@@ -41,6 +41,10 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low | off
 # 구역 나누기(locate)는 낮은 생각에서 모서리 울기·왕패를 자주 놓친다(2026-10-24 매장 실험). 따로 정한다.
 LOCATE_THINKING = os.environ.get("LOCATE_THINKING", "default")
+# 이미지 해상도 수준을 ULTRA_HIGH 로 올려 읽을 /v2 판독. 자리 구역(손패 + 모서리)은 크고 대부분 빈 곳이라 패가 작다.
+ULTRA_HIGH_KINDS = {k for k in os.environ.get("ULTRA_HIGH_KINDS", "seat").split(",") if k}
+# 자리 판독(/v2/seat)을 몇 번 동시에 읽어 맞춰 볼지. 모두 같아야 확신(다르면 다른 패의 확신도를 0 으로).
+SEAT_READS = int(os.environ.get("SEAT_READS", 3))
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))  # 화료 1회 = 3호출
 # 화료 1회 = locate 1 + 판독 최대 10호출(손패·울기·강 4·가운데·왕패)을 동시에 보낸다. 4 로 두면 판독이 줄을 서 2~3배 느려졌다(2026-10-24).
@@ -77,9 +81,9 @@ def startup() -> None:
     global recognizer
     if GEMINI_API_KEY:
         recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
-                                      locate_thinking=LOCATE_THINKING)
-        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d",
-                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT)
+                                      locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS)
+        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d",
+                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT, SEAT_READS)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 
@@ -88,7 +92,7 @@ def startup() -> None:
 def health() -> dict:
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
             "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center",
-                          "/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora"]}
+                          "/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat"]}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -98,7 +102,7 @@ def _check_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
-async def _accept(image: UploadFile, x_api_key: str | None) -> bytes:
+async def _accept(image: UploadFile, x_api_key: str | None, max_side: int = 1568) -> bytes:
     """키·설정·속도 제한·크기·디코딩 검사를 거친 JPEG 바이트."""
     _check_key(x_api_key)
     if recognizer is None:
@@ -109,7 +113,7 @@ async def _accept(image: UploadFile, x_api_key: str | None) -> bytes:
     if len(data) > MAX_UPLOAD:
         raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
     try:
-        return await asyncio.to_thread(prepare_image, data)
+        return await asyncio.to_thread(prepare_image, data, max_side)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
 
@@ -174,8 +178,9 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
 
 
 async def _observe(kind: str, image: UploadFile, x_api_key: str | None) -> dict:
-    jpeg = await _accept(image, x_api_key)
-    c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind), jpeg)
+    # 이미지 해상도를 ULTRA_HIGH 로 읽는 판독은 원본에 가깝게 받는다(1568 로 줄이면 올린 효과가 줄어든다).
+    jpeg = await _accept(image, x_api_key, max_side=3072 if kind in ULTRA_HIGH_KINDS else 1568)
+    c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS), jpeg)
     log.info("observe/%s %s -> %s in %d ms (tokens %d+%d)", kind, image.filename,
              str({k: v for k, v in c.data.items() if k != "notes"})[:300], c.latency_ms, c.input_tokens, c.output_tokens)
     return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
@@ -227,3 +232,10 @@ async def observe_sticks(image: UploadFile = File(...), x_api_key: str | None = 
 async def observe_dora(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """격자 가운데 칸 → 강 밖에 따로 놓인 앞면 패(도라 표시패)."""
     return await _observe("dora", image, x_api_key)
+
+
+@app.post("/v2/seat")
+async def observe_seat(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """격자 5구역의 한 자리(손패 + 오른쪽 모서리, 그 자리 방향으로 세운 것) → 앞면 여부·손패·울기 전부·따로 놓인 패.
+    SEAT_READS 번 동시에 읽어 맞춘 결과와 `agreement`({reads, agree, unanimous, alternatives, requested})."""
+    return await _observe("seat", image, x_api_key)

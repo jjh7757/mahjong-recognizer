@@ -87,7 +87,8 @@ def startup() -> None:
 @app.get("/")
 def health() -> dict:
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
-            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center"]}
+            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center",
+                          "/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora"]}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -202,3 +203,27 @@ async def observe_meld(image: UploadFile = File(...), x_api_key: str | None = He
 async def observe_center(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """가운데 또는 왕패 크롭 → 앞면 표시패 전부, 자리별 리치봉."""
     return await _observe("center", image, x_api_key)
+
+
+@app.post("/v2/corner")
+async def observe_corner(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """미리 그은 격자의 모서리 칸(그 자리 방향으로 세운 것) → 울기 묶음 전부, 묶음 아닌 앞면 패."""
+    return await _observe("corner", image, x_api_key)
+
+
+@app.post("/v2/last")
+async def observe_last(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """가운데 칸의 한 자리 쪽(그 자리 방향으로 세운 것) → 그 자리 강의 마지막 패 한 장."""
+    return await _observe("last", image, x_api_key)
+
+
+@app.post("/v2/sticks")
+async def observe_sticks(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """자동탁 가운데 기기 크롭 → 자리별 리치봉."""
+    return await _observe("sticks", image, x_api_key)
+
+
+@app.post("/v2/dora")
+async def observe_dora(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """격자 가운데 칸 → 강 밖에 따로 놓인 앞면 패(도라 표시패)."""
+    return await _observe("dora", image, x_api_key)

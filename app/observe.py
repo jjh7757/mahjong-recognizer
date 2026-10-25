@@ -4,6 +4,10 @@
 - 울기 크롭(locate 의 melds 상자, 그 자리 방향으로 세운 것) → 묶음 하나
 - 강 크롭(그 자리 사람이 보는 방향으로 세운 것) → 버린 순서대로 패와 가로 여부, 리치봉
 - 가운데·왕패 크롭 → 앞면 표시패 전부, 자리별 리치봉
+- 모서리 크롭(미리 그은 격자의 한 칸, 그 자리 방향으로 세운 것) → 울기 묶음 전부와 묶음 아닌 앞면 패
+- 강 끝 크롭(가운데 칸에서 한 자리 쪽, 그 자리 방향으로 세운 것) → 그 자리 강의 마지막 패 한 장
+- 리치봉 크롭(자동탁 가운데 기기) → 자리별 리치봉
+- 도라 크롭(격자 가운데 칸) → 강 밖 펠트 위에 따로 놓인 앞면 패(도라 표시패)
 
 울기 종류(치·퐁·깡), 리치, 강 끝 패, 도라·뒷도라 구분, 론/쯔모는 여기서 정하지 않는다.
 """
@@ -116,6 +120,60 @@ CENTER_SCHEMA_V2 = {
     "required": ["indicators", "riichi_sticks", "notes"],
 }
 
+CORNER_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "melds": {
+            "type": "array",
+            "description": "앞면 3~4장 울기 묶음 전부. 없으면 빈 배열",
+            "items": {
+                "type": "object",
+                "properties": {k: MELD_SCHEMA_V2["properties"][k] for k in ("tiles", "sideways", "face_down", "confidence")},
+                "required": ["tiles", "sideways", "face_down", "confidence"],
+            },
+        },
+        "loose": {
+            "type": "array",
+            "description": "묶음에 속하지 않고 1~2장만 따로 놓인 앞면 패(도라 표시패 등). 없으면 빈 배열",
+            "items": _tile(),
+        },
+        "notes": _NOTES,
+    },
+    "required": ["melds", "loose", "notes"],
+}
+
+LAST_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "last_tile": {**_tile("아래쪽 플레이어 강의 마지막(가장 최근에 버린) 패. 강이 없으면 null"), "nullable": True},
+        "tile_count": {"type": "integer", "description": "아래쪽 플레이어 강의 패 수(대략)"},
+        "notes": _NOTES,
+    },
+    "required": ["last_tile", "tile_count", "notes"],
+}
+
+DORA_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "indicators": {
+            "type": "array",
+            "description": "강(버림패 줄) 밖, 펠트 위에 따로 떨어져 놓인 앞면 패 전부. 없으면 빈 배열",
+            "items": _tile(),
+        },
+        "notes": _NOTES,
+    },
+    "required": ["indicators", "notes"],
+}
+
+STICKS_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "riichi_sticks": CENTER_SCHEMA_V2["properties"]["riichi_sticks"],
+        "notes": _NOTES,
+    },
+    "required": ["riichi_sticks", "notes"],
+}
+
 # ---------------------------------------------------------------- 프롬프트
 
 _ONLY_SEE = "보이는 것만 적습니다. 리치·론·도라 여부 같은 판단은 하지 않습니다."
@@ -168,6 +226,55 @@ CENTER_PROMPT_V2 = f"""이 사진은 리치마작 자동탁의 가운데(또는 
 {NOTATION}
 
 각 항목에 확신도(0~1)를 적어 주세요."""
+
+CORNER_PROMPT_V2 = f"""이 사진은 리치마작 테이블의 한 모서리를, 그 모서리에 울기를 놓는 플레이어 쪽에서 본 방향으로 세운 것입니다. {_ONLY_SEE}
+
+- melds: 앞면 3~4장 울기 묶음(퐁·치·깡) 전부. 묶음마다 패를 왼쪽부터 적고, 옆으로(90도) 눕힌 패의 위치(sideways)와
+  뒤집혀 뒷면만 보이는 패의 위치(face_down)를 0부터 적습니다. 뒤집힌 패는 같은 묶음의 앞면 패와 같은 것으로 적습니다.
+- loose: 묶음에 속하지 않고 1~2장만 따로 놓인 앞면 패(도라 표시패 등).
+- 세워진 손패, 뒷면이 보이는 패산, 사진 가장자리에 걸려 잘린 패는 적지 않습니다. 아무것도 없으면 빈 배열입니다.
+
+{NOTATION}
+
+확신도(0~1)를 적어 주세요."""
+
+LAST_PROMPT_V2 = f"""이 사진은 리치마작 테이블 가운데의 버림패(강)를 아래쪽 플레이어 쪽에서 본 방향으로 세운 것입니다. {_ONLY_SEE}
+
+아래쪽 플레이어의 강만 봅니다. 글자가 바로 서 보이는(위아래가 맞는) 패들이 그 사람의 강입니다.
+강은 6장씩 줄을 이루고, 첫 줄은 테이블 가운데 쪽(사진 위쪽)이며 다음 줄은 아래쪽 플레이어 쪽(사진 아래쪽)으로 쌓입니다.
+각 줄은 왼쪽에서 오른쪽으로 버립니다. 따라서 마지막 패는 **가장 아래 줄의 가장 오른쪽 패**입니다.
+그 패가 옆으로 눕혀져 있어도 그대로 마지막 패입니다.
+
+- last_tile: 그 마지막 패 한 장. 아래쪽 플레이어의 강이 보이지 않으면 null.
+- tile_count: 아래쪽 플레이어 강의 패 수.
+- 옆으로(90도) 또는 거꾸로(180도) 돌아가 보이는 패는 다른 자리의 강이니 보지 않습니다. 가운데 자동탁 기기·패산도 보지 않습니다.
+
+{NOTATION}
+
+확신도(0~1)를 적어 주세요."""
+
+DORA_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데를 위에서 찍은 것입니다. 가운데 기기 둘레에 네 자리의 버림패(강)가 6장씩 줄지어 있습니다. {_ONLY_SEE}
+
+- indicators: 강 줄에 붙어 있지 않고 펠트 위에 따로 떨어져 놓인 앞면 패 전부(도라·뒷도라 표시패). 보통 1~4장이 한 줄로,
+  강에서 한 장 이상 떨어진 곳(사진 가장자리 쪽일 수 있음)에 놓입니다. 패의 방향은 상관없습니다.
+- 강 줄에 붙은 패, 뒷면(연보라)이 보이는 패, 사진 가장자리에 걸려 반 이상 잘린 패는 적지 않습니다. 없으면 빈 배열입니다.
+
+{NOTATION}
+
+각 패의 확신도(0~1)를 적어 주세요."""
+
+STICKS_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데 기기(주사위 창이 있는 판)를 위에서 찍은 것입니다. 리치봉만 봅니다. {_ONLY_SEE}
+
+{SIDE_NOTE}
+
+- riichi_sticks: 자리별로 1000점 리치봉(가늘고 긴 막대. 흰 막대에 빨간 점이거나 파란색 등 색깔 막대)이 있으면 present=true.
+  가운데 기기에는 네 변마다 길쭉한 홈이 하나씩 있고, 각 홈은 가장 가까운 변의 자리 것입니다.
+  홈에 막대(예: 가운데 점과 양끝 화살표 무늬가 있는 파란 막대)가 들어 있으면 그 자리는 true, 빈 홈은 검은색이라 false 입니다.
+  기기 밖, 그 자리 쪽 가장자리에 막대가 놓여 있어도 true 입니다.
+  기기의 일부처럼 보여도 홈 안의 색깔 막대는 리치봉입니다. 여러 자리가 동시에 리치일 수 있으니 네 홈을 하나씩 따로 봅니다.
+- 패(마작패)는 보지 않습니다.
+
+각 자리에 확신도(0~1)를 적어 주세요."""
 
 # ---------------------------------------------------------------- 정리(순수 함수)
 
@@ -248,5 +355,41 @@ def normalize_center_v2(data: dict) -> dict:
         "indicators": [t for t in (_code(x) for x in data.get("indicators") or []) if t],
         "riichi_sticks": sticks,
         "riichi_sticks_conf": conf,
+        "notes": str(data.get("notes") or ""),
+    }
+
+
+def normalize_corner_v2(data: dict) -> dict:
+    """→ {melds:[{tiles,sideways,face_down,conf}], loose:[{tile,conf}], notes}. 3~4장이 아닌 묶음은 버린다."""
+    melds = [m for m in (normalize_meld_v2(x) for x in data.get("melds") or [] if isinstance(x, dict)) if m["tiles"]]
+    for m in melds:
+        m.pop("notes", None)
+    return {
+        "melds": melds,
+        "loose": [t for t in (_code(x) for x in data.get("loose") or []) if t],
+        "notes": str(data.get("notes") or ""),
+    }
+
+
+def normalize_last_v2(data: dict) -> dict:
+    """→ {last_tile:{tile,conf}|None, tile_count, notes}"""
+    try:
+        count = max(0, int(data.get("tile_count") or 0))
+    except (TypeError, ValueError):
+        count = 0
+    return {"last_tile": _code(data.get("last_tile")), "tile_count": count, "notes": str(data.get("notes") or "")}
+
+
+def normalize_sticks_v2(data: dict) -> dict:
+    """→ {riichi_sticks:{side:bool}, riichi_sticks_conf:{side:float}, notes}"""
+    c = normalize_center_v2({"riichi_sticks": data.get("riichi_sticks"), "notes": data.get("notes")})
+    c.pop("indicators")
+    return c
+
+
+def normalize_dora_v2(data: dict) -> dict:
+    """→ {indicators:[{tile,conf}], notes}"""
+    return {
+        "indicators": [t for t in (_code(x) for x in data.get("indicators") or []) if t],
         "notes": str(data.get("notes") or ""),
     }

@@ -288,10 +288,42 @@ LAST_PROMPT_V2 = f"""이 사진은 리치마작 테이블 가운데의 버림패
 # 강 끝을 자리마다 따로(3호출) 부르면 그중 하나가 생각을 수천 토큰 해 장면을 30초대로 늦췄다. 같은 크롭들을 한 호출에 넣으면
 # 출력 칸이 여럿이라 모델이 생각을 건너뛴다(B·C·D 장면 60개 × 2조건, mahjong_calc/experiments/speed/last3.py, 2026-10-26):
 # 론 패 54 → 60/60, 자리별 151 → 150/180, 시간 중앙 8.5 → 5.9초·p90 32.7 → 14.4초. 대신 같은 패를 매번 같은 쪽으로 틀린다(6통 → 8삭 등).
-_ORDINALS = ["첫째", "둘째", "셋째", "넷째"]
+# 자리 판독과 같은 통수·삭수 참고표를 마지막 사진으로 붙인다(B·C·D 120장면씩 두 회차, experiments/speed/last3_opt.py):
+# 자리별 300 → 319/360, 론 패 120/120 그대로, 시간 같음, 입력 토큰 +31%. 무늬 배치 문구·"6장씩 끊어 세기" 문구는 효과 없음.
+_ORDINALS = ["첫째", "둘째", "셋째", "넷째", "다섯째"]
+
+# 강 틀은 YOLO11 검출로 잡고(app/river.py) 마지막 패만 잘라 읽는다. 위 방식이 "어느 패가 마지막인가" 를 처진 패에서 틀리던 것을
+# 위치는 검출 + 규칙, 종류는 모델로 나눠 해결(B·C·D 60장면 10회: 자리별 158 → 180/180, 론 패 60/60, 호출 중앙 4.4초,
+# mahjong_calc/experiments/speed/river_yolo.py read --model nikmomo-s --conf 0.04). 문구는 측정한 그대로.
+LAST_TILE_PROMPT = """사진 {n}장은 각각 리치마작 패 한 장을 위에서 찍은 것입니다(버림패 줄에서 잘라 냄, 가장자리에 이웃 패가 조금 걸릴 수 있음).
+사진마다 가운데에 온전히 보이는 패 한 장의 종류를 적습니다.
+
+- {keys}: 첫째부터 순서대로 그 사진 패의 code 와 확신도.
+
+{notation}
+
+마지막 사진은 이 패 세트의 통수(1p~9p)·삭수(1s~9s) 실물 참고표입니다(이름표가 위에 있음). 통수·삭수는 참고표와 무늬 개수·배치를 비교해 정합니다.
+참고표는 답에 넣지 않습니다."""
+
+
+def last_tile_prompt(n: int) -> str:
+    return LAST_TILE_PROMPT.format(n=n, keys=", ".join(f"photo{i + 1}" for i in range(n)), notation=NOTATION)
+
+
+def last_tile_schema(n: int) -> dict:
+    per = {"type": "object", "properties": {"tile": LAST_SCHEMA_V2["properties"]["last_tile"]}, "required": ["tile"]}
+    keys = [f"photo{i + 1}" for i in range(n)]
+    return {"type": "object", "properties": {**{k: per for k in keys}, "notes": {"type": "string"}}, "required": keys}
+
+
+def normalize_last_tiles(data: dict, n: int) -> list[dict | None]:
+    """→ 사진 순서대로 {tile, conf} 또는 None."""
+    return [_code((data.get(f"photo{i + 1}") or {}).get("tile")) if isinstance(data.get(f"photo{i + 1}"), dict) else None
+            for i in range(n)]
 
 
 def last_multi_prompt(n: int) -> str:
+    """강 끝 n 장 + 마지막에 참고표 한 장(recognizer 가 붙인다)."""
     keys = ", ".join(f"photo{i + 1}" for i in range(n))
     return f"""사진 {n}장은 리치마작 테이블 가운데의 버림패(강)를 찍은 것으로, 사진마다 서로 다른 플레이어 쪽에서 본 방향으로 세웠습니다. {_ONLY_SEE}
 
@@ -306,6 +338,9 @@ def last_multi_prompt(n: int) -> str:
 - 옆으로(90도) 또는 거꾸로(180도) 돌아가 보이는 패는 다른 자리의 강이니 보지 않습니다. 가운데 자동탁 기기·패산도 보지 않습니다.
 
 {NOTATION}
+
+{_ORDINALS[n]} 사진은 이 패 세트의 통수(1p~9p)·삭수(1s~9s) 실물 참고표입니다(이름표가 위에 있음). 통수·삭수는 참고표와 무늬 개수·배치를 비교해 정합니다.
+참고표는 강이 아니므로 답(photo1~photo{n})은 앞의 사진 {n}장에 대해서만 적습니다.
 
 확신도(0~1)를 적어 주세요."""
 

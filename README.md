@@ -68,6 +68,8 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `GEMINI_THINKING` | `default` / `low` / `off` |
 | `LOCATE_THINKING` | 구역 나누기(/v1/locate)만 따로. 기본 `default` — `low` 면 모서리 울기·왕패를 자주 놓친다 |
 | `RATE_PER_MIN`, `MAX_CONCURRENT`, `MAX_UPLOAD_BYTES` | 요청 제한 |
+| `RIVER_FRAME` | 기본 `1` — 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡아 마지막 패만 잘라 읽음. `0` 이면 강 크롭을 통째로 읽음 |
+| `RIVER_CONF` | 강 틀 검출 기준값, 기본 `0.04`(손패 사진으로 학습한 모델이라 강 패는 확신도가 낮다) |
 
 ## 로컬 실행
 
@@ -79,3 +81,10 @@ curl -F image=@hand.jpg -H "X-Api-Key: ..." http://localhost:8000/v1/recognize
 python scripts/try_endpoint.py --mode hand|locate|table [--url ...] [--key-file ...] photo.jpg
 pytest
 ```
+
+## 라이선스
+
+이 서버는 **GNU AGPL-3.0**(`LICENSE`)이고 비상업 프로젝트다. 강 끝 판독의 패 위치 검출에 쓰는 모델
+`app/assets/mahjong-yolo11s.onnx` 는 nikmomo/Mahjong-YOLO(MIT, Copyright (c) 2024 Shin Zhang)의 YOLO11s 이고,
+학습 데이터는 Kaggle shinz114514 데이터셋(MIT), 학습 도구는 Ultralytics(학습한 모델 기본 AGPL-3.0)다.
+자세한 출처와 라이선스 전문은 `THIRD_PARTY_NOTICES.md`. 서버는 ultralytics 라이브러리 없이 onnxruntime 으로만 돌린다.

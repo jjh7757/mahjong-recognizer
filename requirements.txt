@@ -3,3 +3,6 @@ uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 pillow==13.0.0
 google-genai>=1.60,<2
+# 강 끝 판독의 강 틀(app/river.py): YOLO11 ONNX 를 ultralytics 없이 돌린다
+onnxruntime==1.29.0
+numpy==2.5.2

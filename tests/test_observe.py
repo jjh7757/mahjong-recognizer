@@ -140,7 +140,11 @@ def test_last_multi_schema_and_prompt_follow_count():
     s = last_multi_schema(3)
     assert s["required"] == ["photo1", "photo2", "photo3", "notes"]
     assert "photo4" not in s["properties"]
-    assert "사진 3장" in last_multi_prompt(3) and "셋째" in last_multi_prompt(3) and "넷째" not in last_multi_prompt(3)
+    p = last_multi_prompt(3)
+    assert "사진 3장" in p and "첫째·둘째·셋째 사진의 결과" in p
+    # 참고표는 강 크롭 뒤 마지막 사진
+    assert "넷째 사진은 이 패 세트의" in p and "photo1~photo3" in p
+    assert "다섯째 사진은 이 패 세트의" in last_multi_prompt(4)
 
 
 class FakeLastMulti(FakeObserver):

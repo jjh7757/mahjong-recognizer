@@ -95,11 +95,14 @@ def zoom_strips(jpeg: bytes, n: int, width: float = 0.4) -> list[bytes]:
 class GeminiRecognizer:
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash", thinking: str = "default",
                  timeout_s: float = 90.0, locate_thinking: str | None = None,
-                 hedge_s: float = 12.0, locate_hedge_s: float = 35.0, attempts: int = 2, seat_reads: int = 3):
+                 hedge_s: float = 12.0, locate_hedge_s: float = 35.0, attempts: int = 2, seat_reads: int = 3,
+                 river_locator=None):
         from google import genai
         from google.genai import types
 
         self._types = types
+        # 강 끝 판독에서 강 틀(위치)을 잡는 검출기(app/river.RiverLocator). None 이면 강 크롭을 통째로 읽는다.
+        self.river_locator = river_locator
         self.model = model
         self.thinking = thinking
         self.locate_thinking = locate_thinking or thinking
@@ -226,14 +229,53 @@ class GeminiRecognizer:
         return c
 
     def observe_last_multi(self, jpegs: list[bytes]) -> GeminiCall:
-        """강 끝 크롭 여러 장(각 자리 쪽으로 세운 가운데 칸)을 한 호출로. data = {rivers:[...] (보낸 순서), notes}."""
+        """강 끝 크롭 여러 장(각 자리 쪽으로 세운 가운데 칸)을 한 호출로. data = {rivers:[...] (보낸 순서), notes, method}.
+
+        검출기가 있으면 강마다 틀을 잡아 마지막 패만 잘라 읽는다(method "frame", tile_count 는 틀의 장수).
+        한 자리라도 틀을 못 잡으면 크롭을 통째로 읽는다(method "whole", 강 크롭 + 참고표)."""
         from . import observe as ob
 
         n = len(jpegs)
+        frames = self._river_frames(jpegs)
+        if frames is not None:
+            tiles = [crop for _, crop in frames]
+            c = self.call(tiles[0], ob.last_tile_prompt(n), ob.last_tile_schema(n),
+                          extra_images=[(t, None) for t in tiles[1:]] + [(REF_SHEET.read_bytes(), None)])
+            reads = ob.normalize_last_tiles(c.data, n)
+            c.data = {
+                "rivers": [{"last_tile": r, "tile_count": f.count, "rows": [len(row) for row in f.rows],
+                            "sideways": [i for i, s in enumerate(f.sideways) if s]}
+                           for r, (f, _) in zip(reads, frames)],
+                "notes": str(c.data.get("notes") or ""),
+                "method": "frame",
+            }
+            return c
         c = self.call(jpegs[0], ob.last_multi_prompt(n), ob.last_multi_schema(n),
-                      extra_images=[(j, None) for j in jpegs[1:]])
-        c.data = ob.normalize_last_multi(c.data, n)
+                      extra_images=[(j, None) for j in jpegs[1:]] + [(REF_SHEET.read_bytes(), None)])
+        c.data = {**ob.normalize_last_multi(c.data, n), "method": "whole"}
         return c
+
+    def _river_frames(self, jpegs: list[bytes]):
+        """[(RiverFrame, 마지막 패 JPEG)] — 검출기가 없거나 한 자리라도 틀을 못 잡으면 None."""
+        if self.river_locator is None:
+            return None
+        from . import river
+
+        out = []
+        t0 = time.perf_counter()
+        for j in jpegs:
+            try:
+                f, rgb = self.river_locator.locate(j)
+            except Exception:  # noqa: BLE001 — 검출이 깨져도 판독은 통째 읽기로 계속
+                log.exception("river locate failed")
+                return None
+            if f is None:
+                log.info("river frame: not found -> whole read")
+                return None
+            out.append((f, river.crop(rgb, f.last)))
+        log.info("river frames %s in %d ms", [f.rows and [len(r) for r in f.rows] for f, _ in out],
+                 round((time.perf_counter() - t0) * 1000))
+        return out
 
     def _observe_seat(self, jpeg: bytes, resolution: str | None) -> GeminiCall:
         """자리 전체 + 확대 토막 + 참고표를 [seat_reads] 번 동시에 읽어 맞춰 본다. 실패한 읽기는 빼고 맞춘다."""

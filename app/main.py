@@ -50,6 +50,9 @@ MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
 RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))  # 화료 1회 = 3호출
 # 화료 1회 = locate 1 + 판독 최대 10호출(손패·울기·강 4·가운데·왕패)을 동시에 보낸다. 4 로 두면 판독이 줄을 서 2~3배 느려졌다(2026-10-24).
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 16))
+# 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡을지(app/river.py). 0 이면 강 크롭을 통째로 읽는다. 검출 기준값은 RIVER_CONF.
+RIVER_FRAME = os.environ.get("RIVER_FRAME", "1") == "1"
+RIVER_CONF = float(os.environ.get("RIVER_CONF", 0.04))
 
 app = FastAPI(title="mahjong-recognizer", version="0.3.0")
 recognizer: GeminiRecognizer | None = None
@@ -81,10 +84,16 @@ _limiter = RateLimiter(RATE_PER_MIN)
 def startup() -> None:
     global recognizer
     if GEMINI_API_KEY:
+        locator = None
+        if RIVER_FRAME:
+            from .river import RiverLocator
+
+            locator = RiverLocator(conf=RIVER_CONF)
         recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
-                                      locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS)
-        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d",
-                 GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT, SEAT_READS)
+                                      locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS, river_locator=locator)
+        log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d "
+                 "river_frame=%s(conf %.2f)", GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT,
+                 SEAT_READS, RIVER_FRAME, RIVER_CONF)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 
@@ -226,12 +235,13 @@ async def observe_last(image: UploadFile = File(...), x_api_key: str | None = He
 @app.post("/v2/last3")
 async def observe_last_multi(images: list[UploadFile] = File(...),
                              x_api_key: str | None = Header(default=None)) -> dict:
-    """가운데 칸을 자리마다 세운 크롭 여러 장(보통 화료자 빼고 3장, 최대 4장) → 사진 순서대로 강의 마지막 패. 한 번의 Gemini 호출."""
+    """가운데 칸을 자리마다 세운 크롭 여러 장(보통 화료자 빼고 3장, 최대 4장) → 사진 순서대로 강의 마지막 패. 한 번의 Gemini 호출.
+    강 틀은 YOLO11 검출로 잡아 마지막 패만 잘라 읽고(method "frame", rows·sideways 도 줌), 못 잡으면 통째로 읽는다(method "whole")."""
     if not 1 <= len(images) <= LAST_MULTI_MAX:
         raise HTTPException(status_code=400, detail=f"images must be 1..{LAST_MULTI_MAX}")
     jpegs = [await _accept(im, x_api_key) for im in images]
     c: GeminiCall = await _call(recognizer.observe_last_multi, jpegs)
-    log.info("observe/last3 %s -> %s in %d ms (tokens %d+%d)", [im.filename for im in images],
+    log.info("observe/last3[%s] %s -> %s in %d ms (tokens %d+%d)", c.data.get("method"), [im.filename for im in images],
              [r["last_tile"]["tile"] if r["last_tile"] else None for r in c.data["rivers"]],
              c.latency_ms, c.input_tokens, c.output_tokens)
     return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}

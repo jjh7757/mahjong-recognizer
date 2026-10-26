@@ -156,6 +156,17 @@ LAST_SCHEMA_V2 = {
     "required": ["last_tile", "tile_count", "notes"],
 }
 
+LAST_MULTI_MAX = 4
+
+
+def last_multi_schema(n: int) -> dict:
+    """사진 n 장의 강 끝을 한 번에: photo1..photoN 마다 last_tile·tile_count."""
+    per = {"type": "object", "properties": {k: v for k, v in LAST_SCHEMA_V2["properties"].items() if k != "notes"},
+           "required": ["last_tile", "tile_count"]}
+    keys = [f"photo{i + 1}" for i in range(n)]
+    return {"type": "object", "properties": {**{k: per for k in keys}, "notes": _NOTES}, "required": [*keys, "notes"]}
+
+
 DORA_SCHEMA_V2 = {
     "type": "object",
     "properties": {
@@ -268,6 +279,30 @@ LAST_PROMPT_V2 = f"""이 사진은 리치마작 테이블 가운데의 버림패
 
 - last_tile: 그 마지막 패 한 장. 아래쪽 플레이어의 강이 보이지 않으면 null.
 - tile_count: 아래쪽 플레이어 강의 패 수.
+- 옆으로(90도) 또는 거꾸로(180도) 돌아가 보이는 패는 다른 자리의 강이니 보지 않습니다. 가운데 자동탁 기기·패산도 보지 않습니다.
+
+{NOTATION}
+
+확신도(0~1)를 적어 주세요."""
+
+# 강 끝을 자리마다 따로(3호출) 부르면 그중 하나가 생각을 수천 토큰 해 장면을 30초대로 늦췄다. 같은 크롭들을 한 호출에 넣으면
+# 출력 칸이 여럿이라 모델이 생각을 건너뛴다(B·C·D 장면 60개 × 2조건, mahjong_calc/experiments/speed/last3.py, 2026-10-26):
+# 론 패 54 → 60/60, 자리별 151 → 150/180, 시간 중앙 8.5 → 5.9초·p90 32.7 → 14.4초. 대신 같은 패를 매번 같은 쪽으로 틀린다(6통 → 8삭 등).
+_ORDINALS = ["첫째", "둘째", "셋째", "넷째"]
+
+
+def last_multi_prompt(n: int) -> str:
+    keys = ", ".join(f"photo{i + 1}" for i in range(n))
+    return f"""사진 {n}장은 리치마작 테이블 가운데의 버림패(강)를 찍은 것으로, 사진마다 서로 다른 플레이어 쪽에서 본 방향으로 세웠습니다. {_ONLY_SEE}
+
+사진마다 그 사진의 아래쪽 플레이어 강만 봅니다. 글자가 바로 서 보이는(위아래가 맞는) 패들이 그 사람의 강입니다.
+강은 6장씩 줄을 이루고, 첫 줄은 테이블 가운데 쪽(사진 위쪽)이며 다음 줄은 아래쪽 플레이어 쪽(사진 아래쪽)으로 쌓입니다.
+각 줄은 왼쪽에서 오른쪽으로 버립니다. 따라서 마지막 패는 **가장 아래 줄의 가장 오른쪽 패**입니다.
+그 패가 옆으로 눕혀져 있어도 그대로 마지막 패입니다.
+
+- {keys}: {'·'.join(_ORDINALS[:n])} 사진의 결과. 사진마다 따로 봅니다.
+  - last_tile: 그 사진 아래쪽 플레이어 강의 마지막 패 한 장. 그 강이 보이지 않으면 null.
+  - tile_count: 그 강의 패 수.
 - 옆으로(90도) 또는 거꾸로(180도) 돌아가 보이는 패는 다른 자리의 강이니 보지 않습니다. 가운데 자동탁 기기·패산도 보지 않습니다.
 
 {NOTATION}
@@ -431,6 +466,15 @@ def normalize_last_v2(data: dict) -> dict:
     except (TypeError, ValueError):
         count = 0
     return {"last_tile": _code(data.get("last_tile")), "tile_count": count, "notes": str(data.get("notes") or "")}
+
+
+def normalize_last_multi(data: dict, n: int) -> dict:
+    """→ {rivers:[{last_tile, tile_count}] (보낸 사진 순서), notes}. 빠진 사진은 last_tile None."""
+    rivers = []
+    for i in range(n):
+        r = normalize_last_v2(data.get(f"photo{i + 1}") if isinstance(data.get(f"photo{i + 1}"), dict) else {})
+        rivers.append({"last_tile": r["last_tile"], "tile_count": r["tile_count"]})
+    return {"rivers": rivers, "notes": str(data.get("notes") or "")}
 
 
 def normalize_sticks_v2(data: dict) -> dict:

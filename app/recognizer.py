@@ -225,6 +225,16 @@ class GeminiRecognizer:
         c.data = norm(c.data)
         return c
 
+    def observe_last_multi(self, jpegs: list[bytes]) -> GeminiCall:
+        """강 끝 크롭 여러 장(각 자리 쪽으로 세운 가운데 칸)을 한 호출로. data = {rivers:[...] (보낸 순서), notes}."""
+        from . import observe as ob
+
+        n = len(jpegs)
+        c = self.call(jpegs[0], ob.last_multi_prompt(n), ob.last_multi_schema(n),
+                      extra_images=[(j, None) for j in jpegs[1:]])
+        c.data = ob.normalize_last_multi(c.data, n)
+        return c
+
     def _observe_seat(self, jpeg: bytes, resolution: str | None) -> GeminiCall:
         """자리 전체 + 확대 토막 + 참고표를 [seat_reads] 번 동시에 읽어 맞춰 본다. 실패한 읽기는 빼고 맞춘다."""
         from . import observe as ob

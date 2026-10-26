@@ -30,6 +30,7 @@ from collections.abc import Callable
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 
+from .observe import LAST_MULTI_MAX
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image
 
 log = logging.getLogger("recognizer")
@@ -92,7 +93,7 @@ def startup() -> None:
 def health() -> dict:
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
             "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center",
-                          "/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat"]}
+                          "/v2/corner", "/v2/last", "/v2/last3", "/v2/sticks", "/v2/dora", "/v2/seat"]}
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -220,6 +221,20 @@ async def observe_corner(image: UploadFile = File(...), x_api_key: str | None = 
 async def observe_last(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """가운데 칸의 한 자리 쪽(그 자리 방향으로 세운 것) → 그 자리 강의 마지막 패 한 장."""
     return await _observe("last", image, x_api_key)
+
+
+@app.post("/v2/last3")
+async def observe_last_multi(images: list[UploadFile] = File(...),
+                             x_api_key: str | None = Header(default=None)) -> dict:
+    """가운데 칸을 자리마다 세운 크롭 여러 장(보통 화료자 빼고 3장, 최대 4장) → 사진 순서대로 강의 마지막 패. 한 번의 Gemini 호출."""
+    if not 1 <= len(images) <= LAST_MULTI_MAX:
+        raise HTTPException(status_code=400, detail=f"images must be 1..{LAST_MULTI_MAX}")
+    jpegs = [await _accept(im, x_api_key) for im in images]
+    c: GeminiCall = await _call(recognizer.observe_last_multi, jpegs)
+    log.info("observe/last3 %s -> %s in %d ms (tokens %d+%d)", [im.filename for im in images],
+             [r["last_tile"]["tile"] if r["last_tile"] else None for r in c.data["rivers"]],
+             c.latency_ms, c.input_tokens, c.output_tokens)
+    return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
 
 
 @app.post("/v2/sticks")

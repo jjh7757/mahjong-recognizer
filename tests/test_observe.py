@@ -4,10 +4,13 @@ from app import main as server
 from app.normalize import normalize_locate
 from app.observe import (
     agree_seats,
+    last_multi_prompt,
+    last_multi_schema,
     normalize_center_v2,
     normalize_corner_v2,
     normalize_dora_v2,
     normalize_hand_v2,
+    normalize_last_multi,
     normalize_last_v2,
     normalize_meld_v2,
     normalize_river_v2,
@@ -123,6 +126,43 @@ def test_new_v2_routes(monkeypatch):
         assert client.post(path, files=_upload()).status_code == 200
     # 자리 구역만 이미지 해상도를 ULTRA_HIGH 로 읽는다.
     assert server.recognizer.ultra == {"corner": False, "last": False, "sticks": False, "dora": False, "seat": True}
+
+
+def test_last_multi_order_and_missing():
+    out = normalize_last_multi({"photo1": {"last_tile": {"code": "6s", "confidence": 0.9}, "tile_count": 17},
+                                "photo3": {"last_tile": None, "tile_count": 5}, "notes": "n"}, 3)
+    assert [r["last_tile"] and r["last_tile"]["tile"] for r in out["rivers"]] == ["6s", None, None]
+    assert [r["tile_count"] for r in out["rivers"]] == [17, 0, 5]
+    assert out["notes"] == "n"
+
+
+def test_last_multi_schema_and_prompt_follow_count():
+    s = last_multi_schema(3)
+    assert s["required"] == ["photo1", "photo2", "photo3", "notes"]
+    assert "photo4" not in s["properties"]
+    assert "사진 3장" in last_multi_prompt(3) and "셋째" in last_multi_prompt(3) and "넷째" not in last_multi_prompt(3)
+
+
+class FakeLastMulti(FakeObserver):
+    def observe_last_multi(self, jpegs: list[bytes]) -> GeminiCall:
+        self.n = len(jpegs)
+        rivers = [{"last_tile": {"tile": t, "conf": 0.9}, "tile_count": 10} for t in ("6s", "3s", "7z", "1z")[:len(jpegs)]]
+        return GeminiCall({"rivers": rivers, "notes": ""}, 30, 9, 4, "fake")
+
+
+def test_last3_route(monkeypatch):
+    monkeypatch.setattr(server, "recognizer", FakeLastMulti())
+    monkeypatch.setattr(server, "API_KEY", "")
+    client = TestClient(server.app)
+    up = [("images", (f"last_{s}.jpg", _upload()["image"][1], "image/jpeg")) for s in ("bottom", "left", "top")]
+    r = client.post("/v2/last3", files=up)
+    assert r.status_code == 200
+    j = r.json()
+    assert server.recognizer.n == 3
+    assert [x["last_tile"]["tile"] for x in j["rivers"]] == ["6s", "3s", "7z"]
+    assert j["usage"] == {"input_tokens": 9, "output_tokens": 4}
+    # 5장 이상은 거절
+    assert client.post("/v2/last3", files=up + up[:2]).status_code == 400
 
 
 def test_dora_v2_indicators():

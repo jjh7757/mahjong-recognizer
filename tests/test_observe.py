@@ -122,10 +122,11 @@ def test_new_v2_routes(monkeypatch):
     monkeypatch.setattr(server, "recognizer", FakeObserver())
     monkeypatch.setattr(server, "API_KEY", "")
     client = TestClient(server.app)
-    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat"):
+    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat", "/v2/handonly"):
         assert client.post(path, files=_upload()).status_code == 200
     # 자리 구역만 이미지 해상도를 ULTRA_HIGH 로 읽는다.
-    assert server.recognizer.ultra == {"corner": False, "last": False, "sticks": False, "dora": False, "seat": True}
+    assert server.recognizer.ultra == {"corner": False, "last": False, "sticks": False, "dora": False, "seat": True,
+                                       "handonly": True}
 
 
 def test_last_multi_order_and_missing():
@@ -259,3 +260,42 @@ def test_seat_reads_fan_out_and_agree(monkeypatch):
     assert seen == [("MEDIA_RESOLUTION_ULTRA_HIGH", ["MEDIA_RESOLUTION_ULTRA_HIGH"] * 3 + [None])] * 3
     assert c.input_tokens == 300 and c.output_tokens == 60
     assert c.data["agreement"]["agree"] == 2 and not c.data["agreement"]["unanimous"]
+
+
+def test_handonly_prompt_and_schema_drop_melds():
+    """손패 전용 문구: 울기 줄이 빠지고 '이미 따로 읽었다' 는 설명만 남는다. 스키마에도 melds 가 없다."""
+    from app import observe as ob
+    assert "- melds:" not in ob.HANDONLY_PROMPT_V2 and "- melds:" in ob.SEAT_PROMPT_V2
+    assert ob.HANDONLY_PROMPT_V2.count("울기") == 2
+    assert "잘라 냈습니다" in ob.HANDONLY_PROMPT_V2
+    assert "참고표" in ob.HANDONLY_PROMPT_V2  # 토막·참고표 안내는 그대로
+    assert "melds" not in ob.HANDONLY_SCHEMA_V2["properties"] and "melds" not in ob.HANDONLY_SCHEMA_V2["required"]
+    out = ob.normalize_handonly_v2({"face_up": True, "tiles": [{"code": "1s", "confidence": 0.9}],
+                                    "separate_tile": None, "loose": []})
+    assert out["melds"] == [] and [t["tile"] for t in out["tiles"]] == ["1s"]
+
+
+def test_handonly_fans_out_like_seat(monkeypatch):
+    from app import recognizer as rec
+    r = object.__new__(rec.GeminiRecognizer)
+    r.seat_reads, r.model = 3, "fake"
+    answers = iter(["1s 2s 3s", "1s 2s 3s", "1s 2s 3s"])
+    prompts = []
+
+    def fake_call(jpeg, prompt, schema, media_resolution=None, extra_images=()):
+        prompts.append((prompt, "melds" in schema["properties"]))
+        hand = next(answers)
+        return GeminiCall({"face_up": True, "tiles": [{"code": t, "confidence": 0.9} for t in hand.split()],
+                           "separate_tile": None, "loose": []}, 10, 100, 20, "fake")
+
+    monkeypatch.setattr(r, "call", fake_call, raising=False)
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (900, 300), "white").save(buf, format="JPEG")
+    c = r.observe(buf.getvalue(), "handonly", ultra_high=True)
+    from app import observe as ob
+    assert prompts == [(ob.HANDONLY_PROMPT_V2, False)] * 3
+    assert c.data["agreement"]["unanimous"] and c.data["agreement"]["requested"] == 3
+    assert c.data["melds"] == [] and [t["tile"] for t in c.data["tiles"]] == ["1s", "2s", "3s"]

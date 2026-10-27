@@ -220,10 +220,11 @@ class GeminiRecognizer:
             "sticks": (ob.STICKS_PROMPT_V2, ob.STICKS_SCHEMA_V2, ob.normalize_sticks_v2),
             "dora": (ob.DORA_PROMPT_V2, ob.DORA_SCHEMA_V2, ob.normalize_dora_v2),
             "seat": (ob.SEAT_PROMPT_V2, ob.SEAT_SCHEMA_V2, ob.normalize_seat_v2),
+            "handonly": (ob.HANDONLY_PROMPT_V2, ob.HANDONLY_SCHEMA_V2, ob.normalize_handonly_v2),
         }[kind]
         resolution = "MEDIA_RESOLUTION_ULTRA_HIGH" if ultra_high else None
-        if kind == "seat":
-            return self._observe_seat(jpeg, resolution)
+        if kind in ("seat", "handonly"):
+            return self._observe_seat(jpeg, resolution, prompt, schema, norm)
         c = self.call(jpeg, prompt, schema, media_resolution=resolution)
         c.data = norm(c.data)
         return c
@@ -277,14 +278,17 @@ class GeminiRecognizer:
                  round((time.perf_counter() - t0) * 1000))
         return out
 
-    def _observe_seat(self, jpeg: bytes, resolution: str | None) -> GeminiCall:
-        """자리 전체 + 확대 토막 + 참고표를 [seat_reads] 번 동시에 읽어 맞춰 본다. 실패한 읽기는 빼고 맞춘다."""
+    def _observe_seat(self, jpeg: bytes, resolution: str | None, prompt: str | None = None, schema: dict | None = None,
+                      norm=None) -> GeminiCall:
+        """자리 전체(또는 손패 칸만) + 확대 토막 + 참고표를 [seat_reads] 번 동시에 읽어 맞춰 본다. 실패한 읽기는 빼고 맞춘다."""
         from . import observe as ob
 
+        prompt = prompt or ob.SEAT_PROMPT_V2
+        schema = schema or ob.SEAT_SCHEMA_V2
+        norm = norm or ob.normalize_seat_v2
         extra = [(s, resolution) for s in zoom_strips(jpeg, ob.SEAT_ZOOM_STRIPS)] + [(REF_SHEET.read_bytes(), None)]
         t0 = time.perf_counter()
-        futures = [_fanout_pool.submit(self.call, jpeg, ob.SEAT_PROMPT_V2, ob.SEAT_SCHEMA_V2,
-                                       media_resolution=resolution, extra_images=extra)
+        futures = [_fanout_pool.submit(self.call, jpeg, prompt, schema, media_resolution=resolution, extra_images=extra)
                    for _ in range(self.seat_reads)]
         calls, last_error = [], None
         for f in as_completed(futures):  # 먼저 온 순서(동률이면 먼저 온 답을 고른다)
@@ -295,7 +299,7 @@ class GeminiRecognizer:
                 last_error = e
         if not calls:
             raise last_error or RuntimeError("no seat read")
-        data = ob.agree_seats([ob.normalize_seat_v2(c.data) for c in calls])
+        data = ob.agree_seats([norm(c.data) for c in calls])
         data["agreement"]["requested"] = self.seat_reads
         if len(calls) < self.seat_reads:
             data["agreement"]["unanimous"] = False  # 읽기가 빠지면 만장일치로 치지 않는다

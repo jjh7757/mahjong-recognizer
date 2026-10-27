@@ -43,7 +43,7 @@ GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low 
 # 구역 나누기(locate)는 낮은 생각에서 모서리 울기·왕패를 자주 놓친다(2026-10-24 매장 실험). 따로 정한다.
 LOCATE_THINKING = os.environ.get("LOCATE_THINKING", "default")
 # 이미지 해상도 수준을 ULTRA_HIGH 로 올려 읽을 /v2 판독. 자리 구역(손패 + 모서리)은 크고 대부분 빈 곳이라 패가 작다.
-ULTRA_HIGH_KINDS = {k for k in os.environ.get("ULTRA_HIGH_KINDS", "seat").split(",") if k}
+ULTRA_HIGH_KINDS = {k for k in os.environ.get("ULTRA_HIGH_KINDS", "seat,handonly").split(",") if k}
 # 자리 판독(/v2/seat)을 몇 번 동시에 읽어 맞춰 볼지. 모두 같아야 확신(다르면 다른 패의 확신도를 0 으로).
 SEAT_READS = int(os.environ.get("SEAT_READS", 3))
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
@@ -257,6 +257,13 @@ async def observe_sticks(image: UploadFile = File(...), x_api_key: str | None = 
 async def observe_dora(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """격자 가운데 칸 → 강 밖에 따로 놓인 앞면 패(도라 표시패)."""
     return await _observe("dora", image, x_api_key)
+
+
+@app.post("/v2/handonly")
+async def observe_handonly(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """판 상태 추적용: 격자 자리의 손패 칸만(울기 모서리는 잘라 낸 것, 그 자리 방향으로 세운 것) → 앞면 여부·손패·따로 놓인 패.
+    울기는 앱이 게임 중에 미리 읽어 둔 것을 쓴다(melds 는 늘 빈 배열). /v2/seat 와 같이 SEAT_READS 번 동시에 읽어 `agreement`."""
+    return await _observe("handonly", image, x_api_key)
 
 
 @app.post("/v2/seat")

@@ -376,6 +376,41 @@ SEAT_PROMPT_V2 = f"""이 사진은 리치마작 테이블을 위에서 찍은 �
 마지막 사진은 이 패 세트의 통수(1p~9p)·삭수(1s~9s) 실물 참고표입니다(이름표가 위에 있음). 통수·삭수는 참고표와 무늬 개수·배치를 비교해 정합니다.
 참고표의 패는 이 자리의 패가 아닙니다."""
 
+
+
+def _must_replace(s: str, old: str, new: str) -> str:
+    """SEAT_PROMPT_V2 가 바뀌어 문구를 못 찾으면 조용히 어긋나지 않게 바로 실패."""
+    if s.count(old) != 1:
+        raise RuntimeError(f"HANDONLY_PROMPT_V2: 바꿀 문구를 못 찾음: {old[:40]!r}")
+    return s.replace(old, new)
+
+
+# 판 상태 추적(울기를 게임 중에 미리 읽어 둔 뒤의 화료 사진): 손패 칸만 자른 사진용.
+# SEAT_PROMPT_V2 에서 울기 관련 줄만 바꾸고 나머지(앞면 정의·loose·표기법·토막·참고표)는 그대로 둔다 —
+# 사진을 바꾸면 문구도 같이 바꿔야 공정하다(experiments/speed/seat_nomeld.py (c): B·D 120회 정답 같음, p90 14.1 → 9.2초).
+HANDONLY_PROMPT_V2 = SEAT_PROMPT_V2
+HANDONLY_PROMPT_V2 = _must_replace(
+    HANDONLY_PROMPT_V2,
+    "한 플레이어 자리(앞의 손패와 그 오른쪽 테이블 모서리까지)를 그 사람 쪽에서 본 방향으로 세운 것입니다.",
+    "한 플레이어 앞의 손패 줄을 그 사람 쪽에서 본 방향으로 세운 것입니다. 이 사람의 울기 묶음(퐁·치·깡)은 이미 따로 읽었고,"
+    " 놓여 있던 오른쪽 모서리는 사진에서 잘라 냈습니다. 그래서 손패 줄은 13장보다 적을 수 있습니다(울기 묶음 하나당 3장 적음).")
+HANDONLY_PROMPT_V2 = _must_replace(HANDONLY_PROMPT_V2, "이 사람의 손패 줄(보통 10~14장)의", "이 사람의 손패 줄의")
+_i = HANDONLY_PROMPT_V2.index("- melds:")
+_j = HANDONLY_PROMPT_V2.index("- loose:")
+HANDONLY_PROMPT_V2 = HANDONLY_PROMPT_V2[:_i] + HANDONLY_PROMPT_V2[_j:]
+HANDONLY_PROMPT_V2 = _must_replace(HANDONLY_PROMPT_V2, "- loose: 손패 줄·떨어진 한 장·울기 묶음이 아닌", "- loose: 손패 줄·떨어진 한 장이 아닌")
+HANDONLY_PROMPT_V2 = _must_replace(HANDONLY_PROMPT_V2, "떨어진 한 장과 울기 묶음은 제외합니다.", "떨어진 한 장은 제외합니다.")
+HANDONLY_PROMPT_V2 = _must_replace(HANDONLY_PROMPT_V2, "장수·순서·앞면 여부·울기 묶음의 위치는", "장수·순서·앞면 여부는")
+HANDONLY_PROMPT_V2 = _must_replace(HANDONLY_PROMPT_V2, "첫 사진은 자리 전체이고", "첫 사진은 손패 줄 전체이고")
+assert HANDONLY_PROMPT_V2.count("울기") == 2 and "- melds:" not in HANDONLY_PROMPT_V2
+
+HANDONLY_SCHEMA_V2 = {
+    **SEAT_SCHEMA_V2,
+    "properties": {k: v for k, v in SEAT_SCHEMA_V2["properties"].items() if k != "melds"},
+    "required": [k for k in SEAT_SCHEMA_V2["required"] if k != "melds"],
+}
+
+
 DORA_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데를 위에서 찍은 것입니다. 가운데 기기 둘레에 네 자리의 버림패(강)가 6장씩 줄지어 있습니다. {_ONLY_SEE}
 
 - indicators: 강 줄에 붙어 있지 않고 펠트 위에 따로 떨어져 놓인 앞면 패 전부(도라·뒷도라 표시패). 보통 1~4장이 한 줄로,
@@ -539,6 +574,11 @@ def normalize_seat_v2(data: dict) -> dict:
         "loose": [t for t in (_code(x) for x in data.get("loose") or []) if t],
         "notes": h["notes"],
     }
+
+
+def normalize_handonly_v2(data: dict) -> dict:
+    """손패 전용 판독 → normalize_seat_v2 와 같은 모양(melds 는 빈 배열). 앱은 추적해 둔 울기를 채운다."""
+    return normalize_seat_v2({**data, "melds": []})
 
 
 def seat_key(seat: dict) -> tuple:

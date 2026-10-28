@@ -60,7 +60,10 @@ def test_health(monkeypatch):
     with TestClient(server.app) as client:
         r = client.get("/")
         assert r.status_code == 200
-        assert "/v1/locate" in r.json()["endpoints"]
+        body = r.json()
+        assert "/v1/locate" in body["endpoints"]
+        assert "/v2/handonly" in body["endpoints"]
+        assert body["git_sha"] == "unknown"
 
 
 def test_503_without_recognizer(monkeypatch):

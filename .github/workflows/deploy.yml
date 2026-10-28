@@ -4,6 +4,11 @@ name: deploy
 on:
   push:
     branches: [master]
+    paths-ignore:          # 문서·클라이언트 스크립트만 바뀌면 빌드·배포 안 함
+      - "**.md"
+      - "docs/**"
+      - "scripts/**"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
@@ -90,3 +95,24 @@ jobs:
             exit 1
           fi
           echo "배포 성공"
+
+      - name: 운영 확인 (새 이미지가 떴는지, 코드의 라우트가 다 있는지)
+        env:
+          SHA: ${{ github.sha }}
+          URL: https://mahjong.ai-agent-develop.cloud
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            body=$(curl -sS --max-time 10 "$URL/" || true)
+            live=$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("git_sha",""))' 2>/dev/null || true)
+            [ "$live" = "$SHA" ] && break
+            echo "운영 git_sha=$live (기대 $SHA) — 10초 뒤 재확인 ($i/12)"
+            sleep 10
+          done
+          [ "$live" = "$SHA" ] || { echo "운영이 아직 옛 이미지: $live"; exit 1; }
+          printf '%s' "$body" | python3 -c 'import json,sys; b=json.load(sys.stdin); print("status", b["status"], "model", b["model"]); assert b["status"]=="ok"'
+          grep -o '@app.post("[^"]*")' app/main.py | cut -d '"' -f 2 | sort > want.txt
+          curl -sS --max-time 10 "$URL/openapi.json" | python3 -c 'import json,sys; [print(p) for p in sorted(json.load(sys.stdin)["paths"])]' > have.txt
+          missing=$(comm -23 want.txt have.txt)
+          if [ -n "$missing" ]; then echo "코드에는 있는데 운영에 없는 라우트:"; echo "$missing"; exit 1; fi
+          echo "라우트 전부 운영에 있음: $(paste -sd ' ' want.txt)"

@@ -100,9 +100,11 @@ def startup() -> None:
 
 @app.get("/")
 def health() -> dict:
+    # endpoints 는 등록된 POST 라우트에서 뽑는다(손으로 적던 목록에 /v2/handonly 가 빠졌던 적이 있다).
+    # git_sha 는 Dockerfile 이 넣는 GIT_SHA — 배포 워크플로가 이 값으로 새 이미지가 떴는지 확인한다.
+    endpoints = sorted(r.path for r in app.routes if "POST" in getattr(r, "methods", ()))
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
-            "endpoints": ["/v1/recognize", "/v1/locate", "/v1/table", "/v2/hand", "/v2/river", "/v2/meld", "/v2/center",
-                          "/v2/corner", "/v2/last", "/v2/last3", "/v2/sticks", "/v2/dora", "/v2/seat"]}
+            "git_sha": os.environ.get("GIT_SHA", "unknown"), "endpoints": endpoints}
 
 
 def _check_key(x_api_key: str | None) -> None:

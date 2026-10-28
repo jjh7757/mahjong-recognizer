@@ -322,6 +322,39 @@ def normalize_last_tiles(data: dict, n: int) -> list[dict | None]:
             for i in range(n)]
 
 
+# 자리 판독도 틀은 YOLO11 검출 + 규칙(app/seat.py)로 잡고, 조각을 번호 칸에 붙인 그림 한 장의 종류만 읽는다.
+# 조각 13장을 따로 보내면 입력 17.9k 토큰, 한 장 그림이면 3.7k — C·D 40회: 정답 같음, Gemini 중앙 6.5 → 4.9초, p90 11.4 → 7.7초
+# (mahjong_calc/experiments/speed/seat_yolo.py --det mosaic --layout sheet, NOTES 23). 문구는 측정한 것에서 뒷면 색 이름만 뺌.
+PIECE_PROMPT = """첫 사진은 리치마작 테이블 위의 패 {n}장을 한 장씩 잘라 번호(1~{n}) 칸에 순서대로 붙인 것입니다(칸 가장자리에 이웃 패가 조금 걸릴 수 있음).
+
+- tiles: 번호 순서대로 정확히 {n}개. 칸 가운데에 온전히 보이는 패 한 장의 종류(code)와 확신도.
+  옆으로 눕힌 패는 그대로 읽습니다. 무늬 없는 단색 뒷면만 보이면 code 를 "back" 으로 적습니다.
+- 장수·순서·묶음은 이미 정해져 있습니다. 패를 더하거나 빼지 않습니다.
+
+{notation}
+
+마지막 사진은 이 패 세트의 통수(1p~9p)·삭수(1s~9s) 실물 참고표입니다(이름표가 위에 있음). 통수·삭수는 참고표와 무늬 개수·배치를 비교해 정합니다.
+참고표는 답에 넣지 않습니다."""
+
+
+def piece_prompt(n: int) -> str:
+    return PIECE_PROMPT.format(n=n, notation=NOTATION)
+
+
+def piece_schema(n: int) -> dict:
+    item = {"type": "object", "properties": {"code": {"type": "string", "enum": TILE_CODES + ["back"]},
+                                             "confidence": {"type": "number"}}, "required": ["code", "confidence"]}
+    return {"type": "object", "properties": {"tiles": {"type": "array", "items": item, "minItems": n, "maxItems": n},
+                                             "notes": {"type": "string"}}, "required": ["tiles"]}
+
+
+def normalize_pieces(data: dict, n: int) -> list[dict | None]:
+    """→ 칸 순서대로 {tile, conf} 또는 None(뒷면·못 읽음). 장수가 n 과 다르면 모자란 칸은 None."""
+    tiles = data.get("tiles") if isinstance(data.get("tiles"), list) else []
+    out = [_code(t) for t in tiles[:n]]
+    return out + [None] * (n - len(out))
+
+
 def last_multi_prompt(n: int) -> str:
     """강 끝 n 장 + 마지막에 참고표 한 장(recognizer 가 붙인다)."""
     keys = ", ".join(f"photo{i + 1}" for i in range(n))

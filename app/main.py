@@ -53,6 +53,8 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 16))
 # 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡을지(app/river.py). 0 이면 강 크롭을 통째로 읽는다. 검출 기준값은 RIVER_CONF.
 RIVER_FRAME = os.environ.get("RIVER_FRAME", "1") == "1"
 RIVER_CONF = float(os.environ.get("RIVER_CONF", 0.04))
+# 자리 판독(/v2/seat)의 손패 틀을 YOLO11 검출로 잡아 조각 그림 한 장만 읽을지(app/seat.py). 틀을 못 잡으면 통째 읽기.
+SEAT_FRAME = os.environ.get("SEAT_FRAME", "1") == "1"
 
 app = FastAPI(title="mahjong-recognizer", version="0.3.0")
 recognizer: GeminiRecognizer | None = None
@@ -84,16 +86,21 @@ _limiter = RateLimiter(RATE_PER_MIN)
 def startup() -> None:
     global recognizer
     if GEMINI_API_KEY:
-        locator = None
+        locator = seat_locator = None
         if RIVER_FRAME:
             from .river import RiverLocator
 
             locator = RiverLocator(conf=RIVER_CONF)
+        if SEAT_FRAME:
+            from .seat import SeatLocator
+
+            seat_locator = SeatLocator(shared=locator, conf=RIVER_CONF)  # 검출 모델은 강 틀과 하나
         recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
-                                      locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS, river_locator=locator)
+                                      locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS, river_locator=locator,
+                                      seat_locator=seat_locator)
         log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d "
-                 "river_frame=%s(conf %.2f)", GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT,
-                 SEAT_READS, RIVER_FRAME, RIVER_CONF)
+                 "river_frame=%s(conf %.2f) seat_frame=%s", GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING,
+                 MAX_CONCURRENT, SEAT_READS, RIVER_FRAME, RIVER_CONF, SEAT_FRAME)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 
@@ -193,8 +200,10 @@ async def _observe(kind: str, image: UploadFile, x_api_key: str | None) -> dict:
     # 이미지 해상도를 ULTRA_HIGH 로 읽는 판독은 원본에 가깝게 받는다(1568 로 줄이면 올린 효과가 줄어든다).
     jpeg = await _accept(image, x_api_key, max_side=3072 if kind in ULTRA_HIGH_KINDS else 1568)
     c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS), jpeg)
-    log.info("observe/%s %s -> %s in %d ms (tokens %d+%d)", kind, image.filename,
-             str({k: v for k, v in c.data.items() if k != "notes"})[:300], c.latency_ms, c.input_tokens, c.output_tokens)
+    log.info("observe/%s%s %s -> %s in %d ms (tokens %d+%d)", kind,
+             f"[{c.data['method']}]" if "method" in c.data else "", image.filename,
+             str({k: v for k, v in c.data.items() if k not in ("notes", "method")})[:300],
+             c.latency_ms, c.input_tokens, c.output_tokens)
     return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
 
 

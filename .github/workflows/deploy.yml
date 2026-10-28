@@ -20,7 +20,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # CI: 테스트가 통과해야 아래 deploy 가 돈다. 가짜 recognizer 를 쓰므로 Gemini 키 불필요
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # Dockerfile 과 같은 버전
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+
   deploy:
+    needs: test
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4

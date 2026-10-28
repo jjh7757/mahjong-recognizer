@@ -74,12 +74,12 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 ## 로컬 실행
 
 ```
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # 운영 의존성 + pytest
 set GEMINI_API_KEY=...
 uvicorn app.main:app --reload
 curl -F image=@hand.jpg -H "X-Api-Key: ..." http://localhost:8000/v1/recognize
 python scripts/try_endpoint.py --mode hand|locate|table [--url ...] [--key-file ...] photo.jpg
-pytest
+pytest   # master push 시 GitHub Actions 가 먼저 돌리고, 통과해야 배포(.github/workflows/deploy.yml)
 ```
 
 ## 라이선스

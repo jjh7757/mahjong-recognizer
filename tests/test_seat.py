@@ -149,7 +149,50 @@ def test_seat_frame_back_piece_falls_back_to_whole():
     assert len(seen) == 6
 
 
-def test_handonly_ignores_seat_locator():
+def test_handonly_ignores_seat_locator_when_frame_off():
     r, seen = _recognizer(_Locator(), iter(["1s 2s 3s"] * 3))
+    r.handonly_frame = False
     c = r.observe(_jpeg(), "handonly", ultra_high=True)
+    assert c.data["method"] == "whole" and [p for p, _, _ in seen] == [ob.HANDONLY_PROMPT_V2] * 3
+
+
+def test_valid_adds_tracked_melds():
+    hand = _row(10)
+    fr = seat.structure(_canvas(hand), hand)
+    assert not seat.valid(fr)  # 울기를 잘라 낸 사진: 손패만 10장
+    assert seat.valid(fr, extra_melds=1)  # 이미 읽은 울기 하나(3장)를 더하면 13
+    assert not seat.valid(fr, extra_melds=2)
+
+
+class _HandLocator:
+    """울기를 잘라 낸 손패 칸(10장). 받은 울기 수로 실제 장수 검사를 한다."""
+
+    def __init__(self):
+        self.extra = []
+
+    def locate(self, jpeg, extra_melds=0):
+        self.extra.append(extra_melds)
+        hand = _row(10)
+        rgb = _canvas(hand)
+        fr = seat.structure(rgb, hand)
+        return (fr if seat.valid(fr, extra_melds) else None), rgb
+
+
+def test_handonly_frame_uses_tracked_meld_count():
+    loc = _HandLocator()
+    r, seen = _recognizer(loc, iter([" ".join(["2p"] * 10)] * 3))
+    r.handonly_frame = True
+    c = r.observe(_jpeg(), "handonly", ultra_high=True, melds=1)
+    assert c.data["method"] == "frame" and c.data["frame"]["hand"] == 10
+    assert [t["tile"] for t in c.data["tiles"]] == ["2p"] * 10
+    assert c.data["melds"] == []  # 울기는 앱이 이미 안다
+    assert loc.extra == [1]
+    assert seen == [(ob.piece_prompt(10), "MEDIA_RESOLUTION_ULTRA_HIGH", 1)] * 3
+
+
+def test_handonly_frame_without_meld_count_falls_back_to_whole():
+    loc = _HandLocator()
+    r, seen = _recognizer(loc, iter(["1s 2s 3s"] * 3))
+    r.handonly_frame = True
+    c = r.observe(_jpeg(), "handonly", ultra_high=True)  # 울기 수를 안 보낸 예전 앱: 10장은 장수 검사에 걸림
     assert c.data["method"] == "whole" and [p for p, _, _ in seen] == [ob.HANDONLY_PROMPT_V2] * 3

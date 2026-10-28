@@ -64,8 +64,9 @@ class FakeObserver(FakeRecognizer):
     def __init__(self):
         self.ultra = {}
 
-    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False) -> GeminiCall:
+    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False, melds: int = 0) -> GeminiCall:
         self.ultra[kind] = ultra_high
+        self.melds = melds
         data = {"river": {"tiles": [{"tile": "2s", "conf": 0.9, "sideways": False}], "riichi_stick": False, "notes": ""}}
         return GeminiCall(data.get(kind, {"notes": ""}), 20, 7, 3, "fake")
 
@@ -260,6 +261,16 @@ def test_seat_reads_fan_out_and_agree(monkeypatch):
     assert seen == [("MEDIA_RESOLUTION_ULTRA_HIGH", ["MEDIA_RESOLUTION_ULTRA_HIGH"] * 3 + [None])] * 3
     assert c.input_tokens == 300 and c.output_tokens == 60
     assert c.data["agreement"]["agree"] == 2 and not c.data["agreement"]["unanimous"]
+
+
+def test_handonly_passes_meld_count(monkeypatch):
+    fake = FakeObserver()
+    monkeypatch.setattr(server, "recognizer", fake)
+    monkeypatch.setattr(server, "API_KEY", "")
+    client = TestClient(server.app)
+    assert client.post("/v2/handonly?melds=2", files=_upload()).status_code == 200
+    assert fake.melds == 2
+    assert client.post("/v2/handonly?melds=9", files=_upload()).status_code == 422  # 울기는 최대 4묶음
 
 
 def test_handonly_prompt_and_schema_drop_melds():

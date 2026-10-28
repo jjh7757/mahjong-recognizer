@@ -28,7 +28,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 
 from .observe import LAST_MULTI_MAX
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image
@@ -55,6 +55,10 @@ RIVER_FRAME = os.environ.get("RIVER_FRAME", "1") == "1"
 RIVER_CONF = float(os.environ.get("RIVER_CONF", 0.04))
 # 자리 판독(/v2/seat)의 손패 틀을 YOLO11 검출로 잡아 조각 그림 한 장만 읽을지(app/seat.py). 틀을 못 잡으면 통째 읽기.
 SEAT_FRAME = os.environ.get("SEAT_FRAME", "1") == "1"
+# 손패 전용(/v2/handonly, 울기를 잘라 낸 사진)도 같은 손패 틀 + 조각 읽기로. 틀의 장수 검사에는 요청의 ?melds=(앱이 게임 중에
+# 확정한 울기 수)를 더한다. SEAT_FRAME 이 꺼져 있으면(검출기 없음) 이것도 통째 읽기.
+# B·D 60장면 같은 순간: 통째 p90 10.7 → 틀 8.0초, 정답 60/60 둘 다(mahjong_calc docs/metrics.md 표 2-1, 2026-10-28).
+HANDONLY_FRAME = os.environ.get("HANDONLY_FRAME", "1") == "1"
 
 app = FastAPI(title="mahjong-recognizer", version="0.3.0")
 recognizer: GeminiRecognizer | None = None
@@ -97,10 +101,10 @@ def startup() -> None:
             seat_locator = SeatLocator(shared=locator, conf=RIVER_CONF)  # 검출 모델은 강 틀과 하나
         recognizer = GeminiRecognizer(GEMINI_API_KEY, model=GEMINI_MODEL, thinking=GEMINI_THINKING,
                                       locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS, river_locator=locator,
-                                      seat_locator=seat_locator)
+                                      seat_locator=seat_locator, handonly_frame=HANDONLY_FRAME)
         log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d "
-                 "river_frame=%s(conf %.2f) seat_frame=%s", GEMINI_MODEL, GEMINI_THINKING, LOCATE_THINKING,
-                 MAX_CONCURRENT, SEAT_READS, RIVER_FRAME, RIVER_CONF, SEAT_FRAME)
+                 "river_frame=%s(conf %.2f) seat_frame=%s handonly_frame=%s", GEMINI_MODEL, GEMINI_THINKING,
+                 LOCATE_THINKING, MAX_CONCURRENT, SEAT_READS, RIVER_FRAME, RIVER_CONF, SEAT_FRAME, HANDONLY_FRAME)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
 
@@ -196,10 +200,11 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
     return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
 
 
-async def _observe(kind: str, image: UploadFile, x_api_key: str | None) -> dict:
+async def _observe(kind: str, image: UploadFile, x_api_key: str | None, melds: int = 0) -> dict:
     # 이미지 해상도를 ULTRA_HIGH 로 읽는 판독은 원본에 가깝게 받는다(1568 로 줄이면 올린 효과가 줄어든다).
     jpeg = await _accept(image, x_api_key, max_side=3072 if kind in ULTRA_HIGH_KINDS else 1568)
-    c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS), jpeg)
+    opts = {"melds": melds} if melds else {}  # 손패 전용에서 앱이 이미 읽은 울기 수(있을 때만)
+    c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS, **opts), jpeg)
     log.info("observe/%s%s %s -> %s in %d ms (tokens %d+%d)", kind,
              f"[{c.data['method']}]" if "method" in c.data else "", image.filename,
              str({k: v for k, v in c.data.items() if k not in ("notes", "method")})[:300],
@@ -271,10 +276,12 @@ async def observe_dora(image: UploadFile = File(...), x_api_key: str | None = He
 
 
 @app.post("/v2/handonly")
-async def observe_handonly(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+async def observe_handonly(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
+                           melds: int = Query(0, ge=0, le=4)) -> dict:
     """판 상태 추적용: 격자 자리의 손패 칸만(울기 모서리는 잘라 낸 것, 그 자리 방향으로 세운 것) → 앞면 여부·손패·따로 놓인 패.
-    울기는 앱이 게임 중에 미리 읽어 둔 것을 쓴다(melds 는 늘 빈 배열). /v2/seat 와 같이 SEAT_READS 번 동시에 읽어 `agreement`."""
-    return await _observe("handonly", image, x_api_key)
+    울기는 앱이 게임 중에 미리 읽어 둔 것을 쓴다(melds 는 늘 빈 배열). /v2/seat 와 같이 SEAT_READS 번 동시에 읽어 `agreement`.
+    [melds] 는 그 울기 묶음 수 — 손패 틀(HANDONLY_FRAME)의 장수 검사(손패 + 떨어진 한 장 + 울기×3 = 13·14)에 더한다."""
+    return await _observe("handonly", image, x_api_key, melds)
 
 
 @app.post("/v2/seat")

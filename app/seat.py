@@ -164,9 +164,10 @@ def structure(rgb: np.ndarray, boxes: list[Box], white: np.ndarray | None = None
     return SeatFrame(hand, sep, melds, loose, tw, th, len(boxes))
 
 
-def valid(fr: SeatFrame | None) -> bool:
-    """장수 검사(정답 없이): 손패 + 떨어진 한 장 + 울기(묶음마다 3장으로 셈)가 13 또는 14."""
-    return fr is not None and fr.count in (13, 14)
+def valid(fr: SeatFrame | None, extra_melds: int = 0) -> bool:
+    """장수 검사(정답 없이): 손패 + 떨어진 한 장 + 울기(묶음마다 3장으로 셈)가 13 또는 14.
+    [extra_melds] 는 사진 밖에서 이미 읽은 울기 묶음 수(손패 전용 — 울기를 잘라 낸 사진)."""
+    return fr is not None and fr.count + 3 * extra_melds in (13, 14)
 
 
 def strict_ok(fr: SeatFrame) -> bool:
@@ -214,7 +215,7 @@ def safe_ok(fr: SeatFrame, rgb: np.ndarray) -> bool:
     return all(ink(rgb, x) >= INK_MIN for kind, x in fr.pieces() if kind != "loose")
 
 
-def frame(rgb: np.ndarray, det: rv.TileDetector) -> SeatFrame | None:
+def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0) -> SeatFrame | None:
     """자리 크롭 → 틀. 장수·모양 검사를 못 넘으면 None(통째 읽기로)."""
     white = rv.white_mask(rgb)
     got = mosaic(det, rgb, white)
@@ -223,7 +224,7 @@ def frame(rgb: np.ndarray, det: rv.TileDetector) -> SeatFrame | None:
     boxes, _, _ = got
     boxes = [x for x in boxes if ink(rgb, x) >= INK_MIN]  # 무늬 없는 상자(테이블 테두리 등)는 버림
     fr = structure(rgb, boxes, white)
-    if not valid(fr) or not safe_ok(fr, rgb):
+    if not valid(fr, extra_melds) or not safe_ok(fr, rgb):
         return None
     # 따로 놓인 패(도라 표시패 후보)는 손패 띠 안에서 온전히 보이는 것만: 손패 패와 크기가 비슷하고 사진 가장자리에 안 걸림.
     # 띠 밖(통째 검출)은 이웃 강·잘린 패가 섞여 넣지 않는다 — 가운데 칸 도라 판독이 따로 있다.
@@ -311,6 +312,6 @@ class SeatLocator:
                 self._det = rv.TileDetector(conf=self.conf)
             return self._det
 
-    def locate(self, jpeg: bytes) -> tuple[SeatFrame | None, np.ndarray]:
+    def locate(self, jpeg: bytes, extra_melds: int = 0) -> tuple[SeatFrame | None, np.ndarray]:
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
-        return frame(rgb, self._detector()), rgb
+        return frame(rgb, self._detector(), extra_melds), rgb

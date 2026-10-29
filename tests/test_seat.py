@@ -190,6 +190,67 @@ def test_handonly_frame_uses_tracked_meld_count():
     assert seen == [(ob.piece_prompt(10), "MEDIA_RESOLUTION_ULTRA_HIGH", 1)] * 3
 
 
+def test_structure_split_hand_row_and_corner_melds():
+    """손패 칸(경계 1200 왼쪽)의 한 줄 7장 = 손패, 모서리 쪽에 붙어 놓인 6장 = 울기 3+3, 테이블 밖(펠트 없음) 상자는 버림."""
+    hand = _row(7)
+    melds = _row(6, x0=1300, y=420)
+    off = [(1880, 100, 60, 80)]
+    rgb = _canvas(hand + melds + off)
+    rgb[:, 1700:] = (128, 128, 128)  # 탁자 밖(회색 바닥)
+    rgb[100:180, 1880:1940] = 245
+    rgb[126:154, 1900:1920] = 20
+    fr = seat.structure_split(rgb, hand + melds + off, split=1200)
+    assert fr.split and fr.hand == hand and fr.separate is None
+    assert fr.melds == [melds[:3], melds[3:]]
+    assert off[0] not in fr.loose and fr.count == 13
+    assert seat.valid(fr) and seat.safe_ok(fr, rgb)
+    assert fr.summary()["split"] is True and "split" not in seat.structure(rgb, hand).summary()
+
+
+def test_structure_split_ignores_hand_cell_boxes_off_the_row():
+    """손패 칸에 있어도 손패 줄 직선에서 벗어난 3장 묶음(먼 자리의 울기가 손패 칸 아래로 넘어옴)은 울기."""
+    hand = _row(10)
+    meld = _row(3, x0=900, y=420)
+    fr = seat.structure_split(_canvas(hand + meld), hand + meld, split=1200)
+    assert fr.hand == hand and fr.melds == [meld] and seat.valid(fr)
+
+
+def test_table_region_keeps_edge_tiles_and_cuts_far_outside():
+    """펠트(위·왼쪽) + 흰 테두리(아래·오른쪽) + 바닥. 끝에 걸친 패와 끝에서 패 1.7장 안 테두리는 두고, 그 밖은 지운다."""
+    rgb = np.full((400, 1000, 3), 90, np.uint8)  # 바닥(회색)
+    rgb[:330, :900] = 240  # 흰 테두리
+    rgb[:300, :850, :] = (0, 120, 0)  # 펠트
+    rgb[250:330, 780:840] = 245  # 펠트 끝에 걸친 패
+    region = seat.table_region(rgb)
+    assert region[290, 810] and region[320, 810]  # 패(펠트 끝 아래로 나온 부분까지)
+    assert region[100, 100] and region[310, 400]  # 펠트 안, 끝 바로 아래 테두리
+    assert not region[395, 400] and not region[100, 990]  # 끝에서 멀리 떨어진 바닥
+    out = seat.table_only(rgb)
+    assert (out[395, 400] == seat.TABLE_FILL).all() and (out[290, 810] == 245).all()
+    assert seat.table_only(np.full((100, 300, 3), 240, np.uint8)).mean() == 240  # 펠트 없으면 그대로
+
+
+class _SplitLocator:
+    def __init__(self):
+        self.opts = []
+
+    def locate(self, jpeg, **opts):
+        self.opts.append(opts)
+        hand = _row(13)
+        rgb = _canvas(hand)
+        return seat.structure(rgb, hand), rgb
+
+
+def test_hand_frac_goes_to_seat_locator_only_for_seat():
+    loc = _SplitLocator()
+    r, _ = _recognizer(loc, iter([" ".join(["1m"] * 13)] * 9))
+    r.handonly_frame = True
+    r.observe(_jpeg(), "seat", ultra_high=True, hand_frac=0.7)
+    r.observe(_jpeg(), "seat", ultra_high=True)
+    r.observe(_jpeg(), "handonly", ultra_high=True, hand_frac=0.7)  # 손패 전용엔 모서리가 없다
+    assert loc.opts == [{"hand_frac": 0.7}, {}, {}]
+
+
 def test_handonly_frame_without_meld_count_falls_back_to_whole():
     loc = _HandLocator()
     r, seen = _recognizer(loc, iter(["1s 2s 3s"] * 3))

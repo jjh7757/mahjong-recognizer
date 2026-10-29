@@ -40,6 +40,7 @@ class SeatFrame:
     tw: float = 0.0
     th: float = 0.0
     detected: int = 0
+    split: bool = False  # 손패 칸·모서리 칸으로 나눠 잡은 틀(frame_split)
 
     @property
     def count(self) -> int:
@@ -57,7 +58,7 @@ class SeatFrame:
 
     def summary(self) -> dict:
         return {"hand": len(self.hand), "separate": self.separate is not None, "melds": [len(m) for m in self.melds],
-                "loose": len(self.loose), "detected": self.detected}
+                "loose": len(self.loose), "detected": self.detected, **({"split": True} if self.split else {})}
 
 
 # ---------------------------------------------------------------- 검출(띠 + 모자이크)
@@ -215,8 +216,80 @@ def safe_ok(fr: SeatFrame, rgb: np.ndarray) -> bool:
     return all(ink(rgb, x) >= INK_MIN for kind, x in fr.pieces() if kind != "loose")
 
 
-def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0) -> SeatFrame | None:
-    """자리 크롭 → 틀. 장수·모양 검사를 못 넘으면 None(통째 읽기로)."""
+# ---------------------------------------------------------------- 탁자 안만(펠트 끝에서 자르기)
+# 사용자 제안(2026-10-28): 자리 크롭에서 탁자 끝(펠트 경계) 밖 — 흰 테두리·자리 표시판·바닥 — 을 지우고 검출한다.
+# 흰 테두리는 패 면과 색이 같아, 탁자 끝에 놓인 울기 상자가 테두리까지 번지거나(D 8만) 테두리 조각을 패로 잡았다.
+
+TABLE_SCALE = 320  # 펠트 찾기는 긴 변 320 으로 줄여서
+TABLE_WIN = 0.08  # 끝에 놓인 패에 가려진 펠트 끝은 좌우·위아래 폭의 8% 안 이웃 끝으로 메운다(울기 3~4장 너비)
+# 탁자 끝에서 폭의 6%(패 약 1.7장)까지는 둔다. 울기는 끝에 걸치거나 모서리 흰 테두리 위에 놓인다(B 發 퐁, D 8만) —
+# 1.5% 로 바짝 자르면 B·C·D 틀 6/6 → 5/6·울기 합성 7/14 → 4/14, 3%·4.5% 도 합성 4·5/14, 6% 에서 6/6·8/14(틀린 틀 0).
+TABLE_PAD = 0.06
+TABLE_FILL = 114  # 지운 곳 색(모자이크 바탕과 같은 회색)
+
+
+def _majority(m: np.ndarray, r: int) -> np.ndarray:
+    """(2r+1)² 창에서 절반 넘게 참이면 참 — 펠트 결의 잡티를 지운다."""
+    k = 2 * r + 1
+    c = np.pad(m.astype(np.int32), r, mode="edge").cumsum(0).cumsum(1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+    return s * 2 > k * k
+
+
+def _running_max(a: np.ndarray, k: int) -> np.ndarray:
+    return np.lib.stride_tricks.sliding_window_view(np.pad(a, k, constant_values=-1), 2 * k + 1).max(1)
+
+
+def table_region(rgb: np.ndarray) -> np.ndarray | None:
+    """자리 크롭(그 사람 방향, 탁자 끝이 아래·모서리가 오른쪽)에서 탁자 안 마스크. 펠트를 못 찾으면 None(지우지 않음).
+    위쪽 1/4 의 펠트에서 펠트 안으로 번진 덩어리 → 칸마다 가장 아래 펠트 = 아래 끝, 줄마다 가장 오른쪽 펠트 = 오른쪽 끝 →
+    끝에 놓인 패가 가린 곳은 이웃 끝의 최댓값으로 메움 → 두 끝 안쪽(+ 여유)."""
+    H, W = rgb.shape[:2]
+    w = TABLE_SCALE
+    h = max(1, round(H * w / W))
+    small = np.asarray(Image.fromarray(rgb).resize((w, h), Image.BILINEAR))
+    felt = _majority(felt_mask(small), 1)
+    reg = felt.copy()
+    reg[h // 4:] = False
+    if not reg.any() or felt.mean() < 0.05:
+        return None
+    while True:  # 펠트 안으로 번지기(가장 큰 덩어리, 바닥의 푸른 물건은 안 닿음)
+        g = reg.copy()
+        g[1:] |= reg[:-1]
+        g[:-1] |= reg[1:]
+        g[:, 1:] |= reg[:, :-1]
+        g[:, :-1] |= reg[:, 1:]
+        g &= felt
+        if np.array_equal(g, reg):
+            break
+        reg = g
+    k = max(1, int(TABLE_WIN * w))
+    bottom = _running_max(np.where(reg.any(0), h - 1 - np.argmax(reg[::-1], 0), -1), k)
+    right = _running_max(np.where(reg.any(1), w - 1 - np.argmax(reg[:, ::-1], 1), -1), k)
+    pad = TABLE_PAD * w
+    inside = (np.arange(h)[:, None] <= bottom[None, :] + pad) & (np.arange(w)[None, :] <= right[:, None] + pad)
+    return np.asarray(Image.fromarray(inside).resize((W, H), Image.NEAREST))
+
+
+def table_only(rgb: np.ndarray) -> np.ndarray:
+    """탁자 밖을 회색으로 지운 사본(못 찾으면 그대로)."""
+    region = table_region(rgb)
+    if region is None:
+        return rgb
+    out = rgb.copy()
+    out[~region] = TABLE_FILL
+    return out
+
+
+def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0, hand_frac: float | None = None,
+          table: bool = False) -> SeatFrame | None:
+    """자리 크롭 → 틀. 장수·모양 검사를 못 넘으면 None(통째 읽기로).
+    [hand_frac] (격자 손패 칸이 자리 크롭에서 차지하는 폭 비율)이 있으면, 한 장 규칙이 못 잡은 자리를 손패 칸·모서리 칸으로
+    나눠 한 번 더 잡아 본다(frame_split). 한 장 규칙이 잡은 자리는 그대로 — 나눠 잡기는 더하기만 한다.
+    [table] 이면 탁자 끝 밖을 지운 사진으로 검출한다(table_only). 조각 그림은 원본에서 자른다(좌표는 같다)."""
+    if table:
+        rgb = table_only(rgb)
     white = rv.white_mask(rgb)
     got = mosaic(det, rgb, white)
     if got is None:
@@ -225,7 +298,9 @@ def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0) -> SeatFr
     boxes = [x for x in boxes if ink(rgb, x) >= INK_MIN]  # 무늬 없는 상자(테이블 테두리 등)는 버림
     fr = structure(rgb, boxes, white)
     if not valid(fr, extra_melds) or not safe_ok(fr, rgb):
-        return None
+        fr = frame_split(rgb, det, hand_frac, boxes, extra_melds) if hand_frac else None
+        if fr is None:
+            return None
     # 따로 놓인 패(도라 표시패 후보)는 손패 띠 안에서 온전히 보이는 것만: 손패 패와 크기가 비슷하고 사진 가장자리에 안 걸림.
     # 띠 밖(통째 검출)은 이웃 강·잘린 패가 섞여 넣지 않는다 — 가운데 칸 도라 판독이 따로 있다.
     H, W = rgb.shape[:2]
@@ -234,6 +309,143 @@ def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0) -> SeatFr
                 if ink(rgb, x) >= INK_MIN and 0.7 * fr.th <= x[3] <= 1.3 * fr.th and x[2] <= 1.6 * fr.tw
                 and x[0] >= m and x[0] + x[2] <= W - m and x[1] >= m and x[1] + x[3] <= H - m]
     return fr
+
+
+# ---------------------------------------------------------------- 손패 칸·모서리 칸 나눠 잡기
+# 실험: mahjong_calc/experiments/speed/seat_zones.py(NOTES·metrics 표 2-3). 한 장 규칙은 먼 자리(B)에서 손패 띠를 울기 쪽과
+# 섞어 잡아 장수가 안 맞았다. 격자 선으로 손패 칸만 따로 모자이크하면 패가 커져 놓치던 패를 찾고, 울기는 모서리 칸에서 찾는다.
+
+SPLIT_MARGIN = 0.03  # 경계 양쪽으로 자리 폭의 3% 겹쳐 검출(선을 넘은 패)
+SPLIT_MELD = {6: (3, 3), 8: (4, 4)}  # 붙어 놓인 울기 둘
+RUN_GAP = 0.45  # 손패 줄 안 이웃 틈 < 패 0.45개
+TABLE_REACH = 1.3  # 상자 가운데에서 패 1.3개 안에 펠트가 없으면 테이블 밖(울기는 흰 테두리 위에도 놓인다)
+CORNER_K = 2  # 모서리만 잘라 검출할 때 토막 수
+
+
+def fit_line(faces: list[Box]) -> tuple[float, float] | None:
+    """가운데점 RANSAC(모든 쌍) → 가장 많은 상자가 패 높이 0.35 안에 드는 직선(기울기 0.3 이하), 최소제곱으로 다듬음."""
+    if len(faces) < 3:
+        return None
+    th = statistics.median(x[3] for x in faces)
+    tw = statistics.median(x[2] for x in faces)
+    c = [(x[0] + x[2] / 2, x[1] + x[3] / 2) for x in faces]
+    best: list[Box] | None = None
+    for i in range(len(c)):
+        for j in range(i + 1, len(c)):
+            (x1, y1), (x2, y2) = c[i], c[j]
+            if abs(x2 - x1) < tw:
+                continue
+            m = (y2 - y1) / (x2 - x1)
+            if abs(m) > 0.3:
+                continue
+            k = y1 - m * x1
+            inl = [f for f, (cx, cy) in zip(faces, c) if abs(cy - (m * cx + k)) < 0.35 * th]
+            if best is None or len(inl) > len(best):
+                best = inl
+    if best is None or len(best) < 3:
+        return None
+    m, k = np.polyfit([f[0] + f[2] / 2 for f in best], [f[1] + f[3] / 2 for f in best], 1)
+    return float(m), float(k)
+
+
+def felt_mask(rgb: np.ndarray) -> np.ndarray:
+    """펠트(초록~파랑, 채도 있는 면) — 탁자 안쪽(앱 rectify.dart findFeltQuad 와 같은 생각)."""
+    hsv = np.asarray(Image.fromarray(rgb).convert("HSV")).astype(int)
+    h = hsv[..., 0] * 360 // 255
+    return (h >= 70) & (h <= 250) & (hsv[..., 1] > 60) & (hsv[..., 2] > 40)
+
+
+def on_table(faces: list[Box], rgb: np.ndarray, reach: float) -> list[Box]:
+    m = felt_mask(rgb)
+    H, W = m.shape
+    r = int(reach)
+    out = []
+    for f in faces:
+        cx, cy = int(f[0] + f[2] / 2), int(f[1] + f[3] / 2)
+        if m[max(0, cy - r):min(H, cy + r), max(0, cx - r):min(W, cx + r)].any():
+            out.append(f)
+    return out
+
+
+def hand_cell_boxes(det: rv.TileDetector, rgb: np.ndarray, split: int) -> list[Box]:
+    """손패 칸(경계 + 여유까지)만 모자이크한 상자."""
+    hand_rgb = np.ascontiguousarray(rgb[:, :split + int(rgb.shape[1] * SPLIT_MARGIN)])
+    got = mosaic(det, hand_rgb, rv.white_mask(hand_rgb))
+    return [x for x in (got[0] if got else []) if ink(hand_rgb, x) >= INK_MIN]
+
+
+def corner_cell_boxes(det: rv.TileDetector, rgb: np.ndarray, split: int) -> list[Box]:
+    """모서리 칸만 잘라 모자이크한 상자(원래 좌표)."""
+    x0 = max(0, split - int(rgb.shape[1] * SPLIT_MARGIN))
+    corner = np.ascontiguousarray(rgb[:, x0:])
+    got = mosaic(det, corner, rv.white_mask(corner), k=CORNER_K)
+    out = []
+    for bx in (got[0] if got else []):
+        nb = (bx[0] + x0, bx[1], bx[2], bx[3])
+        if ink(rgb, nb) >= INK_MIN:
+            out.append(nb)
+    return out
+
+
+def structure_split(rgb: np.ndarray, faces: list[Box], split: int) -> SeatFrame | None:
+    """손패 = 손패 칸 상자 중 한 직선 위(세운 패)에 틈 없이 이어진 가장 긴 줄, 그 뒤 패 2.5개 안 한 장 = 떨어진 패.
+    울기 = 나머지 중 손패 줄 시작보다 오른쪽 것을 틈으로 묶은 3·4장(6 → 3+3, 8 → 4+4). 나머지는 loose."""
+    if not faces:
+        return None
+    W = rgb.shape[1]
+    up = [x for x in faces if x[3] > x[2]] or faces
+    tw = statistics.median(x[2] for x in up)
+    th = statistics.median(x[3] for x in up)
+    faces = on_table(faces, rgb, TABLE_REACH * th)
+    hand_side = [f for f in faces if f[0] + f[2] / 2 < split + SPLIT_MARGIN * W]
+    line = fit_line(hand_side)
+    if line is None:
+        return None
+    a, c = line
+    on = sorted([f for f in hand_side if abs(f[1] + f[3] / 2 - (a * (f[0] + f[2] / 2) + c)) < 0.5 * th and f[3] > f[2]],
+                key=lambda x: x[0])
+    if not on:
+        return None
+    runs = [[on[0]]]
+    for f in on[1:]:
+        if f[0] - (runs[-1][-1][0] + runs[-1][-1][2]) > RUN_GAP * tw:
+            runs.append([f])
+        else:
+            runs[-1].append(f)
+    hand = max(runs, key=len)
+    after = runs[runs.index(hand) + 1:]
+    hx1 = hand[-1][0] + hand[-1][2]
+    sep = after[0][0] if after and len(after[0]) == 1 and after[0][0][0] - hx1 < SEP_DIST * tw else None
+    used = set(hand) | ({sep} if sep else set())
+    rest = [f for f in faces if f not in used and f[0] > hand[0][0]]
+    loose = [f for f in faces if f not in used and f not in rest]
+    melds = []
+    for g in cluster(rest, tw * GAP, th * 0.5):
+        g = sorted(g, key=lambda x: x[0])
+        if len(g) in (3, 4):
+            melds.append(g)
+        elif len(g) in SPLIT_MELD:
+            k = SPLIT_MELD[len(g)][0]
+            melds += [g[:k], g[k:]]
+        else:
+            loose.extend(g)
+    melds.sort(key=lambda m: m[0][0])
+    return SeatFrame(hand, sep, melds, loose, tw, th, len(faces), split=True)
+
+
+def frame_split(rgb: np.ndarray, det: rv.TileDetector, hand_frac: float, full: list[Box],
+                extra_melds: int = 0) -> SeatFrame | None:
+    """손패 칸·모서리 칸으로 나눠 틀 잡기 — 검사(장수·모양·무늬)를 넘는 첫 것. 손패 칸은 따로 모자이크(패가 커져 놓치던 패를
+    찾음), 모서리 칸은 자리 전체 모자이크 상자([full] 중 경계 오른쪽)를 먼저 쓰고, 안 되면 모서리만 잘라 모자이크한다
+    (따로 자르면 상자가 커져 서로 겹치기 쉬워 두 번째로)."""
+    split = int(rgb.shape[1] * hand_frac)
+    hand = hand_cell_boxes(det, rgb, split)
+    white = rv.white_mask(rgb)
+    for corner in (lambda: [x for x in full if x[0] + x[2] / 2 >= split], lambda: corner_cell_boxes(det, rgb, split)):
+        fr = structure_split(rgb, rv.dedupe(rv.keep_faces(hand + corner(), white)), split)
+        if valid(fr, extra_melds) and safe_ok(fr, rgb):
+            return fr
+    return None
 
 
 def sideways(x: Box) -> bool:
@@ -298,9 +510,10 @@ def to_seat(fr: SeatFrame, tiles: list[dict | None]) -> dict | None:
 class SeatLocator:
     """자리 크롭 JPEG → (SeatFrame 또는 None, rgb). 검출기는 강 틀(RiverLocator)과 같이 쓴다(모델 하나, 잠금 하나)."""
 
-    def __init__(self, shared: rv.RiverLocator | None = None, conf: float = 0.04):
+    def __init__(self, shared: rv.RiverLocator | None = None, conf: float = 0.04, table: bool = False):
         self._shared = shared
         self.conf = conf
+        self.table = table  # 탁자 끝 밖을 지우고 검출(frame 의 table)
         self._det: rv.TileDetector | None = None
         self._init = threading.Lock()
 
@@ -312,6 +525,7 @@ class SeatLocator:
                 self._det = rv.TileDetector(conf=self.conf)
             return self._det
 
-    def locate(self, jpeg: bytes, extra_melds: int = 0) -> tuple[SeatFrame | None, np.ndarray]:
+    def locate(self, jpeg: bytes, extra_melds: int = 0, hand_frac: float | None = None) \
+            -> tuple[SeatFrame | None, np.ndarray]:
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
-        return frame(rgb, self._detector(), extra_melds), rgb
+        return frame(rgb, self._detector(), extra_melds, hand_frac, self.table), rgb

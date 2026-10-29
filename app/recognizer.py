@@ -210,8 +210,9 @@ class GeminiRecognizer:
         c.data = normalize_table(c.data)
         return c
 
-    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False, melds: int = 0) -> GeminiCall:
-        """/v2 관찰 전용 판독. kind = hand | river | meld | center | corner | last | sticks | dora | seat."""
+    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False, melds: int = 0,
+                hand_frac: float | None = None) -> GeminiCall:
+        """/v2 관찰 전용 판독. kind = hand | river | meld | center | corner | last | sticks | dora | seat | handonly | wall | walldora."""
         from . import observe as ob
 
         prompt, schema, norm = {
@@ -225,13 +226,18 @@ class GeminiRecognizer:
             "dora": (ob.DORA_PROMPT_V2, ob.DORA_SCHEMA_V2, ob.normalize_dora_v2),
             "seat": (ob.SEAT_PROMPT_V2, ob.SEAT_SCHEMA_V2, ob.normalize_seat_v2),
             "handonly": (ob.HANDONLY_PROMPT_V2, ob.HANDONLY_SCHEMA_V2, ob.normalize_handonly_v2),
+            "wall": (ob.WALL_PROMPT_V2, ob.WALL_SCHEMA_V2, ob.normalize_wall_v2),
+            "walldora": (ob.WALLDORA_PROMPT_V2, ob.WALLDORA_SCHEMA_V2, ob.normalize_dora_v2),
+            "setup": (ob.SETUP_PROMPT_V2, ob.SETUP_SCHEMA_V2, ob.normalize_setup_v2),
         }[kind]
         resolution = "MEDIA_RESOLUTION_ULTRA_HIGH" if ultra_high else None
         # 손패 전용도 손패 틀 + 조각 읽기로(handonly_frame). 조각 읽기는 패 종류만 묻고 울기는 틀 규칙에서 나오는데,
         # 울기를 잘라 낸 사진이라 melds 는 빈 배열로 둔다. 틀의 장수 검사(13·14)에는 앱이 이미 읽은 울기 수([melds])를 더한다.
         handonly_frame = kind == "handonly" and getattr(self, "handonly_frame", False)
         if (kind == "seat" or handonly_frame) and getattr(self, "seat_locator", None) is not None:
-            c = self._observe_seat_frame(jpeg, resolution, extra_melds=melds if kind == "handonly" else 0)
+            # [hand_frac] 은 자리 판독만: 격자 손패 칸 폭 비율로 손패 칸·모서리 칸을 나눠 한 번 더 잡아 본다(seat.frame_split).
+            c = self._observe_seat_frame(jpeg, resolution, extra_melds=melds if kind == "handonly" else 0,
+                                         hand_frac=hand_frac if kind == "seat" else None)
             if c is not None:
                 if kind == "handonly":
                     c.data["melds"] = []
@@ -240,7 +246,9 @@ class GeminiRecognizer:
             c = self._observe_seat(jpeg, resolution, prompt, schema, norm)
             c.data["method"] = "whole"
             return c
-        c = self.call(jpeg, prompt, schema, media_resolution=resolution)
+        # 왕패 찾기(판 시작 때 한 번)·처음 설정 틀은 상자만 묻는다. 생각 수준은 WALL_THINKING(low).
+        thinking = getattr(self, "wall_thinking", None) if kind in ("wall", "setup") else None
+        c = self.call(jpeg, prompt, schema, thinking=thinking, media_resolution=resolution)
         c.data = norm(c.data)
         return c
 
@@ -293,7 +301,8 @@ class GeminiRecognizer:
                  round((time.perf_counter() - t0) * 1000))
         return out
 
-    def _observe_seat_frame(self, jpeg: bytes, resolution: str | None, extra_melds: int = 0) -> GeminiCall | None:
+    def _observe_seat_frame(self, jpeg: bytes, resolution: str | None, extra_melds: int = 0,
+                            hand_frac: float | None = None) -> GeminiCall | None:
         """자리 틀(YOLO11 + 규칙) → 조각을 번호 칸에 붙인 그림 한 장 + 참고표를 [seat_reads] 번 동시에 읽어 맞춰 본다.
         틀을 못 잡거나(장수·모양 검사), 읽은 조각에 뒷면·빈 칸이 있으면 None(통째 읽기로). data["method"] = "frame"."""
         from . import observe as ob
@@ -301,7 +310,8 @@ class GeminiRecognizer:
 
         t0 = time.perf_counter()
         try:
-            fr, rgb = self.seat_locator.locate(jpeg, extra_melds) if extra_melds else self.seat_locator.locate(jpeg)
+            opts = {k: v for k, v in (("extra_melds", extra_melds), ("hand_frac", hand_frac)) if v}
+            fr, rgb = self.seat_locator.locate(jpeg, **opts)
         except Exception:  # noqa: BLE001 — 검출이 깨져도 판독은 통째 읽기로 계속
             log.exception("seat locate failed")
             return None

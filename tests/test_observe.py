@@ -16,6 +16,8 @@ from app.observe import (
     normalize_river_v2,
     normalize_seat_v2,
     normalize_sticks_v2,
+    normalize_setup_v2,
+    normalize_wall_v2,
 )
 from app.recognizer import GeminiCall
 from tests.test_api import FakeRecognizer, _upload
@@ -64,9 +66,11 @@ class FakeObserver(FakeRecognizer):
     def __init__(self):
         self.ultra = {}
 
-    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False, melds: int = 0) -> GeminiCall:
+    def observe(self, jpeg: bytes, kind: str, ultra_high: bool = False, melds: int = 0,
+                hand_frac: float | None = None) -> GeminiCall:
         self.ultra[kind] = ultra_high
         self.melds = melds
+        self.hand_frac = hand_frac
         data = {"river": {"tiles": [{"tile": "2s", "conf": 0.9, "sideways": False}], "riichi_stick": False, "notes": ""}}
         return GeminiCall(data.get(kind, {"notes": ""}), 20, 7, 3, "fake")
 
@@ -123,11 +127,12 @@ def test_new_v2_routes(monkeypatch):
     monkeypatch.setattr(server, "recognizer", FakeObserver())
     monkeypatch.setattr(server, "API_KEY", "")
     client = TestClient(server.app)
-    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat", "/v2/handonly"):
+    for path in ("/v2/corner", "/v2/last", "/v2/sticks", "/v2/dora", "/v2/seat", "/v2/handonly", "/v2/wall", "/v2/walldora",
+                 "/v2/setup"):
         assert client.post(path, files=_upload()).status_code == 200
     # 자리 구역만 이미지 해상도를 ULTRA_HIGH 로 읽는다.
     assert server.recognizer.ultra == {"corner": False, "last": False, "sticks": False, "dora": False, "seat": True,
-                                       "handonly": True}
+                                       "handonly": True, "wall": False, "walldora": False, "setup": False}
 
 
 def test_last_multi_order_and_missing():
@@ -273,6 +278,21 @@ def test_handonly_passes_meld_count(monkeypatch):
     assert client.post("/v2/handonly?melds=9", files=_upload()).status_code == 422  # 울기는 최대 4묶음
 
 
+def test_seat_passes_hand_frac(monkeypatch):
+    fake = FakeObserver()
+    monkeypatch.setattr(server, "recognizer", fake)
+    monkeypatch.setattr(server, "API_KEY", "")
+    client = TestClient(server.app)
+    assert client.post("/v2/seat?hand_frac=0.65", files=_upload()).status_code == 200
+    assert fake.hand_frac == 0.65
+    assert client.post("/v2/seat", files=_upload()).status_code == 200
+    assert fake.hand_frac is None  # 예전 앱: 지금처럼
+    assert client.post("/v2/seat?hand_frac=1.2", files=_upload()).status_code == 422
+    monkeypatch.setattr(server, "SEAT_SPLIT", False)
+    assert client.post("/v2/seat?hand_frac=0.65", files=_upload()).status_code == 200
+    assert fake.hand_frac is None  # 꺼 두면 넘기지 않음
+
+
 def test_handonly_prompt_and_schema_drop_melds():
     """손패 전용 문구: 울기 줄이 빠지고 '이미 따로 읽었다' 는 설명만 남는다. 스키마에도 melds 가 없다."""
     from app import observe as ob
@@ -310,3 +330,49 @@ def test_handonly_fans_out_like_seat(monkeypatch):
     assert prompts == [(ob.HANDONLY_PROMPT_V2, False)] * 3
     assert c.data["agreement"]["unanimous"] and c.data["agreement"]["requested"] == 3
     assert c.data["melds"] == [] and [t["tile"] for t in c.data["tiles"]] == ["1s", "2s", "3s"]
+
+
+def test_wall_v2_box_side_and_not_found():
+    out = normalize_wall_v2({"found": True, "box_2d": [455, 223, 709, 389], "side": "left", "notes": ""})
+    assert out == {"found": True, "box": [455, 223, 709, 389], "side": "left", "notes": ""}
+    # 0~1000 밖은 자르고, 뒤집힌 상자·모자란 좌표·found=false 는 못 찾은 것.
+    assert normalize_wall_v2({"found": True, "box_2d": [-5, 10, 1200, 300], "side": "top"})["box"] == [0, 10, 1000, 300]
+    assert normalize_wall_v2({"found": True, "box_2d": [500, 300, 400, 200]})["found"] is False
+    assert normalize_wall_v2({"found": True, "box_2d": [1, 2, 3]})["box"] is None
+    nf = normalize_wall_v2({"found": False, "box_2d": [1, 2, 3, 4], "side": "left"})
+    assert nf["found"] is False and nf["side"] is None
+    assert normalize_wall_v2({"found": True, "box_2d": [1, 2, 3, 4], "side": "north"})["side"] is None
+
+
+def test_wall_uses_wall_thinking(monkeypatch):
+    from app.recognizer import GeminiRecognizer
+
+    rec = GeminiRecognizer.__new__(GeminiRecognizer)
+    rec.wall_thinking = "low"
+    seen = {}
+
+    def fake_call(jpeg, prompt, schema, thinking=None, media_resolution=None, **kw):
+        seen[schema is not None and "box_2d" in schema["properties"]] = thinking
+        data = {"found": True, "box_2d": [1, 2, 3, 4], "side": "top", "notes": ""} if "box_2d" in schema["properties"]             else {"indicators": [{"code": "5s", "confidence": 0.9}], "notes": ""}
+        return GeminiCall(data, 1, 1, 1, "m")
+
+    monkeypatch.setattr(rec, "call", fake_call, raising=False)
+    assert rec.observe(b"x", "wall").data["box"] == [1, 2, 3, 4]
+    assert rec.observe(b"x", "walldora").data["indicators"] == [{"tile": "5s", "conf": 0.9}]
+    assert seen == {True: "low", False: None}
+
+
+def test_setup_v2_boxes():
+    out = normalize_setup_v2({
+        "seats": [
+            {"side": "bottom", "hand": [860, 300, 900, 700], "melds": [880, 850, 930, 990]},
+            {"side": "left", "hand": [200, 100, 560, 180], "melds": []},
+            {"side": "north", "hand": [1, 2, 3, 4], "melds": []},
+        ],
+        "device": [400, 420, 560, 580],
+        "notes": "",
+    })
+    assert out["seats"]["bottom"] == {"hand": [860, 300, 900, 700], "melds": [880, 850, 930, 990]}
+    assert out["seats"]["left"]["melds"] is None
+    assert "north" not in out["seats"]
+    assert out["device"] == [400, 420, 560, 580]

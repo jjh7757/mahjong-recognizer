@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import Counter
 
 from .prompts import NOTATION, SIDE_NOTE
+from .normalize import normalize_box
 from .schemas import SIDES, TILE_CODES, _NOTES, _tile
 
 # ---------------------------------------------------------------- 스키마
@@ -195,6 +196,52 @@ SEAT_SCHEMA_V2 = {
         "notes": _NOTES,
     },
     "required": ["face_up", "tiles", "separate_tile", "melds", "loose", "notes"],
+}
+
+WALL_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "found": {"type": "boolean"},
+        "box_2d": {
+            "type": "array",
+            "description": "왕패 7줄을 감싸는 상자 [ymin, xmin, ymax, xmax], 0~1000 정수. 못 찾으면 빈 배열",
+            "items": {"type": "integer"},
+        },
+        "side": {"type": "string", "enum": list(SIDES), "description": "왕패가 어느 자리 앞의 패산인지(사진 기준)"},
+        "notes": _NOTES,
+    },
+    "required": ["found", "box_2d", "notes"],
+}
+
+_BOX_INT = {"type": "array", "items": {"type": "integer"}}
+SETUP_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "seats": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"side": {"type": "string", "enum": list(SIDES)}, "hand": _BOX_INT, "melds": _BOX_INT},
+                "required": ["side", "hand", "melds"],
+            },
+        },
+        "device": _BOX_INT,
+        "notes": _NOTES,
+    },
+    "required": ["seats", "device", "notes"],
+}
+
+WALLDORA_SCHEMA_V2 = {
+    "type": "object",
+    "properties": {
+        "indicators": {
+            "type": "array",
+            "description": "패산 위에 앞면으로 뒤집힌 패. 왼쪽부터. 없으면 빈 배열",
+            "items": _tile(),
+        },
+        "notes": _NOTES,
+    },
+    "required": ["indicators", "notes"],
 }
 
 STICKS_SCHEMA_V2 = {
@@ -454,6 +501,38 @@ DORA_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데를 위에서
 
 각 패의 확신도(0~1)를 적어 주세요."""
 
+# 도라 산(왕패) 찾기: 판 시작 때 테이블 전체(줄인 것)로 한 번. 앱이 이 상자를 그 판 동안 들고 있다가 리치 아닌 화료 때
+# 그 상자만 잘라 /v2/walldora 로 읽는다.
+WALL_PROMPT_V2 = """이 사진은 판이 시작된 리치마작 자동탁 전체를 위에서 찍은 것입니다. 왕패를 찾습니다.
+
+- 네 변에 패산(뒷면이 보이게 2단으로 쌓인 패 줄)이 있고, 그중 한 곳에 도라 표시패가 앞면으로 뒤집혀 있습니다(깡을 했으면 그 옆에 더).
+- 왕패는 그 도라 표시패가 있는 변의 패산에서 도라 표시패를 포함한 일자 구간(보통 7줄)입니다.
+- box_2d: 그 변의 일자 구간만 감싸는 상자 [ymin, xmin, ymax, xmax], 사진 크기를 0~1000 으로 본 정수.
+  모서리를 돌아 이웃 변으로 이어진 줄은 넣지 않습니다.
+  찾지 못하면 found=false, box_2d 는 빈 배열.
+- side: 왕패가 어느 자리 앞의 패산인지(bottom/right/top/left, 사진 기준)."""
+
+# 처음 설정(카메라를 놓을 때 한 번): 네 자리 손패·울기 틀과 가운데 기기 틀. 앱이 이것으로 손패+울기 바깥 띠(격자 선)와
+# 리치봉 상자를 넉넉하게 정하고 사용자가 끌어 고친다(사용자 그림 2026-10-29: 바깥 띠 · 리치봉 상자 · 나머지 패산 구역).
+SETUP_PROMPT_V2 = """이 사진은 리치마작 자동탁을 위에서 찍은 것입니다. 구역의 틀(상자)만 잡습니다. 패의 종류는 읽지 않습니다.
+
+사진 기준 네 자리(bottom = 사진 아래쪽 변, right = 오른쪽 변, top = 위쪽 변, left = 왼쪽 변)마다:
+- hand: 그 자리 사람 앞의 손패 줄(세워져 있든 앞면으로 눕혀져 있든)을 감싸는 상자.
+- melds: 그 사람 오른쪽 테이블 모서리 쪽에 놓인 울기 묶음 전부를 감싸는 상자. 없으면 빈 배열.
+그리고 device: 가운데 자동탁 기기(주사위 창이 있는 사각 판)를 감싸는 상자.
+
+상자는 [ymin, xmin, ymax, xmax], 사진 크기를 0~1000 으로 본 정수입니다."""
+
+WALLDORA_PROMPT_V2 = f"""이 사진은 리치마작 테이블에서 왕패(도라 표시패를 뒤집어 놓는 패산 7줄) 부분만 잘라, 그 패산 앞 사람 쪽에서 본 방향으로
+세운 것입니다. {_ONLY_SEE}
+
+- indicators: 패산 위에 앞면(그림이 보이게)으로 뒤집혀 있는 패 전부(도라 표시패, 깡도라 표시패). 왼쪽부터.
+- 뒷면(단색)만 보이는 패, 사진 가장자리에 걸려 반 이상 잘린 패는 적지 않습니다. 없으면 빈 배열입니다.
+
+{NOTATION}
+
+각 패의 확신도(0~1)를 적어 주세요."""
+
 STICKS_PROMPT_V2 = f"""이 사진은 리치마작 자동탁 가운데 기기(주사위 창이 있는 판)를 위에서 찍은 것입니다. 리치봉만 봅니다. {_ONLY_SEE}
 
 {SIDE_NOTE}
@@ -593,6 +672,27 @@ def normalize_dora_v2(data: dict) -> dict:
         "indicators": [t for t in (_code(x) for x in data.get("indicators") or []) if t],
         "notes": str(data.get("notes") or ""),
     }
+
+
+def normalize_wall_v2(data: dict) -> dict:
+    """→ {found, box:[ymin,xmin,ymax,xmax]|None (0~1000), side|None, notes}. 상자가 뒤집혔거나 4개가 아니면 못 찾은 것으로."""
+    box = normalize_box(data.get("box_2d")) if data.get("found", True) else None
+    side = data.get("side")
+    return {
+        "found": box is not None,
+        "box": box,
+        "side": side if box is not None and side in SIDES else None,
+        "notes": str(data.get("notes") or ""),
+    }
+
+
+def normalize_setup_v2(data: dict) -> dict:
+    """→ {seats: {side: {hand: box|None, melds: box|None}}, device: box|None, notes}. 상자는 0~1000 [ymin, xmin, ymax, xmax]."""
+    seats = {}
+    for s in data.get("seats") or []:
+        if isinstance(s, dict) and s.get("side") in SIDES:
+            seats[s["side"]] = {"hand": normalize_box(s.get("hand")), "melds": normalize_box(s.get("melds"))}
+    return {"seats": seats, "device": normalize_box(data.get("device")), "notes": str(data.get("notes") or "")}
 
 
 def normalize_seat_v2(data: dict) -> dict:

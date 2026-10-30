@@ -230,6 +230,17 @@ def test_agree_seats_disputed_meld_and_face_down():
     assert "(앞면 아님)" in " ".join(out["agreement"]["alternatives"])
 
 
+def test_agree_seats_conf_follows_tile_code_not_position():
+    """같은 답인데 순서가 다르면(seat_key 는 순서 무시) 확신도를 위치별로 섞지 않고 같은 패 코드끼리만 모은다."""
+    def seat(pairs):
+        return normalize_seat_v2({"face_up": True, "tiles": [{"code": c, "confidence": p} for c, p in pairs],
+                                  "separate_tile": None, "melds": [], "loose": []})
+
+    out = agree_seats([seat([("1s", 0.5), ("9p", 0.9), ("9p", 0.6)]), seat([("9p", 0.7), ("1s", 0.95), ("9p", 0.65)])])
+    assert out["agreement"]["unanimous"]
+    assert [(t["tile"], t["conf"]) for t in out["tiles"]] == [("1s", 0.95), ("9p", 0.9), ("9p", 0.65)]  # 전엔 1s 0.7, 9p 0.95
+
+
 def test_zoom_strips_overlap_at_full_resolution():
     import io
 

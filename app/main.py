@@ -1,6 +1,6 @@
 """마작 패 인식 서버 (Gemini 비전).
 
-모든 엔드포인트: multipart `image`, 헤더 `X-Api-Key`, 응답에 `notes`·`model`·`latency_ms` 공통.
+모든 엔드포인트: multipart `image`, 헤더 `X-Api-Key`, 응답에 `notes`·`model`·`latency_ms`·`prep_ms`·`usage` 공통.
 
 POST /v1/recognize  눕힌 손패 크롭
   → {"tiles":[{"tile":"5m","conf":0.93},...], "count":13,
@@ -13,30 +13,41 @@ POST /v1/table      테이블 중앙 크롭(강 4개 + 왕패)
   → {"dora_indicators":[{"tile":"3p","conf":0.9}], "ura_dora_indicators":[...](리치 화료 뒤 공개했을 때만),
      "riichi":{"bottom":true,...}, "riichi_conf":{...},
      "last_discards":{"bottom":"7s","top":null,...}, "last_discards_conf":{...}, ...}
-GET  /              헬스체크.
+GET  /              헬스체크(+ 저장소 주소 `source`, AGPL §13).
 
 좌표는 0~1000 정규화, side 는 이미지 기준(bottom/right/top/left). 설계: mahjong_calc/docs/table_reading_design.md
+
+오류: 401 키 틀림 · 400 디코딩 실패·픽셀 과다 · 413 크기 초과(Content-Length 로 본문 받기 전에, 또는 파일 크기) ·
+429 + Retry-After(이 서버의 요청 제한, 또는 Gemini 429) · 503 + Retry-After(Gemini 5xx·시간 초과·예산 초과) · 502 그 밖의 실패.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import math
 import os
 import secrets
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse
 
 from .observe import LAST_MULTI_MAX
-from .recognizer import GeminiCall, GeminiRecognizer, prepare_image
+from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
 
 log = logging.getLogger("recognizer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 API_KEY = os.environ.get("RECOGNIZER_API_KEY", "")
+# 키가 비면 기동을 거부한다(전엔 조용히 인증이 꺼졌다, 2026-10-30). 로컬 실험에서만 ALLOW_NO_AUTH=1 로 연다.
+ALLOW_NO_AUTH = os.environ.get("ALLOW_NO_AUTH", "0") == "1"
+# AGPL-3.0 §13: 네트워크로 쓰는 사람에게 소스 받을 곳을 알린다(/ 응답의 source).
+SOURCE_URL = os.environ.get("SOURCE_URL", "https://github.com/jjh7757/mahjong-recognizer")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "default")  # default | low | off
@@ -49,7 +60,18 @@ WALL_THINKING = os.environ.get("WALL_THINKING", "low")
 # 자리 판독(/v2/seat)을 몇 번 동시에 읽어 맞춰 볼지. 모두 같아야 확신(다르면 다른 패의 확신도를 0 으로).
 SEAT_READS = int(os.environ.get("SEAT_READS", 3))
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
-RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))  # 화료 1회 = 3호출
+# Content-Length 선검사에서 multipart 겉포장(경계·헤더·파일 이름)에 주는 여유.
+MULTIPART_SLACK = 64 * 1024
+# 요청 제한(요청당 1, 사진 수와 무관). 토큰 버킷: 한 번에 RATE_BURST 까지 몰아 보낼 수 있고 분당 RATE_PER_MIN 씩 다시 찬다.
+# 화료 1회 = locate 1 + 판독 최대 10호출, 추적 중엔 자리·강 끝·도라 산이 겹쳐 온다. 10-29 측정에서 분당 40 고정 창에
+# /v2/last3 가 사진 수(3~4)만큼 깎여 429 가 났다. 비용 보호(사고로 무한 호출)는 시간·일 상한이 따로 맡는다.
+RATE_PER_MIN = int(os.environ.get("RATE_PER_MIN", 40))
+RATE_BURST = int(os.environ.get("RATE_BURST", 20))
+RATE_PER_HOUR = int(os.environ.get("RATE_PER_HOUR", 600))
+RATE_PER_DAY = int(os.environ.get("RATE_PER_DAY", 3000))
+# Gemini 가 429 를 돌려줘 끝내 실패했을 때 앱에 알리는 Retry-After(초). 5xx·시간 초과는 UPSTREAM_DOWN_RETRY_S.
+UPSTREAM_429_RETRY_S = int(os.environ.get("UPSTREAM_429_RETRY_S", 10))
+UPSTREAM_DOWN_RETRY_S = int(os.environ.get("UPSTREAM_DOWN_RETRY_S", 5))
 # 화료 1회 = locate 1 + 판독 최대 10호출(손패·울기·강 4·가운데·왕패)을 동시에 보낸다. 4 로 두면 판독이 줄을 서 2~3배 느려졌다(2026-10-24).
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 16))
 # 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡을지(app/river.py). 0 이면 강 크롭을 통째로 읽는다. 검출 기준값은 RIVER_CONF.
@@ -69,35 +91,91 @@ SEAT_SPLIT = os.environ.get("SEAT_SPLIT", "1") == "1"
 # 탁자 밖은 앱이 처음 사진을 펼 때(rectify.dart) 한 번에 자르는 쪽으로 간다.
 SEAT_TABLE = os.environ.get("SEAT_TABLE", "0") == "1"
 
-app = FastAPI(title="mahjong-recognizer", version="0.3.0")
+app = FastAPI(title="mahjong-recognizer", version="0.4.0")
 recognizer: GeminiRecognizer | None = None
 _sem = asyncio.Semaphore(MAX_CONCURRENT)
+# Gemini 호출·디코딩이 도는 스레드. asyncio.to_thread 의 기본 실행기는 min(32, cpu+4) 라 2 vCPU 에서 6개 — 세마포어 16 이
+# 무의미하고 판독이 여섯 개씩 줄을 섰다(2026-10-30). 세마포어 안의 호출 16 + 디코딩 몫 4.
+_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT + 4, thread_name_prefix="call")
 
 
 class RateLimiter:
-    """분당 요청 수 제한(프로세스 전역). 비용 사고 방지용."""
+    """요청 수 제한(프로세스 전역, 요청당 1).
 
-    def __init__(self, per_min: int):
-        self.per_min = per_min
-        self.calls: list[float] = []
+    토큰 버킷: 토큰은 [burst] 개까지 쌓이고 분당 [per_min] 개씩 다시 찬다 → 화료 한 번의 묶음 호출을 한 번에 받고,
+    평균은 분당 [per_min] 으로 묶는다. [per_hour]·[per_day] 는 비용 사고를 막는 고정 창 상한(0 이면 없음)."""
+
+    def __init__(self, per_min: int, burst: int, per_hour: int = 0, per_day: int = 0,
+                 clock: Callable[[], float] = time.monotonic):
+        self.per_min = max(1, per_min)
+        self.rate = self.per_min / 60.0  # 초당 채우는 토큰
+        self.burst = max(1, burst)
+        self.caps = {3600: per_hour, 86400: per_day}
+        self.clock = clock
+        now = clock()
+        self.tokens = float(self.burst)
+        self.updated = now
+        self.windows = {span: [now, 0] for span in self.caps}  # 창 길이 → [시작 시각, 그 창의 요청 수]
         self.lock = threading.Lock()
 
-    def allow(self) -> bool:
-        now = time.monotonic()
+    def take(self) -> float:
+        """허용이면 0, 아니면 다시 보내도 될 때까지의 초(> 0)."""
+        now = self.clock()
         with self.lock:
-            self.calls = [t for t in self.calls if now - t < 60]
-            if len(self.calls) >= self.per_min:
-                return False
-            self.calls.append(now)
-            return True
+            self.tokens = min(float(self.burst), self.tokens + (now - self.updated) * self.rate)
+            self.updated = now
+            for span, cap in self.caps.items():
+                start, n = self.windows[span]
+                if now - start >= span:
+                    self.windows[span] = [now, 0]
+                    start, n = now, 0
+                if cap and n >= cap:
+                    return span - (now - start)
+            if self.tokens < 1:
+                return (1 - self.tokens) / self.rate
+            self.tokens -= 1
+            for w in self.windows.values():
+                w[1] += 1
+            return 0.0
+
+    def allow(self) -> bool:
+        return self.take() == 0
 
 
-_limiter = RateLimiter(RATE_PER_MIN)
+_limiter = RateLimiter(RATE_PER_MIN, RATE_BURST, RATE_PER_HOUR, RATE_PER_DAY)
+
+
+class BodyLimit:
+    """Content-Length 가 한도를 넘는 요청은 본문을 받기 전에 413. 전엔 본문을 다 받은 뒤에야 크기를 봤다(2026-10-30).
+    한도 = 사진 MAX_UPLOAD × 장수(/v2/last3 는 LAST_MULTI_MAX, 나머지 1) + multipart 겉포장 여유. Content-Length 가 없거나
+    (chunked) 속이면 _read_image 가 파일 크기로 다시 막는다."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            length = dict(scope["headers"]).get(b"content-length", b"")
+            if length.isdigit():
+                n_images = LAST_MULTI_MAX if scope["path"] == "/v2/last3" else 1
+                if int(length) > MAX_UPLOAD * n_images + MULTIPART_SLACK:
+                    response = JSONResponse({"detail": f"body too large (> {MAX_UPLOAD} bytes per image)"},
+                                            status_code=413)
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(BodyLimit)
 
 
 @app.on_event("startup")
 def startup() -> None:
     global recognizer
+    if not API_KEY:
+        if not ALLOW_NO_AUTH:
+            raise RuntimeError("RECOGNIZER_API_KEY 가 비어 있다 — 인증 없이 띄우려면 ALLOW_NO_AUTH=1 (로컬 실험만)")
+        log.warning("RECOGNIZER_API_KEY 없음: ALLOW_NO_AUTH=1 로 인증 없이 받는다")
     if GEMINI_API_KEY:
         locator = seat_locator = None
         if RIVER_FRAME:
@@ -118,6 +196,8 @@ def startup() -> None:
                  HANDONLY_FRAME, SEAT_SPLIT, SEAT_TABLE)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
+    log.info("limits: rate=%d/min burst=%d hour=%d day=%d upload=%d bytes executor=%d threads", RATE_PER_MIN,
+             RATE_BURST, RATE_PER_HOUR, RATE_PER_DAY, MAX_UPLOAD, _executor._max_workers)
 
 
 @app.get("/")
@@ -126,30 +206,54 @@ def health() -> dict:
     # git_sha 는 Dockerfile 이 넣는 GIT_SHA — 배포 워크플로가 이 값으로 새 이미지가 떴는지 확인한다.
     endpoints = sorted(r.path for r in app.routes if "POST" in getattr(r, "methods", ()))
     return {"status": "ok", "backend": "gemini", "model": GEMINI_MODEL if recognizer else None,
-            "git_sha": os.environ.get("GIT_SHA", "unknown"), "endpoints": endpoints}
+            "git_sha": os.environ.get("GIT_SHA", "unknown"), "endpoints": endpoints,
+            "source": SOURCE_URL, "license": "AGPL-3.0-only"}
 
 
 def _check_key(x_api_key: str | None) -> None:
     if not API_KEY:
         return
-    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+    # bytes 로 비교한다: str 끼리의 compare_digest 는 비ASCII 가 들어오면 TypeError(500)였다.
+    if not x_api_key or not secrets.compare_digest(x_api_key.encode(), API_KEY.encode()):
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def _gate(x_api_key: str | None) -> None:
+    """키·설정·요청 제한. 요청당 한 번(사진 수와 무관)."""
+    _check_key(x_api_key)
+    if recognizer is None:
+        raise HTTPException(status_code=503, detail="recognizer not configured")
+    wait_s = _limiter.take()
+    if wait_s:
+        retry = max(1, math.ceil(wait_s))
+        raise HTTPException(status_code=429, detail=f"too many requests (retry after {retry}s)",
+                            headers={"Retry-After": str(retry)})
+
+
+async def _run(fn: Callable, *args):
+    return await asyncio.get_running_loop().run_in_executor(_executor, functools.partial(fn, *args))
+
+
+async def _read_image(image: UploadFile, max_side: int = 1568) -> bytes:
+    """크기(파일 크기, 넘는 순간 중단)·디코딩 검사를 거친 JPEG 바이트."""
+    if image.size is not None and image.size > MAX_UPLOAD:
+        raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
+    chunks, total = [], 0
+    while chunk := await image.read(1 << 20):
+        total += len(chunk)
+        if total > MAX_UPLOAD:
+            raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
+        chunks.append(chunk)
+    try:
+        return await _run(prepare_image, b"".join(chunks), max_side)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
 
 
 async def _accept(image: UploadFile, x_api_key: str | None, max_side: int = 1568) -> bytes:
     """키·설정·속도 제한·크기·디코딩 검사를 거친 JPEG 바이트."""
-    _check_key(x_api_key)
-    if recognizer is None:
-        raise HTTPException(status_code=503, detail="recognizer not configured")
-    if not _limiter.allow():
-        raise HTTPException(status_code=429, detail="too many requests")
-    data = await image.read()
-    if len(data) > MAX_UPLOAD:
-        raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
-    try:
-        return await asyncio.to_thread(prepare_image, data, max_side)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
+    _gate(x_api_key)
+    return await _read_image(image, max_side)
 
 
 def _usage(input_tokens: int, output_tokens: int) -> dict:
@@ -157,11 +261,25 @@ def _usage(input_tokens: int, output_tokens: int) -> dict:
     return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
-async def _call(fn: Callable[[bytes], object], jpeg: bytes):
+def _timing(c: GeminiCall) -> dict:
+    return {"model": c.model, "latency_ms": c.latency_ms, "prep_ms": c.prep_ms,
+            "usage": _usage(c.input_tokens, c.output_tokens)}
+
+
+async def _call(fn: Callable[[bytes], object], jpeg):
     async with _sem:
         try:
-            return await asyncio.to_thread(fn, jpeg)
+            return await _run(fn, jpeg)
         except Exception as e:  # noqa: BLE001
+            if rate_limited(e):
+                # Gemini 429 가 재시도(recognizer.call) 뒤에도 남았다: 앱이 쉬고 다시 보내게 429 + Retry-After.
+                log.warning("gemini 429 after retry -> 429 to client")
+                raise HTTPException(status_code=429, detail="upstream rate limited (gemini 429)",
+                                    headers={"Retry-After": str(UPSTREAM_429_RETRY_S)}) from e
+            if retryable(e):
+                log.warning("gemini unavailable (%s) -> 503 to client", type(e).__name__)
+                raise HTTPException(status_code=503, detail=f"upstream unavailable: {type(e).__name__}",
+                                    headers={"Retry-After": str(UPSTREAM_DOWN_RETRY_S)}) from e
             log.exception("gemini call failed")
             raise HTTPException(status_code=502, detail=f"recognition failed: {type(e).__name__}") from e
 
@@ -183,6 +301,7 @@ async def recognize(image: UploadFile = File(...), x_api_key: str | None = Heade
         "notes": result.notes,
         "model": result.model,
         "latency_ms": result.latency_ms,
+        "prep_ms": 0,
         "usage": _usage(result.input_tokens, result.output_tokens),
     }
 
@@ -195,7 +314,7 @@ async def locate(image: UploadFile = File(...), x_api_key: str | None = Header(d
     log.info("locate %s -> hands=%s face_up=%s rivers=%d dead_wall=%s in %d ms (tokens %d+%d) notes=%r",
              image.filename, [h["side"] for h in d["hands"]], d["face_up_sides"], len(d["rivers"]),
              d["dead_wall"] is not None, c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
-    return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+    return {**d, **_timing(c)}
 
 
 @app.post("/v1/table")
@@ -208,7 +327,7 @@ async def table(image: UploadFile = File(...), x_api_key: str | None = Header(de
              " ".join(t["tile"] for t in d["ura_dora_indicators"]),
              [s for s, v in d["riichi"].items() if v], d["last_discards"],
              c.latency_ms, c.input_tokens, c.output_tokens, d["notes"][:200])
-    return {**d, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+    return {**d, **_timing(c)}
 
 
 async def _observe(kind: str, image: UploadFile, x_api_key: str | None, melds: int = 0,
@@ -219,11 +338,11 @@ async def _observe(kind: str, image: UploadFile, x_api_key: str | None, melds: i
     if hand_frac is not None and SEAT_SPLIT:
         opts["hand_frac"] = hand_frac  # 자리 판독에서 앱이 보낸 격자 손패 칸 폭 비율(있을 때만)
     c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS, **opts), jpeg)
-    log.info("observe/%s%s %s -> %s in %d ms (tokens %d+%d)", kind,
+    log.info("observe/%s%s %s -> %s in %d ms (prep %d) (tokens %d+%d)", kind,
              f"[{c.data['method']}]" if "method" in c.data else "", image.filename,
              str({k: v for k, v in c.data.items() if k not in ("notes", "method")})[:300],
-             c.latency_ms, c.input_tokens, c.output_tokens)
-    return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+             c.latency_ms, c.prep_ms, c.input_tokens, c.output_tokens)
+    return {**c.data, **_timing(c)}
 
 
 @app.post("/v2/hand")
@@ -266,15 +385,18 @@ async def observe_last(image: UploadFile = File(...), x_api_key: str | None = He
 async def observe_last_multi(images: list[UploadFile] = File(...),
                              x_api_key: str | None = Header(default=None)) -> dict:
     """가운데 칸을 자리마다 세운 크롭 여러 장(보통 화료자 빼고 3장, 최대 4장) → 사진 순서대로 강의 마지막 패. 한 번의 Gemini 호출.
-    강 틀은 YOLO11 검출로 잡아 마지막 패만 잘라 읽고(method "frame", rows·sideways 도 줌), 못 잡으면 통째로 읽는다(method "whole")."""
+    강 틀은 YOLO11 검출로 잡아 마지막 패만 잘라 읽고(method "frame", rows·sideways 도 줌), 못 잡으면 통째로 읽는다(method "whole").
+    요청 제한은 요청당 1(사진 수만큼 깎지 않는다)."""
     if not 1 <= len(images) <= LAST_MULTI_MAX:
         raise HTTPException(status_code=400, detail=f"images must be 1..{LAST_MULTI_MAX}")
-    jpegs = [await _accept(im, x_api_key) for im in images]
+    _gate(x_api_key)
+    jpegs = [await _read_image(im) for im in images]
     c: GeminiCall = await _call(recognizer.observe_last_multi, jpegs)
-    log.info("observe/last3[%s] %s -> %s in %d ms (tokens %d+%d)", c.data.get("method"), [im.filename for im in images],
+    log.info("observe/last3[%s] %s -> %s in %d ms (prep %d) (tokens %d+%d)", c.data.get("method"),
+             [im.filename for im in images],
              [r["last_tile"]["tile"] if r["last_tile"] else None for r in c.data["rivers"]],
-             c.latency_ms, c.input_tokens, c.output_tokens)
-    return {**c.data, "model": c.model, "latency_ms": c.latency_ms, "usage": _usage(c.input_tokens, c.output_tokens)}
+             c.latency_ms, c.prep_ms, c.input_tokens, c.output_tokens)
+    return {**c.data, **_timing(c)}
 
 
 @app.post("/v2/sticks")

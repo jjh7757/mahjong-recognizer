@@ -739,8 +739,21 @@ def agree_seats(reads: list[dict]) -> dict:
     def tile_list(r: dict) -> list[dict]:
         return list(r["tiles"]) + ([r["separate_tile"]] if r["separate_tile"] else [])
 
-    # 같은 답끼리는 위치가 같다고 보고 가장 높은 확신도를 쓴다.
-    best_conf = [max(tile_list(r)[i]["conf"] for r in same) for i in range(len(tile_list(chosen)))]
+    # 같은 답끼리는 손패가 같은 다중집합이지만 순서는 다를 수 있다(seat_key 가 순서를 무시). 확신도는 패 코드가 같은 것끼리만
+    # 모아 k번째 같은 패에는 각 읽기의 k번째로 높은 확신도를 짝지어 가장 높은 값을 쓴다(2026-10-30, 전엔 위치별로 섞였다).
+    def conf_by_code(r: dict) -> dict[str, list[float]]:
+        out: dict[str, list[float]] = {}
+        for t in tile_list(r):
+            out.setdefault(t["tile"], []).append(t["conf"])
+        return {k: sorted(v, reverse=True) for k, v in out.items()}
+
+    same_confs = [conf_by_code(r) for r in same]
+    seen: Counter = Counter()
+    best_conf = []
+    for t in tile_list(chosen):
+        k = seen[t["tile"]]
+        seen[t["tile"]] += 1
+        best_conf.append(max((c[t["tile"]][k] for c in same_confs if k < len(c.get(t["tile"], ()))), default=t["conf"]))
     if others:
         # 다른 답 모두에 있는 만큼만 믿는다(장수 기준). 넘치는 패는 확신도 0.
         trusted = Counter(t["tile"] for t in tile_list(chosen))

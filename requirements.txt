@@ -2,7 +2,8 @@ fastapi==0.159.1
 uvicorn[standard]==0.54.0
 python-multipart==0.0.32
 pillow==13.0.0
-google-genai>=1.60,<2
+# 고정(2026-10-30): 범위로 두면 빌드마다 다른 판이 들어와 재시도·오류 종류(errors.ClientError 429) 동작이 바뀔 수 있다
+google-genai==1.75.0
 # 강 끝 판독의 강 틀(app/river.py): YOLO11 ONNX 를 ultralytics 없이 돌린다
 onnxruntime==1.29.0
 numpy==2.5.2

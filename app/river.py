@@ -197,6 +197,28 @@ def own_rows(rows: list[list[Box]], tw: float, th: float) -> list[list[Box]]:
     return list(reversed(acc))
 
 
+# 눕힌 패(리치 선언패). 세운 패는 원근으로 넓어져도 가로/세로 1.00, 눕힌 패는 1.12 부터(B·C·D 상자 298개, 2026-10-30).
+SIDEWAYS_RATIO = 1.05
+# 눕힌 패의 높이는 세운 패의 약 3/4(0.70~0.78). 이보다 낮으면 패가 쪼개진 조각, 높으면 넓게 잡힌 세운 패(0.83 부터)다.
+SIDEWAYS_HEIGHT = (0.6, 0.8)
+
+
+def sideways(box: Box, th: float, boxes: list[Box]) -> bool:
+    """[box] 가 눕힌 패인가. [th] 는 세운 패 높이, [boxes] 는 그 강의 상자 전부. 한 패가 위아래 두 상자로 쪼개지면 넓은 상자가
+    눕힌 패처럼 보이는데(D k12 위 4통: 1.69·1.22), 둘이 겹치므로 다른 상자와 겹치는 상자는 세지 않는다."""
+    x, y, w, h = box
+    if w <= SIDEWAYS_RATIO * h or not SIDEWAYS_HEIGHT[0] <= h / th < SIDEWAYS_HEIGHT[1]:
+        return False
+    for o in boxes:
+        if o == box:
+            continue
+        ix = min(x + w, o[0] + o[2]) - max(x, o[0])
+        iy = min(y + h, o[1] + o[3]) - max(y, o[1])
+        if ix > 0.5 * min(w, o[2]) and iy > 0.2 * min(h, o[3]):
+            return False
+    return True
+
+
 def frame(rgb: np.ndarray, boxes: list[Box]) -> RiverFrame | None:
     H, W = rgb.shape[:2]
     faces = dedupe(keep_faces(boxes, white_mask(rgb)))
@@ -207,7 +229,8 @@ def frame(rgb: np.ndarray, boxes: list[Box]) -> RiverFrame | None:
     rows = own_rows(to_rows(group, th), tw, th)
     if not rows:
         return None
-    return RiverFrame(rows, len(boxes), [b[2] > 1.15 * b[3] for r in rows for b in r])
+    own = [b for r in rows for b in r]
+    return RiverFrame(rows, len(boxes), [sideways(b, th, own) for b in own])
 
 
 def crop(rgb: np.ndarray, box: Box, pad: float = 0.12) -> bytes:

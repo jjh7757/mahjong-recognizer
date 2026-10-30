@@ -32,6 +32,25 @@ def test_dedupe_keeps_one_box_per_tile():
     assert river.dedupe([(0, 0, 60, 80), (2, 3, 55, 75), (100, 0, 60, 80)]) == [(0, 0, 60, 80), (100, 0, 60, 80)]
 
 
+def test_sideways_uses_ratio_and_height():
+    upright = (500, 0, 72, 100)  # 겹치지 않는 옆 패
+    assert river.sideways((0, 0, 96, 76), 100, [upright])  # 1.26, 0.76: 눕힌 패
+    assert river.sideways((0, 0, 85, 76), 100, [upright])  # 1.12: 전엔 기준 1.15 아래라 놓쳤다
+    assert not river.sideways(upright, 100, [upright])  # 세운 패
+    assert not river.sideways((0, 0, 95, 95), 100, [upright])  # 1.00: 원근으로 넓어진 세운 패
+    assert not river.sideways((0, 0, 93, 83), 100, [upright])  # 1.12, 0.83: 넓게 잡힌 세운 패
+    assert not river.sideways((0, 0, 85, 50), 100, [upright])  # 1.70, 0.50: 쪼개진 조각
+
+
+def test_sideways_ignores_split_tile_but_not_next_row():
+    top_half, bottom_half = (100, 100, 85, 50), (100, 120, 94, 77)  # 한 패가 두 상자로 겹쳐 잡힘
+    assert not river.sideways(bottom_half, 100, [top_half, bottom_half])
+    # 옆·아래 패와 살짝 닿는 정도는 겹침이 아니다.
+    lying = (100, 100, 96, 76)
+    near = [lying, (198, 100, 72, 100), (100, 170, 72, 100)]
+    assert river.sideways(lying, 100, near)
+
+
 def test_nms_and_decode_map_back_to_crop_pixels():
     # 1280×640 크롭 → 640 입력: 축소 0.5, 위아래 160 패딩. 같은 패에 겹친 두 예측 + 낮은 확신도 하나
     out = np.zeros((41, 3), np.float32)

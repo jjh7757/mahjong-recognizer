@@ -86,6 +86,45 @@ def test_river_above_is_dropped_and_left_corner_meld_ignored(monkeypatch):
     assert sorted(fr.others) == sorted(left_meld)
 
 
+def test_isolated_pair_above_river_line_is_table_indicator_pair(monkeypatch):
+    row = _row(13)
+    pair = _row(2, x0=1200, y=300)  # 줄보다 패 2.5개 넘게 위, 둘레 펠트, 다른 패 없음
+    boxes = row + pair
+    fr = _locate(boxes, _canvas(boxes), monkeypatch)
+    assert fr.row == row and sorted(fr.singles) == pair
+    assert fr.lone == [False, False] and fr.pair == [True, True]
+    assert fr.summary()["pair"] == 2
+
+
+def test_pair_near_row_above_is_pair_but_below_row_is_not(monkeypatch):
+    row = _row(13)
+    above = _row(2, x0=1300, y=640)  # 줄(y 800)보다 패 2개 위, 낱장 높이
+    below = _row(2, x0=300, y=900)  # 줄 아래: 떨어뜨린 손패
+    boxes = row + above + below
+    fr = _locate(boxes, _canvas(boxes), monkeypatch)
+    got = {x: (lo, pa) for x, lo, pa in zip(fr.singles, fr.lone, fr.pair)}
+    assert all(got[x] == (False, True) for x in above)
+    assert all(got[x] == (False, False) for x in below)
+
+
+def test_two_tile_river_row_touching_another_row_is_not_a_pair(monkeypatch):
+    row = _row(13)
+    river = _row(6, x0=800, y=100) + _row(2, x0=800, y=184)  # 강 둘째 줄이 2장, 첫 줄에 붙어 있음
+    boxes = row + river
+    fr = _locate(boxes, _canvas(boxes), monkeypatch)
+    assert fr.singles == [] and fr.pair == []
+
+
+def test_pair_next_to_undetected_wall_tiles_is_not_a_pair(monkeypatch):
+    row = _row(13)
+    pair = _row(2, x0=1200, y=300)
+    boxes = row + pair
+    rgb = _canvas(boxes + _row(1, x0=1200 + 2 * 64, y=300), blank=())  # 오른쪽에 무늬 있는 패를 그렸지만 검출은 안 됨(왕패 노릇)
+    rgb[300:380, 1200 + 2 * 64:1200 + 2 * 64 + 60] = 230  # 옆이 펠트가 아님
+    fr = _locate(boxes, rgb, monkeypatch)
+    assert fr.pair == [] and fr.singles == []
+
+
 def _rotated_tile(rgb, cx, cy, w=60, h=80, deg=45):
     """돌아간 흰 패 + 무늬 하나를 그려 넣는다."""
     a = np.deg2rad(deg)
@@ -155,7 +194,7 @@ def test_observe_seat_wide_reads_pieces_and_corner(monkeypatch):
     d = c.data
     assert d["method"] == "wide"
     assert [t["tile"] for t in d["row"]] == ["1m"] * 10
-    assert d["singles"] == [{"tile": "7s", "conf": 0.9, "lone": True}]
+    assert d["singles"] == [{"tile": "7s", "conf": 0.9, "lone": True, "pair": False}]
     assert d["melds"][0]["tiles"] == ["5z"] * 3
     assert d["agreement"]["unanimous"] is True
     assert len(seen) == 6 and c.input_tokens == 450

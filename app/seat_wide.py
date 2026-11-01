@@ -9,6 +9,9 @@
 - 외톨이 = 다른 낱장과 안 붙고 좌우가 펠트(왕패 위 표시패는 옆이 패산). 탁자 위 표시패는 리치의 도라 + 뒷도라라 2장 이상이므로(사용자)
   외톨이는 표시패가 아니라 떼어 둔 패다.
 - 모서리 칸 = 펠트 오른쪽 끝에서 패 4.5개 안쪽. 흰 패는 YOLO·무늬 검사가 못 잡아 칸을 통째로 읽는다.
+- 표시패 짝(pair) = 줄보다 위(낱장 높이든 강 높이든)에서 둘레가 펠트이고 다른 패와 한 패 넘게 떨어져 둘만 붙어 놓인 패. 리치 화료자가
+  탁자에 내놓은 도라·뒷도라 표시패(매장 습관, 2026-11-01: 143104·172424 강 옆, 142535·171025 줄 가까이, 겹쳐 놓기도). 강 줄·왕패 위
+  표시패(옆이 패)·줄 아래 낱장(떨어뜨린 손패)은 아니다. 앱이 리치 화료의 표시패로 쓴다.
 """
 from __future__ import annotations
 
@@ -46,9 +49,10 @@ class WideFrame:
     th: float = 0.0
     detected: int = 0
     others: list[Box] = field(default_factory=list)  # 왼쪽 아래 옆 사람 묶음(읽지 않음)
+    pair: list[bool] = field(default_factory=list)  # singles 와 같은 순서, 탁자에 내놓은 표시패 짝
 
     def summary(self) -> dict:
-        return {"row": len(self.row), "singles": len(self.singles), "lone": sum(self.lone), "detected": self.detected}
+        return {"row": len(self.row), "singles": len(self.singles), "lone": sum(self.lone), "pair": sum(self.pair), "detected": self.detected}
 
 
 def detect_all(rgb: np.ndarray, det: rv.TileDetector) -> list[Box]:
@@ -171,6 +175,29 @@ def lone_flags(rgb: np.ndarray, singles: list[Box], tw: float, th: float) -> lis
     return out
 
 
+def table_pairs(rgb: np.ndarray, far: list[Box], faces: list[Box], corner: tuple[int, int, int, int], tw: float, th: float) -> list[Box]:
+    """줄보다 위에서 둘만 붙어 놓인 패 — 탁자에 내놓은 표시패 짝. 다른 패(검출된 면)가 한 패 안에 있으면 강·울기, 둘레가 펠트가
+    아니면 왕패 위 표시패라 뺀다."""
+    felt = st.felt_mask(rgb)
+    H, W = felt.shape
+    out: list[Box] = []
+    for g in st.cluster(far, tw * LONE_CLUSTER, th * 0.5):
+        if len(g) != 2:
+            continue
+        x0, y0 = min(x[0] for x in g), min(x[1] for x in g)
+        x1, y1 = max(x[0] + x[2] for x in g), max(x[1] + x[3] for x in g)
+        if corner[0] <= (x0 + x1) / 2 and corner[1] <= (y0 + y1) / 2:
+            continue
+        if any(f not in g and max(0, max(x0, f[0]) - min(x1, f[0] + f[2])) < tw and max(0, max(y0, f[1]) - min(y1, f[1] + f[3])) < th
+               for f in faces):
+            continue
+        w, h = max(4, int(tw * 0.4)), max(4, int(th * 0.4))
+        bands = [felt[y0:y1, max(0, x0 - w):x0], felt[y0:y1, x1:min(W, x1 + w)], felt[max(0, y0 - h):y0, x0:x1], felt[y1:min(H, y1 + h), x0:x1]]
+        if all(b.size > 0 and b.mean() > 0.5 for b in bands):
+            out.extend(sorted(g))
+    return out
+
+
 def locate(rgb: np.ndarray, det: rv.TileDetector) -> WideFrame | None:
     """테이블 절반(그 사람 방향으로 세운 것, 손패가 아래) → 틀. 손패 줄을 못 찾으면 None."""
     faces = detect_all(rgb, det)
@@ -214,7 +241,13 @@ def locate(rgb: np.ndarray, det: rv.TileDetector) -> WideFrame | None:
             others.extend(g)  # 왼쪽 아래 모서리: 옆 사람 울기
         else:
             singles.extend(g)
-    return WideFrame(row, singles, lone_flags(rgb, singles, tw, th), corner, tw, th, len(faces), others)
+    far = [f for f in faces if f not in used and f[1] + f[3] <= ry - RIVER_ABOVE * th and st.ink(rgb, f) >= st.INK_MIN]
+    above = [x for x in singles if x[1] + x[3] / 2 < ry - 0.5 * th]  # 줄보다 위의 낱장(줄 아래는 떨어뜨린 손패)
+    pair_set = set(table_pairs(rgb, far + above, faces, corner, tw, th))
+    extra = [x for x in pair_set if x not in singles]
+    lone = lone_flags(rgb, singles, tw, th) + [False] * len(extra)
+    all_singles = singles + extra
+    return WideFrame(row, all_singles, lone, corner, tw, th, len(faces), others=others, pair=[x in pair_set for x in all_singles])
 
 
 def grown(x: Box, rgb: np.ndarray) -> Box:

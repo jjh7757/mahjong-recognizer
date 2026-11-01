@@ -479,7 +479,7 @@ class GeminiRecognizer:
         nr = len(fr.row)
         data = {
             "row": tiles[:nr],
-            "singles": [{**t, "lone": lone} for t, lone in zip(tiles[nr:], fr.lone) if t],
+            "singles": [{**t, "lone": lone, "pair": pair} for t, lone, pair in zip(tiles[nr:], fr.lone, fr.pair) if t],
             "melds": corner["melds"] if corner else [],
             "corner_loose": corner["loose"] if corner else [],
             "agreement": {"unanimous": unanimous},

@@ -432,6 +432,9 @@ def last_multi_prompt(n: int) -> str:
 # "손패 + 울기 = 13장, 화료패 더해 14장" 장수 규칙은 뺐다: B·C·D 60회씩 같은 시각에 있음 55 / 없음 59, 시간 같음(2026-10-26).
 # 뒷면 색 이름("연보라")은 뺐다: 매장마다 뒷면 색이 다르다. B·C·D 뒷면을 파랑·초록·노랑·주황·검정으로 바꾼 합성 사진 네 자리 × 6색에서
 # face_up 144/144·화료자 손패 36/36(색 이름 있을 때 144/144·35/36) — mahjong_calc/experiments/backcolor(2026-10-27).
+# 넓은 구역 판독(/v2/seatwide)의 모서리 칸: 백 3장은 무늬가 없어 흰 테두리로 보기 쉽다. mahjong_calc/experiments/speed/wide_pieces.py 164501·171245.
+CORNER_WIDE_PROMPT_V2 = CORNER_PROMPT_V2 + "\n\n무늬 없는 흰 패(5z) 3장도 묶음입니다. 흰 테두리와 헷갈리지 말고 패의 네모난 윗면과 뒷면 색 두께로 구분합니다."
+
 SEAT_ZOOM_STRIPS = 3
 SEAT_PROMPT_V2 = f"""이 사진은 리치마작 테이블을 위에서 찍은 것으로, 한 플레이어 자리(앞의 손패와 그 오른쪽 테이블 모서리까지)를 그 사람 쪽에서 본 방향으로 세운 것입니다. {_ONLY_SEE}
 

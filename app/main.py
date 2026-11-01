@@ -369,6 +369,17 @@ async def observe_center(image: UploadFile = File(...), x_api_key: str | None = 
     return await _observe("center", image, x_api_key)
 
 
+@app.post("/v2/seatwide")
+async def observe_seat_wide(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """화료자 쪽 테이블 절반(그 자리 방향으로 세운 것) → 손패 줄, 낱장(lone = 펠트 위 외톨이), 모서리 울기. 앱이 /v2/seat 로
+    답을 못 정한 장면에서만 부른다. row 가 비면 틀을 못 잡은 것(method "none")."""
+    jpeg = await _accept(image, x_api_key, max_side=4080)
+    c: GeminiCall = await _call(recognizer.observe_seat_wide, jpeg)
+    log.info("observe/seatwide[%s] %s -> %s in %d ms (prep %d) (tokens %d+%d)", c.data["method"], image.filename,
+             str({k: c.data[k] for k in ("row", "singles", "melds")})[:300], c.latency_ms, c.prep_ms, c.input_tokens, c.output_tokens)
+    return {**c.data, **_timing(c)}
+
+
 @app.post("/v2/corner")
 async def observe_corner(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """미리 그은 격자의 모서리 칸(그 자리 방향으로 세운 것) → 울기 묶음 전부, 묶음 아닌 앞면 패."""

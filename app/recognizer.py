@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -419,6 +420,74 @@ class GeminiRecognizer:
         data["frame"] = {**fr.summary(), "ms": frame_ms}
         return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls),
                           self.model, prep_ms=prep_ms)
+
+    def observe_seat_wide(self, jpeg: bytes) -> GeminiCall:
+        """화료자 쪽 테이블 절반 → 손패 줄·낱장(외톨이 표시)·모서리 울기. 위치는 YOLO11(seat_wide), 종류는 조각 그림 + 참고표를
+        [seat_reads] 번 읽어 칸마다 다수결, 모서리 칸은 통째로 [seat_reads] 번 다수결. 틀을 못 잡으면 row 가 빈 답(method "none")."""
+        import numpy as np
+
+        from . import observe as ob
+        from . import seat, seat_wide
+
+        t0 = time.perf_counter()
+        rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+        locator = getattr(self, "seat_locator", None)
+        fr = seat_wide.locate(rgb, locator._detector()) if locator is not None else None
+        frame_ms = _ms(t0)
+        empty = {"row": [], "singles": [], "melds": [], "corner_loose": [], "agreement": {"unanimous": False}, "notes": ""}
+        if fr is None:
+            log.info("seat wide: not found in %d ms", frame_ms)
+            return GeminiCall({**empty, "method": "none", "frame": {"ms": frame_ms}}, _ms(t0), 0, 0, self.model, prep_ms=frame_ms)
+        log.info("seat wide frame %s in %d ms", fr.summary(), frame_ms)
+        boxes = fr.row + [seat_wide.grown(x, rgb) for x in fr.singles]
+        n = len(boxes)
+        sheet = seat.sheet(rgb, seat.SeatFrame(hand=boxes, separate=None, melds=[]))
+        x0, y0, x1, y1 = fr.corner
+        buf = io.BytesIO()
+        Image.fromarray(rgb[y0:y1, x0:x1]).save(buf, "JPEG", quality=92)
+        res = "MEDIA_RESOLUTION_ULTRA_HIGH"
+        prep_ms = _ms(t0)
+        pieces = [_fanout_pool.submit(self.call, sheet, ob.piece_prompt(n), ob.piece_schema(n), media_resolution=res,
+                                      extra_images=[(REF_SHEET.read_bytes(), None)]) for _ in range(self.seat_reads)]
+        corners = [_fanout_pool.submit(self.call, buf.getvalue(), ob.CORNER_WIDE_PROMPT_V2, ob.CORNER_SCHEMA_V2, media_resolution=res)
+                   for _ in range(self.seat_reads)]
+        calls, reads, corner_reads, last_error = [], [], [], None
+        for f, into in [(f, reads) for f in pieces] + [(f, corner_reads) for f in corners]:
+            try:
+                c = f.result()
+            except Exception as e:  # noqa: BLE001
+                log.warning("seat wide read failed: %s", type(e).__name__)
+                last_error = e
+                continue
+            calls.append(c)
+            into.append(ob.normalize_pieces(c.data, n) if into is reads else ob.normalize_corner_v2(c.data))
+        if not reads:
+            raise last_error or RuntimeError("no seat wide read")
+        unanimous = len(reads) == self.seat_reads
+        tiles: list[dict | None] = []
+        for i in range(n):
+            votes = Counter(r[i]["tile"] if r[i] else None for r in reads)
+            top, k = votes.most_common(1)[0]
+            unanimous = unanimous and k == len(reads)
+            tiles.append({"tile": top, "conf": 0.9 if k == len(reads) else 0.0} if top else None)
+
+        def corner_key(r: dict) -> tuple:
+            return tuple(sorted(" ".join(sorted(m["tiles"])) for m in r["melds"]))
+
+        corner = next((r for r in corner_reads if corner_key(r) == Counter(map(corner_key, corner_reads)).most_common(1)[0][0]), None) \
+            if corner_reads else None
+        nr = len(fr.row)
+        data = {
+            "row": tiles[:nr],
+            "singles": [{**t, "lone": lone} for t, lone in zip(tiles[nr:], fr.lone) if t],
+            "melds": corner["melds"] if corner else [],
+            "corner_loose": corner["loose"] if corner else [],
+            "agreement": {"unanimous": unanimous},
+            "method": "wide",
+            "frame": {**fr.summary(), "ms": frame_ms},
+            "notes": "",
+        }
+        return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls), self.model, prep_ms=prep_ms)
 
     def _observe_seat(self, jpeg: bytes, resolution: str | None, prompt: str | None = None, schema: dict | None = None,
                       norm=None, t0: float | None = None) -> GeminiCall:

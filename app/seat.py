@@ -528,4 +528,6 @@ class SeatLocator:
     def locate(self, jpeg: bytes, extra_melds: int = 0, hand_frac: float | None = None) \
             -> tuple[SeatFrame | None, np.ndarray]:
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
-        return frame(rgb, self._detector(), extra_melds, hand_frac, self.table), rgb
+        det = self._detector()
+        with det.gate.priority():  # 넓은 구역 틀 잡기보다 먼저(river.PriorityGate)
+            return frame(rgb, det, extra_melds, hand_frac, self.table), rgb

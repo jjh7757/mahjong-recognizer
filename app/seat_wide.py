@@ -64,7 +64,7 @@ def detect_all(rgb: np.ndarray, det: rv.TileDetector) -> list[Box]:
     for x0, y0 in itertools.product(xs, ys):
         part = np.ascontiguousarray(rgb[y0:y0 + WIN, x0:x0 + WIN])
         ph, pw = part.shape[:2]
-        for bx in det.detect(part):
+        for bx in det.detect(part, low=True):  # 자리·강 틀 잡기가 진행 중이면 창마다 양보
             if (bx[0] <= 1 and x0 > 0) or (bx[1] <= 1 and y0 > 0) \
                     or (bx[0] + bx[2] >= pw - 1 and x0 + WIN < W) or (bx[1] + bx[3] >= ph - 1 and y0 + WIN < H):
                 continue

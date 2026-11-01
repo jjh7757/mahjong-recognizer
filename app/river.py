@@ -40,6 +40,46 @@ class RiverFrame:
 
 # ---------------------------------------------------------------- 검출(onnxruntime)
 
+class PriorityGate:
+    """검출을 한 번에 하나만, 우선 작업(자리·강 틀 잡기)이 진행 중이면 뒤로 미룰 수 있는 작업(넓은 구역 틀 잡기)은 기다린다.
+
+    앱이 /v2/seatwide 를 자리 판독과 같은 순간에 미리 보내므로(mahjong_calc 2026-11-01), 작은 서버(t4g.small 2 vCPU)에선 두 틀 잡기가
+    CPU 를 나눠 써 자리 판독이 10.4 → 13.1초로 느려졌다(metrics 표 1-15). 자리·강은 `with gate.priority():` 로 감싸고, 넓은 구역은
+    `run(fn, low=True)` 로 — 우선 작업이 하나라도 진행 중이면 창 하나를 돌리기 전마다 기다린다(진행 중인 창 하나만 끝내고 양보)."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._high = 0  # 진행 중인 우선 작업 수
+        self._busy = False  # 검출(창 하나)이 돌고 있나 — 잠금은 장부에만 쓰고 검출 중엔 놓는다(우선 표시가 막히지 않게)
+
+    def priority(self):
+        gate = self
+
+        class _Ctx:
+            def __enter__(self):
+                with gate._cv:
+                    gate._high += 1
+
+            def __exit__(self, *exc):
+                with gate._cv:
+                    gate._high -= 1
+                    gate._cv.notify_all()
+
+        return _Ctx()
+
+    def run(self, fn, low: bool = False):
+        with self._cv:
+            while self._busy or (low and self._high > 0):
+                self._cv.wait()
+            self._busy = True
+        try:
+            return fn()
+        finally:
+            with self._cv:
+                self._busy = False
+                self._cv.notify_all()
+
+
 class TileDetector:
     """YOLO11 detect ONNX(입력 1×3×640×640, 출력 1×(4+37)×8400, NMS 없음)."""
 
@@ -51,13 +91,13 @@ class TileDetector:
         self.session = ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
         self.input = self.session.get_inputs()[0].name
         self.conf, self.iou = conf, iou
-        self._lock = threading.Lock()
+        self.gate = PriorityGate()  # 작은 서버라 동시에 돌리지 않는다(메모리·CPU). 자리·강 먼저, 넓은 구역은 뒤에
 
-    def detect(self, rgb: np.ndarray) -> list[Box]:
+    def detect(self, rgb: np.ndarray, low: bool = False) -> list[Box]:
+        """[low] 면 우선 작업(자리·강 틀 잡기)이 진행 중인 동안 기다린다."""
         H, W = rgb.shape[:2]
         x, scale, px, py = letterbox(rgb)
-        with self._lock:  # 작은 서버라 동시에 돌리지 않는다(메모리·CPU)
-            out = self.session.run(None, {self.input: x})[0][0]  # (41, 8400)
+        out = self.gate.run(lambda: self.session.run(None, {self.input: x})[0][0], low=low)  # (41, 8400)
         return decode(out, scale, px, py, W, H, self.conf, self.iou)
 
 
@@ -259,4 +299,6 @@ class RiverLocator:
 
     def locate(self, jpeg: bytes) -> tuple[RiverFrame | None, np.ndarray]:
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
-        return frame(rgb, self._detector().detect(rgb)), rgb
+        det = self._detector()
+        with det.gate.priority():
+            return frame(rgb, det.detect(rgb)), rgb

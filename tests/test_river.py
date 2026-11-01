@@ -126,3 +126,66 @@ def test_real_crop_picks_the_sagging_row_last_tile():
     assert f is not None
     x, y, w, h = f.last
     assert x > 650 and y < 600  # 6통(오른쪽, 위) — 8삭은 x≈355, y≈575~715
+
+
+def test_priority_gate_low_waits_for_high_job():
+    """우선 작업(자리·강)이 진행 중이면 뒤로 미룰 수 있는 작업(넓은 구역)은 창마다 기다리고, 끝나면 이어서 돈다."""
+    import threading
+    import time
+
+    from app.river import PriorityGate
+
+    gate = PriorityGate()
+    order = []
+    started = threading.Event()
+
+    def high():
+        with gate.priority():
+            started.set()
+            for i in range(3):
+                gate.run(lambda i=i: order.append(("high", i)) or time.sleep(0.02))
+                time.sleep(0.01)  # 창 사이 틈 — 그 사이에도 low 가 끼어들면 안 된다
+
+    def low():
+        started.wait()
+        for i in range(2):
+            gate.run(lambda i=i: order.append(("low", i)), low=True)
+
+    th, tl = threading.Thread(target=high), threading.Thread(target=low)
+    th.start()
+    tl.start()
+    th.join()
+    tl.join()
+    assert order == [("high", 0), ("high", 1), ("high", 2), ("low", 0), ("low", 1)]
+
+
+def test_priority_gate_high_only_waits_for_running_window():
+    """low 가 창 하나를 돌리는 중이면 high 는 그 창만 기다리고, 다음 low 창은 high 뒤로 밀린다."""
+    import threading
+    import time
+
+    from app.river import PriorityGate
+
+    gate = PriorityGate()
+    order = []
+    low_running = threading.Event()
+
+    def low():
+        for i in range(3):
+            def win(i=i):
+                low_running.set()
+                time.sleep(0.03)
+                order.append(("low", i))
+            gate.run(win, low=True)
+
+    def high():
+        low_running.wait()
+        with gate.priority():
+            gate.run(lambda: order.append(("high", 0)))
+
+    tl, th = threading.Thread(target=low), threading.Thread(target=high)
+    tl.start()
+    th.start()
+    tl.join()
+    th.join()
+    assert order[0] == ("low", 0) and order[1] == ("high", 0) and order[2:] == [("low", 1), ("low", 2)]

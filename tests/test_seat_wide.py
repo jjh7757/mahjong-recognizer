@@ -33,7 +33,7 @@ class _Det:
         self.boxes = boxes
         self.calls = []
 
-    def detect(self, part):
+    def detect(self, part, low=False):
         # 창 위치를 알 수 없으니 한 창짜리 그림만 쓴다(창 크기 안의 그림).
         self.calls.append(part.shape)
         return list(self.boxes)

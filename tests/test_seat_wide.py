@@ -65,7 +65,8 @@ def test_single_next_to_undetected_tile_is_not_lone(monkeypatch):
     row = _row(13)
     pair = [(1300, 650, 60, 80), (1364, 650, 60, 80)]
     fr = _locate(row + pair[:1], _canvas(row + pair), monkeypatch)
-    assert fr.singles == pair[:1] and fr.lone == [False]
+    # 놓친 쪽은 색 덩어리로 찾아 둘 다 낱장이 되고, 붙어 있어 외톨이가 아니다.
+    assert sorted(fr.singles)[0] == pair[0] and len(fr.singles) == 2 and fr.lone == [False, False]
 
 
 def test_missed_tile_in_row_is_filled(monkeypatch):
@@ -83,6 +84,35 @@ def test_river_above_is_dropped_and_left_corner_meld_ignored(monkeypatch):
     fr = _locate(boxes, _canvas(boxes), monkeypatch)
     assert fr.row == row and fr.singles == []
     assert sorted(fr.others) == sorted(left_meld)
+
+
+def _rotated_tile(rgb, cx, cy, w=60, h=80, deg=45):
+    """돌아간 흰 패 + 무늬 하나를 그려 넣는다."""
+    a = np.deg2rad(deg)
+    ys, xs = np.mgrid[0:rgb.shape[0], 0:rgb.shape[1]]
+    u = (xs - cx) * np.cos(a) + (ys - cy) * np.sin(a)
+    v = -(xs - cx) * np.sin(a) + (ys - cy) * np.cos(a)
+    rgb[(abs(u) < w / 2) & (abs(v) < h / 2)] = 245
+    rgb[(abs(u) < w / 6) & (abs(v) < h / 6)] = 20
+
+
+def test_rotated_tile_yolo_missed_is_found_by_color(monkeypatch):
+    row = _row(13)
+    rgb = _canvas(row)
+    _rotated_tile(rgb, 1500, 700)
+    fr = _locate(row, rgb, monkeypatch)
+    assert len(fr.singles) == 1 and fr.lone == [True]
+    x, y, w, h = fr.singles[0]
+    assert x < 1500 < x + w and y < 700 < y + h
+
+
+def test_color_blob_ignores_hands_and_far_tiles(monkeypatch):
+    row = _row(13)
+    rgb = _canvas(row)
+    rgb[600:760, 1400:1600] = (200, 150, 120)  # 살색: 넓고 희지 않음
+    _rotated_tile(rgb, 1000, 150)  # 줄에서 먼 위쪽(강)
+    fr = _locate(row, rgb, monkeypatch)
+    assert fr.singles == []
 
 
 def test_corner_zone_is_at_felt_right_edge():

@@ -17,6 +17,7 @@ import statistics
 from dataclasses import dataclass, field
 
 import numpy as np
+from PIL import Image
 
 from . import river as rv
 from . import seat as st
@@ -29,6 +30,10 @@ RIVER_ABOVE = 2.5  # 줄보다 패 2.5개 넘게 위는 강
 FILL_WHITE = 0.7
 LONE_CLUSTER = 0.45
 CORNER_TILES = 4.5
+BLOB_SCALE = 4  # 덩어리 찾기는 1/4 로 줄여서
+BLOB_AREA = (0.6, 1.9)  # 패 한 장 넓이 배수(두께 포함, 돌아가도 넓이는 같다)
+BLOB_LONG = 1.9  # 상자 긴 변 < 패 높이 × 1.9(돌아간 패의 대각선까지)
+BLOB_WHITE = 0.35  # 상자 안 흰 면 비율(돌아간 패는 상자 모서리가 펠트라 낮다)
 
 
 @dataclass
@@ -105,6 +110,51 @@ def corner_zone(rgb: np.ndarray, rx1: float, ry: float, tw: float, th: float, sl
     return min(x0, W - 1), min(y0, H - 1), min(W, int(right + 2 * tw)), H
 
 
+def _components(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    """4방향 연결 덩어리 → (x0, y0, x1, y1, 넓이). opencv 없이(서버 의존성에 없다), 줄인 그림이라 파이썬 반복으로 충분."""
+    H, W = mask.shape
+    seen = np.zeros_like(mask, bool)
+    out = []
+    for y0, x0 in zip(*np.nonzero(mask)):
+        if seen[y0, x0]:
+            continue
+        seen[y0, x0] = True
+        stack = [(int(y0), int(x0))]
+        ys, xs, area = [int(y0), int(y0)], [int(x0), int(x0)], 0
+        while stack:
+            y, x = stack.pop()
+            area += 1
+            ys = [min(ys[0], y), max(ys[1], y)]
+            xs = [min(xs[0], x), max(xs[1], x)]
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < H and 0 <= nx < W and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        out.append((xs[0], ys[0], xs[1] + 1, ys[1] + 1, area))
+    return out
+
+
+def tile_blobs(rgb: np.ndarray, known: list[Box], tw: float, th: float, min_y: float) -> list[Box]:
+    """펠트 위의 패 한 장 크기 덩어리(YOLO 가 놓치는 돌아간 낱장, 181209 9s·183627 4m). 이미 찾은 상자와 겹치는 것은 뺀다."""
+    S = BLOB_SCALE
+    H, W = rgb.shape[:2]
+    small = np.asarray(Image.fromarray(rgb).resize((max(1, W // S), max(1, H // S)), Image.BILINEAR))
+    white = rv.white_mask(small)
+    full = tw * th / (S * S)
+    out = []
+    for x0, y0, x1, y1, area in _components(~st.felt_mask(small)):
+        if not BLOB_AREA[0] * full <= area <= BLOB_AREA[1] * full or max(x1 - x0, y1 - y0) * S > BLOB_LONG * th:
+            continue
+        if white[y0:y1, x0:x1].mean() < BLOB_WHITE:  # 손·기기·패산 뒷면
+            continue
+        b = (x0 * S, y0 * S, (x1 - x0) * S, (y1 - y0) * S)
+        cx, cy = b[0] + b[2] / 2, b[1] + b[3] / 2
+        if cy < min_y or any(k[0] <= cx <= k[0] + k[2] and k[1] <= cy <= k[1] + k[3] for k in known):
+            continue
+        out.append(b)
+    return out
+
+
 def lone_flags(rgb: np.ndarray, singles: list[Box], tw: float, th: float) -> list[bool]:
     groups = st.cluster(singles, tw * LONE_CLUSTER, th * 0.5)
     alone = {g[0] for g in groups if len(g) == 1}
@@ -153,6 +203,7 @@ def locate(rgb: np.ndarray, det: rv.TileDetector) -> WideFrame | None:
     corner = corner_zone(rgb, rx1, ry, tw, th, a)
     used = set(row)
     near = [f for f in faces if f not in used and f[1] + f[3] > ry - RIVER_ABOVE * th and st.ink(rgb, f) >= st.INK_MIN]
+    near += [b for b in tile_blobs(rgb, row + faces, tw, th, ry - RIVER_ABOVE * th) if st.ink(rgb, b) >= st.INK_MIN]
     singles, others = [], []
     for g in st.cluster(near, tw * LONE_CLUSTER, th * 0.5):
         cx = statistics.mean(x[0] + x[2] / 2 for x in g)

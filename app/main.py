@@ -39,6 +39,7 @@ from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from .observe import LAST_MULTI_MAX
+from .local_read import rss_mb
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
 from .river import gate_wait_ms, reset_gate_wait
 
@@ -276,7 +277,7 @@ def _timing(c: GeminiCall) -> dict:
     """`timing`: handler_ms = 키 검사부터 응답 직전까지, decode_ms = 디코딩·줄이기, queue_ms = 세마포어·실행기 대기, prep_ms·work_ms =
     판독 함수의 전처리·전체, gate_ms = 검출 차례 대기(prep_ms 안), gemini_ms = Gemini 호출마다. 앱의 호출 시간 − handler_ms = 망·업로드·파싱."""
     stages = _stages.get()
-    timing = {"prep_ms": c.prep_ms, "work_ms": c.latency_ms, "gemini_ms": c.gemini_ms}
+    timing = {"prep_ms": c.prep_ms, "work_ms": c.latency_ms, "gemini_ms": c.gemini_ms, "rss_mb": rss_mb()}
     if stages is not None:
         timing |= {k: stages[k] for k in ("decode_ms", "queue_ms", "gate_ms")}
         timing["handler_ms"] = round((time.perf_counter() - stages["t0"]) * 1000)
@@ -287,7 +288,8 @@ def _timing(c: GeminiCall) -> dict:
 # ---------------------------------------------------------------- 자체 모델 그림자(app/local_read.py)
 # 같은 사진을 자체 모델로도 읽어 응답 `local` 과 서버 로그에 남긴다. 답에는 쓰지 않고, 기다리지 않으며, 실패해도 판독에 영향이 없다.
 # 스레드 하나에서 차례로, 밀리면 건너뛴다(화료자를 몰라 네 자리를 읽는 장면 등).
-LOCAL_SHADOW = os.environ.get("LOCAL_SHADOW", "1") == "1"
+# 기본 끔: 운영 80d48ac 에서 켜 보니 seatwide 전처리 9.0 → 11.5초, 프로세스 최대 메모리 1054MB(mahjong_calc metrics 표 1-30).
+LOCAL_SHADOW = os.environ.get("LOCAL_SHADOW", "0") == "1"
 LOCAL_QUEUE = 3
 _local_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local")
 _local_pending = 0

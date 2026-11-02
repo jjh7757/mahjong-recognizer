@@ -91,7 +91,7 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `MAX_UPLOAD_BYTES`, `MAX_PIXELS` | 사진 하나의 크기(기본 4MB)·픽셀 수(기본 4천만) |
 | `SEAT_READS` | 자리 판독을 몇 번 동시에 읽어 맞출지(기본 3) |
 | `WIDE_READS` | `/v2/seatwide` 조각·모서리를 각각 몇 번 읽을지(기본 1 = 호출 2번, `agreement.unanimous` 는 거짓). 0 이면 `SEAT_READS` |
-| `LOCAL_SHADOW` | 기본 `1` — `/v2/seat`·`/v2/last3` 사진을 자체 모델로도 읽어 응답 `local`·서버 로그에 남김(`app/local_read.py`, 답에는 안 씀, 기다리지 않음). `0` 이면 끔 |
+| `LOCAL_SHADOW` | 기본 `0`(끔). `1` 이면 `/v2/seat`·`/v2/last3` 사진을 자체 모델로도 읽어 응답 `local`·서버 로그에 남김(`app/local_read.py`, 답에는 안 씀). 켜면 운영에서 넓은 판독이 느려지고 메모리가 늘어 평소엔 끈다 |
 | `RIVER_FRAME` | 기본 `1` — 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡아 마지막 패만 잘라 읽음. `0` 이면 강 크롭을 통째로 읽음 |
 | `RIVER_CONF` | 강 틀 검출 기준값, 기본 `0.04`(손패 사진으로 학습한 모델이라 강 패는 확신도가 낮다) |
 

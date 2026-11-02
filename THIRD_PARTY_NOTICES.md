@@ -3,6 +3,14 @@
 This server (mahjong-recognizer) is licensed under the GNU Affero General Public License v3.0 (see `LICENSE`).
 It is a non-commercial project. The components below are included or used as described.
 
+## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-cls-mnv3s.onnx`
+
+Used only for shadow reads (`app/local_read.py`), compared with Gemini and not shown to users. Run with onnxruntime.
+
+- `tile-yolo26n.onnx`: Ultralytics YOLO26n trained by this project on its own table photos. Ultralytics states that models
+  trained with Ultralytics YOLO are licensed under AGPL-3.0 by default (https://www.ultralytics.com/license).
+- `tile-cls-mnv3s.onnx`: torchvision MobileNetV3 Small (ImageNet weights, BSD-3-Clause code) fine-tuned by this project.
+
 ## Tile detection model — `app/assets/mahjong-yolo11s.onnx`
 
 Used only to find where tiles lie: in a discard-pile (river) crop (`app/river.py`) and in a seat crop, where it

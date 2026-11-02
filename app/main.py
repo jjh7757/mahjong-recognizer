@@ -284,6 +284,61 @@ def _timing(c: GeminiCall) -> dict:
             "usage": _usage(c.input_tokens, c.output_tokens), "timing": timing}
 
 
+# ---------------------------------------------------------------- 자체 모델 그림자(app/local_read.py)
+# 같은 사진을 자체 모델로도 읽어 응답 `local` 과 서버 로그에 남긴다. 답에는 쓰지 않고, 기다리지 않으며, 실패해도 판독에 영향이 없다.
+# 스레드 하나에서 차례로, 밀리면 건너뛴다(화료자를 몰라 네 자리를 읽는 장면 등).
+LOCAL_SHADOW = os.environ.get("LOCAL_SHADOW", "1") == "1"
+LOCAL_QUEUE = 3
+_local_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local")
+_local_pending = 0
+_local_guard = threading.Lock()
+_local_reader = None
+
+
+def _get_local_reader():
+    global _local_reader
+    if _local_reader is None:
+        from .local_read import LocalReader
+
+        locator = getattr(recognizer, "seat_locator", None)
+        _local_reader = LocalReader(gate=locator._detector().gate if locator is not None else None)
+    return _local_reader
+
+
+def _shadow(kind: str, name, fn: Callable):
+    """그림자 판독을 시작한다. 끄거나 밀리면 None."""
+    global _local_pending
+    if not LOCAL_SHADOW:
+        return None
+    with _local_guard:
+        if _local_pending >= LOCAL_QUEUE:
+            log.info("local %s %s: skipped (queue full)", kind, name)
+            return None
+        _local_pending += 1
+
+    def work() -> dict:
+        global _local_pending
+        try:
+            out = fn(_get_local_reader())
+            log.info("local %s %s -> %s", kind, name, str(out)[:400])
+            return out
+        except Exception as e:  # noqa: BLE001 — 그림자가 깨져도 판독은 계속
+            log.warning("local %s %s failed", kind, name, exc_info=True)
+            return {"error": type(e).__name__}
+        finally:
+            with _local_guard:
+                _local_pending -= 1
+
+    return _local_pool.submit(work)
+
+
+def _shadow_result(shadow) -> dict:
+    """Gemini 답이 왔을 때 끝나 있으면 응답에 넣는다. 안 끝났으면 기다리지 않는다(서버 로그에는 남는다)."""
+    if shadow is None:
+        return {}
+    return {"local": shadow.result() if shadow.done() else {"pending": True}}
+
+
 async def _call(fn: Callable[[bytes], object], jpeg):
     stages = _stages.get()
     t0 = time.perf_counter()
@@ -368,12 +423,13 @@ async def _observe(kind: str, image: UploadFile, x_api_key: str | None, melds: i
     opts: dict = {"melds": melds} if melds else {}  # 손패 전용에서 앱이 이미 읽은 울기 수(있을 때만)
     if hand_frac is not None and SEAT_SPLIT:
         opts["hand_frac"] = hand_frac  # 자리 판독에서 앱이 보낸 격자 손패 칸 폭 비율(있을 때만)
+    shadow = _shadow("seat", image.filename, lambda r: r.read_seat(jpeg, hand_frac)) if kind == "seat" else None
     c: GeminiCall = await _call(lambda j: recognizer.observe(j, kind, ultra_high=kind in ULTRA_HIGH_KINDS, **opts), jpeg)
     log.info("observe/%s%s %s -> %s in %d ms (prep %d) (tokens %d+%d)", kind,
              f"[{c.data['method']}]" if "method" in c.data else "", image.filename,
              str({k: v for k, v in c.data.items() if k not in ("notes", "method")})[:300],
              c.latency_ms, c.prep_ms, c.input_tokens, c.output_tokens)
-    return {**c.data, **_timing(c)}
+    return {**c.data, **_timing(c), **_shadow_result(shadow)}
 
 
 @app.post("/v2/hand")
@@ -433,12 +489,13 @@ async def observe_last_multi(images: list[UploadFile] = File(...),
         raise HTTPException(status_code=400, detail=f"images must be 1..{LAST_MULTI_MAX}")
     _gate(x_api_key)
     jpegs = [await _read_image(im) for im in images]
+    shadow = _shadow("last3", [im.filename for im in images], lambda r: r.read_rivers(jpegs))
     c: GeminiCall = await _call(recognizer.observe_last_multi, jpegs)
     log.info("observe/last3[%s] %s -> %s in %d ms (prep %d) (tokens %d+%d)", c.data.get("method"),
              [im.filename for im in images],
              [r["last_tile"]["tile"] if r["last_tile"] else None for r in c.data["rivers"]],
              c.latency_ms, c.prep_ms, c.input_tokens, c.output_tokens)
-    return {**c.data, **_timing(c)}
+    return {**c.data, **_timing(c), **_shadow_result(shadow)}
 
 
 @app.post("/v2/sticks")

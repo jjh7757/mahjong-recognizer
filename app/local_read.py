@@ -41,7 +41,9 @@ ABOVE = 1.5  # 손패 줄보다 패 몇 개 위(가운데 쪽)까지 울기 후�
 STRAY_UP, STRAY_DOWN = 1.0, 3.5  # 떼어 둔 패: 손패 줄 기준 패 몇 개 위·아래까지
 ANGLES = range(0, 360, 15)
 
+FACE_UP_MIN = 8  # 틀을 못 잡아도 앞면 패가 이만큼 보이면 화료자 자리로 친다
 WALL_SIDE = 0.5  # 패산 표시패: 앞면 패 바로 옆 칸이 이 비율 이상 패 뒷면이면 그쪽에 패산이 붙어 있다
+LOCAL_SIDEWAYS_HEIGHT = (0.6, 0.9)  # YOLO26 상자는 눕힌 패 높이가 운영 기준(YOLO11, ~0.8)보다 크게 잡힌다(metrics 표 3-2)
 WALL_CONF = 0.7  # 이보다 확신이 낮으면 답을 내지 않는다(측정에서 맞은 답 0.81 이상, 돌아가 겹친 패 0.33·0.58, metrics 표 1-35)
 
 
@@ -316,12 +318,17 @@ class LocalReader:
         scored = sorted(((*wall_score(rgb, b), b) for b in faces), key=lambda c: -c[1])
         top = scored[0] if scored and scored[0][0] else None
         t_rule = time.perf_counter()
-        out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces)}
+        out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces), "pairs": []}
         if top:
             tile, conf = self.read_any(rgb, top[2])
             out.update(box=list(top[2]), sides=top[0], conf=conf)
             if conf >= WALL_CONF:
                 out["indicators"] = [{"tile": tile, "conf": conf}]
+        tw = statistics.median(min(f[2], f[3]) for f in faces) if faces else 1
+        for group in st.cluster(faces, tw * 0.5, tw * 0.5):  # 리치 화료의 탁자 위 표시패 짝 후보: 딱 2장 붙은 묶음
+            if len(group) == 2:
+                read = [self.read_any(rgb, b) for b in group]
+                out["pairs"].append([{"tile": t, "conf": c} for t, c in read])
         out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
         out["rss_mb"] = rss_mb()
         return out
@@ -350,6 +357,30 @@ class LocalReader:
         out["ms"] = {"detect": round((t_det - t0) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
         out["rss_mb"] = rss_mb()
         return out
+
+    def read_seat_app(self, jpeg: bytes, hand_frac: float | None) -> dict:
+        """read_seat 을 앱의 /v2/seat 응답 모양으로. 틀을 못 잡으면 패 없이 답한다(Gemini 로 넘기지 않음)."""
+        r = self.read_seat(jpeg, hand_frac)
+        count = len(r["hand"]) + 3 * len(r["melds"])
+        separate = r["hand"][-1] if r["hand"] and count % 3 == 2 else None
+        hand = r["hand"][:-1] if separate else r["hand"]
+        tile = lambda t: {"tile": t, "conf": 0.9}  # noqa: E731
+        return {"face_up": r["framed"] or r["faces"] >= FACE_UP_MIN, "tiles": [tile(t) for t in hand], "separate_tile": tile(separate) if separate else None,
+                "melds": [{"tiles": m.split(), "sideways": [], "face_down": [], "conf": 0.9} for m in r["melds"]], "loose": [], "framed": r["framed"], "ms": r["ms"], "rss_mb": r["rss_mb"]}
+
+    def read_rivers_app(self, jpegs: list[bytes]) -> dict:
+        """강 크롭들 → 앱의 /v2/last3 응답 모양(마지막 패·장수·눕힌 패 순번). 못 잡은 자리는 패 없음."""
+        t0 = time.perf_counter()
+        rivers = []
+        for j in jpegs:
+            rgb = np.asarray(Image.open(io.BytesIO(j)).convert("RGB"))
+            fr = rv.frame(rgb, self.detect(rgb), LOCAL_SIDEWAYS_HEIGHT)
+            if fr is None:
+                rivers.append({"last_tile": None, "tile_count": 0, "sideways": []})
+                continue
+            tile, conf = self.read_any(rgb, fr.last)
+            rivers.append({"last_tile": {"tile": tile, "conf": conf}, "tile_count": fr.count, "sideways": [i for i, s in enumerate(fr.sideways) if s]})
+        return {"rivers": rivers, "method": "frame", "ms": {"total": _ms(t0)}, "rss_mb": rss_mb()}
 
     def read_rivers(self, jpegs: list[bytes]) -> dict:
         """강 크롭들(각 자리 쪽으로 세운 것, 보낸 순서) → rivers[{tile, conf, count}|None], 시간."""

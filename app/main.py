@@ -539,6 +539,23 @@ async def observe_local_dora(image: UploadFile = File(...), x_api_key: str | Non
     return out
 
 
+@app.post("/v2/localseat")
+async def observe_local_seat(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
+                             hand_frac: float | None = Query(None, gt=0, lt=1)) -> dict:
+    """자리 크롭 → /v2/seat 모양의 답(자체 모델만, Gemini 없음)."""
+    jpeg = await _accept(image, x_api_key, max_side=3072)
+    return await _run(_get_local_reader().read_seat_app, jpeg, hand_frac)
+
+
+@app.post("/v2/locallast3")
+async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """강 크롭 1~4장 → /v2/last3 모양의 답과 눕힌 패(자체 모델만, Gemini 없음)."""
+    if not 1 <= len(images) <= 4:
+        raise HTTPException(status_code=422, detail="images must be 1~4")
+    jpegs = [await _accept(i, x_api_key, max_side=3072) for i in images]
+    return await _run(_get_local_reader().read_rivers_app, jpegs)
+
+
 @app.post("/v2/handonly")
 async def observe_handonly(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
                            melds: int = Query(0, ge=0, le=4)) -> dict:

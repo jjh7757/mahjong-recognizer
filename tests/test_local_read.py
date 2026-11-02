@@ -126,6 +126,42 @@ def test_localdora_route_uses_reader(monkeypatch):
     assert r.status_code == 200 and r.json()["indicators"] == []
 
 
+def test_read_seat_app_splits_separate_tile_and_melds(monkeypatch):
+    r = lr.LocalReader()
+    base = {"framed": True, "faces": 14, "ms": {}, "rss_mb": 1}
+    monkeypatch.setattr(r, "read_seat", lambda j, f: {**base, "hand": ["1m"] * 10 + ["5s"], "melds": ["6z 6z 6z"]})
+    o = r.read_seat_app(b"", 0.7)
+    assert o["face_up"] is True and len(o["tiles"]) == 10 and o["separate_tile"]["tile"] == "5s"
+    assert o["melds"][0]["tiles"] == ["6z", "6z", "6z"]
+    monkeypatch.setattr(r, "read_seat", lambda j, f: {**base, "hand": ["1m"] * 13, "melds": []})
+    assert r.read_seat_app(b"", 0.7)["separate_tile"] is None
+
+
+def test_read_seat_app_without_frame_has_no_tiles(monkeypatch):
+    r = lr.LocalReader()
+    base = {"framed": False, "hand": [], "melds": [], "ms": {}, "rss_mb": 1}
+    monkeypatch.setattr(r, "read_seat", lambda j, f: {**base, "faces": 20})
+    o = r.read_seat_app(b"", 0.7)
+    assert o["face_up"] is True and o["tiles"] == []
+    monkeypatch.setattr(r, "read_seat", lambda j, f: {**base, "faces": 0})
+    assert r.read_seat_app(b"", 0.7)["face_up"] is False
+
+
+def test_read_wall_reports_lone_pairs():
+    pair = [(800, 400, 60, 80), (862, 400, 60, 80)]
+    row = [(100 + 62 * i, 600, 60, 80) for i in range(3)]
+    o = _Wall(pair + row, 0.9).read_wall(_jpeg(_canvas(pair + row)))
+    assert len(o["pairs"]) == 1 and [x["tile"] for x in o["pairs"][0]] == ["5s", "5s"]
+
+
+def test_local_routes_answer_in_app_shape(monkeypatch):
+    client = _client(monkeypatch, lr.LocalReader())
+    seat = client.post("/v2/localseat", files=_files(), params={"hand_frac": 0.7}).json()
+    assert seat["face_up"] is False and seat["tiles"] == []
+    rivers = client.post("/v2/locallast3", files=[("images", ("a.jpg", _jpeg(_canvas([])), "image/jpeg"))]).json()
+    assert rivers["method"] == "frame" and rivers["rivers"] == [{"last_tile": None, "tile_count": 0, "sideways": []}]
+
+
 class _Fake:
     model = "fake"
 

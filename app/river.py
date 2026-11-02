@@ -258,11 +258,11 @@ SIDEWAYS_RATIO = 1.05
 SIDEWAYS_HEIGHT = (0.6, 0.8)
 
 
-def sideways(box: Box, th: float, boxes: list[Box]) -> bool:
+def sideways(box: Box, th: float, boxes: list[Box], height: tuple[float, float] = SIDEWAYS_HEIGHT) -> bool:
     """[box] 가 눕힌 패인가. [th] 는 세운 패 높이, [boxes] 는 그 강의 상자 전부. 한 패가 위아래 두 상자로 쪼개지면 넓은 상자가
     눕힌 패처럼 보이는데(D k12 위 4통: 1.69·1.22), 둘이 겹치므로 다른 상자와 겹치는 상자는 세지 않는다."""
     x, y, w, h = box
-    if w <= SIDEWAYS_RATIO * h or not SIDEWAYS_HEIGHT[0] <= h / th < SIDEWAYS_HEIGHT[1]:
+    if w <= SIDEWAYS_RATIO * h or not height[0] <= h / th < height[1]:
         return False
     for o in boxes:
         if o == box:
@@ -274,7 +274,7 @@ def sideways(box: Box, th: float, boxes: list[Box]) -> bool:
     return True
 
 
-def frame(rgb: np.ndarray, boxes: list[Box]) -> RiverFrame | None:
+def frame(rgb: np.ndarray, boxes: list[Box], height: tuple[float, float] = SIDEWAYS_HEIGHT) -> RiverFrame | None:
     H, W = rgb.shape[:2]
     faces = dedupe(keep_faces(boxes, white_mask(rgb)))
     got = own_group(faces, W, H)
@@ -285,7 +285,7 @@ def frame(rgb: np.ndarray, boxes: list[Box]) -> RiverFrame | None:
     if not rows:
         return None
     own = [b for r in rows for b in r]
-    return RiverFrame(rows, len(boxes), [sideways(b, th, own) for b in own])
+    return RiverFrame(rows, len(boxes), [sideways(b, th, own, height) for b in own])
 
 
 def crop(rgb: np.ndarray, box: Box, pad: float = 0.12) -> bytes:

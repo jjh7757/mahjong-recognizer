@@ -1,9 +1,10 @@
-"""자체 모델 판독(그림자): 자리 크롭·강 크롭을 Gemini 없이 읽어 비교용으로 남긴다. 사용자에게 보이는 답에는 쓰지 않는다.
+"""자체 모델 판독: 자리 크롭·강 크롭·사진 전체를 Gemini 없이 읽는다(/v2/localseat·/v2/locallast3·/v2/localdora, 그림자).
 
 검출 = YOLO26n "앞면 패" 1종(mahjong_calc/experiments/tile_classifier, 입력 긴 변 1280, NMS 필요), 분류 = MobileNetV3 Small 37종(128×128).
 자리: 통째 검출 1번 → seat.structure_split 복사본(이웃 패를 울기에서 뺌, 위아래 울기를 줄로 나눔) → 모양·무늬 검사(옅은 무늬·白 허용, 직선 0.30패)
-→ 분류, 13장이면 손패 줄 오른쪽 홀로 놓인 패를 떼어 둔 패로. 강: 검출 → river.frame → 마지막 패를 위아래 두 방향으로 읽어 확신 높은 쪽.
-측정: mahjong_calc metrics 표 1-23·1-26·1-28·1-29(같은 매장 사진, t4g.small 자리 0.69 / 0.91 / 1.02초).
+→ 분류, 13장이면 손패 줄 오른쪽 홀로 놓인 패를 떼어 둔 패로. 틀을 못 잡고 장수가 모자라면 白 을 코드로 채운다(빈칸·모서리 퐁).
+강: 검출 → river.frame → 마지막 패를 위아래 두 방향으로 읽어 확신 높은 쪽. 확신도는 분류기 확률, 채운 白 은 [FILLED_CONF](앱이 자동 반영하지 않는다).
+측정: mahjong_calc metrics 표 1-23·1-26·1-28·1-29·1-33(같은 매장 사진, t4g.small 자리 0.69 / 0.91 / 1.02초).
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from PIL import Image
 
 from . import river as rv
 from . import seat as st
+from . import seat_wide as sw
 
 log = logging.getLogger("local_read")
 
@@ -45,6 +47,19 @@ FACE_UP_MIN = 8  # 틀을 못 잡아도 앞면 패가 이만큼 보이면 화료
 WALL_SIDE = 0.5  # 패산 표시패: 앞면 패 바로 옆 칸이 이 비율 이상 패 뒷면이면 그쪽에 패산이 붙어 있다
 LOCAL_SIDEWAYS_HEIGHT = (0.6, 0.9)  # YOLO26 상자는 눕힌 패 높이가 운영 기준(YOLO11, ~0.8)보다 크게 잡힌다(metrics 표 3-2)
 WALL_CONF = 0.7  # 이보다 확신이 낮으면 답을 내지 않는다(측정에서 맞은 답 0.81 이상, 돌아가 겹친 패 0.33·0.58, metrics 표 1-35)
+
+# 白 채우기(metrics 표 1-33). 뒷면이 색 있는 패 세트에서는 무늬 없는 흰 앞면 = 白 이라 위치만 찾으면 종류가 정해진다.
+FILLED_CONF = 0.5  # 앱 uncertainBelow(0.7)보다 낮게: 노란 테두리·자동 반영 막힘
+WHITE_MIN = sw.FILL_WHITE
+RISE = 0.5  # 탁자 끝이 패 높이의 이만큼 넘게 올라오면 패가 놓인 곳
+CORNER_W = (2.4, 3.9)  # 패 3장 폭(패 폭 배수)
+CORNER_H = (0.6, 1.5)  # 올라온 높이(패 높이 배수)
+CORNER_REACH = 1.0  # 오른쪽 탁자 끝에서 패 폭 1개 안에서 끝나야 모서리
+WINDOW = 6  # 오른쪽 끝에서 패 몇 개 폭을 보나
+SEAM_JUMP, SEAM_MIN = 0.12, 0.6  # 패 나누기: 위쪽 끝 꺾임 최소(패 폭 배수), 첫 패 최소 폭(패 폭 배수)
+TILE_W_MAX, TILE_H = 1.3, 1.05  # 모서리 패 상자: 폭 상한(패 폭 배수), 높이(패 높이 배수)
+EDGE = 0.1  # 모서리 무늬 검사에서 뺄 경계 폭(패 폭 배수)
+CORNER_INK = 0.03  # 모서리 칸 무늬 비율 상한. 패 옆면 줄이 조금 들어와 낱장 기준 0.01 보다 넉넉히
 
 
 def _ms(t0: float) -> int:
@@ -174,6 +189,152 @@ def strays(fr: st.SeatFrame, faces: list, rgb: np.ndarray) -> list:
     return out
 
 
+# ---------------------------------------------------------------- 白 채우기
+
+def blank_at(rgb: np.ndarray, b) -> bool:
+    return sw._white_at(rgb, b) >= WHITE_MIN and st.ink(rgb, b) < BLANK
+
+
+def overlaps(b, faces: list) -> bool:
+    return any(min(b[0] + b[2], f[0] + f[2]) - max(b[0], f[0]) > 0.3 * b[2] and min(b[1] + b[3], f[1] + f[3]) - max(b[1], f[1]) > 0.3 * b[3] for f in faces)
+
+
+def row_blanks(rgb: np.ndarray, faces: list, fr: st.SeatFrame, split: int) -> list:
+    """손패 줄의 틈·양 끝에서 무늬 없는 흰 칸. 줄에 든 상자(앞뒤 덩어리 모두)로 간격을 잰다."""
+    W = rgb.shape[1]
+    line = st.fit_line([f for f in faces if f[0] + f[2] / 2 < split + st.SPLIT_MARGIN * W])
+    if line is None:
+        return []
+    a, c = line
+    on = sorted([f for f in faces if abs(f[1] + f[3] / 2 - (a * (f[0] + f[2] / 2) + c)) < 0.5 * fr.th and f[3] > f[2]], key=lambda x: x[0])
+    if len(on) < 2:
+        return []
+    steps = [q[0] - p[0] for p, q in zip(on, on[1:]) if q[0] - p[0] < 1.4 * fr.tw]
+    if not steps:
+        return []
+    pitch = statistics.median(steps)
+    out = []
+    for p, q in zip(on, on[1:]):
+        k = round((q[0] - p[0]) / pitch)
+        for i in range(1, k):
+            out.append((round(p[0] + (q[0] - p[0]) * i / k), round(p[1] + (q[1] - p[1]) * i / k), p[2], p[3]))
+    for e, step in ((on[0], -1), (on[-1], 1)):
+        for i in range(1, 5):
+            out.append((round(e[0] + step * i * pitch), round(e[1] + step * i * pitch * a), e[2], e[3]))
+    # 끝쪽 후보는 안쪽부터 이어져야 한다(떨어진 흰 곳을 건너뛰어 잡지 않게)
+    keep = [b for b in out if not overlaps(b, faces) and blank_at(rgb, b)]
+    lo, hi = on[0][0], on[-1][0]
+    inner = [b for b in keep if lo < b[0] < hi]
+    left = [b for b in keep if b[0] <= lo and round((lo - b[0]) / pitch) <= 1 + sum(1 for x in keep if b[0] < x[0] <= lo)]
+    right = [b for b in keep if b[0] >= hi and round((b[0] - hi) / pitch) <= 1 + sum(1 for x in keep if hi <= x[0] < b[0])]
+    return inner + left + right
+
+
+def first_seam(tops: np.ndarray, tw: float) -> int | None:
+    """왼쪽 첫 패의 오른쪽 끝: 위쪽 경계의 큰 꺾임 두 곳 중 왼쪽. 나란히 놓여 안 꺾이면 None."""
+    span = 24  # 패 모서리가 둥글어 꺾임이 약 30픽셀에 걸치기도 한다(171245)
+    if len(tops) <= span:
+        return None
+    jump = np.abs(tops[span:].astype(int) - tops[:-span].astype(int))
+    cuts: list[int] = []
+    for i in np.argsort(-jump):
+        c = int(i) + span // 2
+        if jump[i] < SEAM_JUMP * tw or len(cuts) == 2:
+            break
+        if c >= SEAM_MIN * tw and len(tops) - c >= SEAM_MIN * tw and all(abs(c - k) >= SEAM_MIN * tw for k in cuts):
+            cuts.append(c)
+    return min(cuts) if cuts else None
+
+
+def corner_blank(rgb: np.ndarray, fr: st.SeatFrame, faces: list) -> list | None:
+    """오른쪽 모서리 白 퐁: 펠트 아래쪽 경계가 패 3장 폭만큼 올라온 곳. 세 상자(왼쪽부터) 또는 None."""
+    felt = st.felt_mask(rgb)
+    y_ref = int(max(b[1] + b[3] for b in fr.hand) + fr.th)  # 손패 줄 아래 펠트에서 아래로 내려가며 끝을 찾는다(탁자 밖 초록 옷·그늘을 안 잡게)
+    if y_ref >= felt.shape[0]:
+        return None
+    cols = np.nonzero(felt[y_ref])[0]
+    if not cols.size:
+        return None
+    # 오른쪽 탁자 끝 = 패 폭 2개 넘게 이어진 펠트 중 가장 오른쪽(테두리 너머 작은 조각을 안 잡게)
+    runs = np.split(cols, np.nonzero(np.diff(cols) > 0.5 * fr.tw)[0] + 1)
+    long_runs = [c for c in runs if c[-1] - c[0] >= 2 * fr.tw]
+    if not long_runs:
+        return None
+    right = int(long_runs[-1][-1])
+    x0 = max(0, int(right - WINDOW * fr.tw))
+
+    def edge(x: int) -> int:
+        if not felt[y_ref, x]:
+            return -1  # 손·팔 등으로 가려진 줄
+        stop = np.nonzero(~felt[y_ref:, x])[0]
+        return y_ref + int(stop[0]) if stop.size else felt.shape[0]
+
+    prof = np.array([edge(x) for x in range(x0, right + 1)])
+    # 탁자 끝은 손패 줄과 나란하다. 그만큼 빼고 봐야 기운 사진의 비스듬한 끝을 패로 잘못 보지 않는다
+    tilt = _line(fr.hand)[0] * np.arange(len(prof))
+    level = prof - tilt
+    seen = level[prof >= 0]
+    if not seen.size:
+        return None
+    base = float(np.percentile(seen, 90))  # 모서리는 패가 절반 넘게 가려 높은 쪽으로 잡는다
+    up = (prof >= 0) & (level < base - RISE * fr.th)
+    idx = np.nonzero(up)[0]
+    if not idx.size:
+        return None
+    end = int(idx.max())
+    start = end
+    while start > 0 and (up[start - 1] or (start >= 2 and up[start - 2])):
+        start -= 1
+    x1, x2 = x0 + start, x0 + end + 1
+    if right - x2 > CORNER_REACH * fr.tw or not CORNER_W[0] * fr.tw <= x2 - x1 <= CORNER_W[1] * fr.tw:
+        return None
+    tops = prof[start:end + 1]
+    if not CORNER_H[0] * fr.th <= base - float(np.median(level[start:end + 1])) <= CORNER_H[1] * fr.th:
+        return None
+    y2 = int(base + tilt[end])
+    # 계단이라 칸마다 위쪽 끝이 달라 상자 대신 경계 안쪽 픽셀만 본다(펠트·패 옆면 줄 제외)
+    hsv = np.asarray(Image.fromarray(rgb[:y2, x1:x2]).convert("HSV")).astype(int)
+    trim = int(EDGE * fr.tw)
+    inside = np.zeros(hsv.shape[:2], bool)
+    for i, t in enumerate(tops):
+        if trim <= i < len(tops) - trim and t + trim < y2 - trim:
+            inside[t + trim:y2 - trim, i] = True
+    if inside.sum() == 0:
+        return None
+    ink = ((hsv[..., 2] < 120) | (hsv[..., 1] > 80))[inside].mean()
+    if ink >= CORNER_INK:
+        return None
+    # 패마다 상자. 오른쪽·아래는 흰 테두리 위에 걸쳐 경계가 안 보이므로, 폭은 첫 꺾임(없으면 손패 패 폭), 높이는 손패 패 높이로 정한다
+    seam = first_seam(tops, fr.tw)
+    pw = float(np.clip(seam if seam else fr.tw, fr.tw, TILE_W_MAX * fr.tw))
+    boxes = []
+    for i in range(3):
+        col = tops[int(i * pw):int((i + 1) * pw)]
+        top = int(np.median(col)) if col.size else boxes[-1][1]
+        boxes.append((round(x1 + i * pw), top, round(pw), round(TILE_H * fr.th)))
+    return None if any(overlaps(b, faces) for b in boxes) else boxes
+
+
+def fill(rgb: np.ndarray, faces: list, split: int) -> tuple[st.SeatFrame | None, list]:
+    """틀이 실패한 사진에 白 을 채워 다시 잡는다. (통과한 틀, 채운 상자) 또는 (None, [])."""
+    fr = split_frame(rgb, faces, split)
+    if fr is None or fr.count >= 13:
+        return None, []
+    added = row_blanks(rgb, faces, fr, split)
+    if fr.count + len(added) > 14:
+        return None, []
+    if added:
+        fr = split_frame(rgb, faces + added, split)
+        if fr is None:
+            return None, []
+    if fr.count + 3 in (13, 14):
+        boxes = corner_blank(rgb, fr, faces + added)
+        if boxes:
+            fr.melds = [*fr.melds, boxes]
+            added = added + boxes
+    return (fr, added) if added and frame_ok(fr, rgb) else (None, [])
+
+
 def cut(rgb: np.ndarray, b) -> Image.Image:
     x, y, w, h = b
     H, W = rgb.shape[:2]
@@ -274,9 +435,9 @@ class LocalReader:
         e = np.exp(y - y.max(1, keepdims=True))
         return e / e.sum(1, keepdims=True)
 
-    def read(self, ims: list[Image.Image]) -> list[str]:
-        """자리 크롭처럼 이미 세운 패."""
-        return [CLASSES[int(k)] for k in self.probs(ims).argmax(1)] if ims else []
+    def read(self, ims: list[Image.Image]) -> list[tuple[str, float]]:
+        """자리 크롭처럼 이미 세운 패. (종류, 확신도)."""
+        return [(CLASSES[int(q.argmax())], round(float(q.max()), 3)) for q in self.probs(ims)] if ims else []
 
     def read_any(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """방향을 모르는 패: 상자 모양에 맞는 방향 중 확신이 가장 높은 값(매장 강 패는 뒤집혀 놓이기도 한다)."""
@@ -286,23 +447,24 @@ class LocalReader:
         i = int(p.max(1).argmax())
         return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
 
-    def read_meld_tile(self, rgb: np.ndarray, b) -> str:
+    def read_meld_tile(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """울기: 세운 패는 그대로, 눕힌 패는 두 방향 중 확신 높은 쪽."""
         im = cut(rgb, b)
         if b[2] <= 1.15 * b[3]:
             return self.read([im])[0]
         p = self.probs([im.rotate(90 * k, expand=True) for k in (1, 3)])
-        return CLASSES[int(p[int(p.max(1).argmax())].argmax())]
+        i = int(p.max(1).argmax())
+        return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
 
-    def read_turned(self, rgb: np.ndarray, b, tw: float, th: float) -> str:
+    def read_turned(self, rgb: np.ndarray, b, tw: float, th: float) -> tuple[str, float]:
         """돌아간 낱장: 각도마다 패 크기로 잘라 가장 확신 높은 값."""
         cx, cy, r = b[0] + b[2] / 2, b[1] + b[3] / 2, int(max(b[2], b[3], th))
         H, W = rgb.shape[:2]
         part = Image.fromarray(rgb).crop((max(0, int(cx - r)), max(0, int(cy - r)), min(W, int(cx + r)), min(H, int(cy + r))))
         m = part.width / 2, part.height / 2
         box = (int(m[0] - tw / 2), int(m[1] - th / 2), int(m[0] + tw / 2), int(m[1] + th / 2))
-        p = self.probs([part.rotate(a).crop(box) for a in ANGLES])
-        return CLASSES[int(p.max(0).argmax())]
+        p = self.probs([part.rotate(a).crop(box) for a in ANGLES]).max(0)
+        return CLASSES[int(p.argmax())], round(float(p.max()), 3)
 
     # ------------------------------------------------------------ 판독
 
@@ -333,8 +495,9 @@ class LocalReader:
         out["rss_mb"] = rss_mb()
         return out
 
-    def read_seat(self, jpeg: bytes, hand_frac: float | None) -> dict:
-        """자리 크롭(그 자리 방향으로 세운 것) → framed, hand(떼어 둔 패는 끝에), melds, block(홀로 놓인 패가 둘 이상), 시간."""
+    def read_seat(self, jpeg: bytes, hand_frac: float | None, fill_blank: bool = True) -> dict:
+        """자리 크롭(그 자리 방향으로 세운 것) → framed, hand(떼어 둔 패는 끝에)·hand_conf, melds·meld_conf(묶음에서 가장 낮은 값),
+        block(홀로 놓인 패가 둘 이상), filled(코드로 채운 白 장수), 시간."""
         t0 = time.perf_counter()
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
         boxes = self.detect(rgb)
@@ -343,17 +506,30 @@ class LocalReader:
         split = int(rgb.shape[1] * (hand_frac if hand_frac else 0.7))
         fr = split_frame(rgb, faces, split)
         framed = frame_ok(fr, rgb)
+        added: list = []
+        if not framed and fill_blank:
+            got, added = fill(rgb, faces, split)
+            if got is not None:
+                fr, framed = got, True
         t_rule = time.perf_counter()
-        out = {"framed": framed, "hand": [], "melds": [], "block": False, "faces": len(faces)}
+        out = {"framed": framed, "hand": [], "hand_conf": [], "melds": [], "meld_conf": [], "block": False, "faces": len(faces), "filled": len(added)}
         if framed:
-            out["hand"] = self.read([cut(rgb, b) for b in fr.hand] + ([cut(rgb, fr.separate)] if fr.separate else []))
-            out["melds"] = [" ".join(self.read_meld_tile(rgb, b) for b in m) for m in fr.melds]
-            if fr.count == 13 and not fr.separate:
+            filled = set(added)
+
+            def blank_or(b, read):
+                """白 을 채운 사진은 무늬 없는 상자도 白 으로(분류기 답을 안 쓴다). 틀을 그냥 잡은 사진은 분류기 답 그대로."""
+                return ("5z", FILLED_CONF) if filled and (b in filled or st.ink(rgb, b) < BLANK) else read(b)
+
+            hand = [blank_or(b, lambda x: self.read([cut(rgb, x)])[0]) for b in fr.hand + ([fr.separate] if fr.separate else [])]
+            melds = [[blank_or(b, lambda x: self.read_meld_tile(rgb, x)) for b in m] for m in fr.melds]
+            if fr.count == 13 and not fr.separate and not added:
                 got = strays(fr, faces, rgb)
                 if len(got) == 1:
-                    out["hand"].append(self.read_turned(rgb, got[0], fr.tw, fr.th))
+                    hand.append(self.read_turned(rgb, got[0], fr.tw, fr.th))
                 elif got:
                     out["block"] = True
+            out["hand"], out["hand_conf"] = [t for t, _ in hand], [c for _, c in hand]
+            out["melds"], out["meld_conf"] = [" ".join(t for t, _ in m) for m in melds], [min(c for _, c in m) for m in melds]
         out["ms"] = {"detect": round((t_det - t0) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
         out["rss_mb"] = rss_mb()
         return out
@@ -364,9 +540,10 @@ class LocalReader:
         count = len(r["hand"]) + 3 * len(r["melds"])
         separate = r["hand"][-1] if r["hand"] and count % 3 == 2 else None
         hand = r["hand"][:-1] if separate else r["hand"]
-        tile = lambda t: {"tile": t, "conf": 0.9}  # noqa: E731
-        return {"face_up": r["framed"] or r["faces"] >= FACE_UP_MIN, "tiles": [tile(t) for t in hand], "separate_tile": tile(separate) if separate else None,
-                "melds": [{"tiles": m.split(), "sideways": [], "face_down": [], "conf": 0.9} for m in r["melds"]], "loose": [], "framed": r["framed"], "ms": r["ms"], "rss_mb": r["rss_mb"]}
+        tiles = [{"tile": t, "conf": c} for t, c in zip(r["hand"], r["hand_conf"])]
+        return {"face_up": r["framed"] or r["faces"] >= FACE_UP_MIN, "tiles": tiles[:len(hand)], "separate_tile": tiles[-1] if separate else None,
+                "melds": [{"tiles": m.split(), "sideways": [], "face_down": [], "conf": c} for m, c in zip(r["melds"], r["meld_conf"])], "loose": [],
+                "framed": r["framed"], "filled": r["filled"], "ms": r["ms"], "rss_mb": r["rss_mb"]}
 
     def read_rivers_app(self, jpegs: list[bytes]) -> dict:
         """강 크롭들 → 앱의 /v2/last3 응답 모양(마지막 패·장수·눕힌 패 순번). 못 잡은 자리는 패 없음."""

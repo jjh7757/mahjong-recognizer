@@ -86,6 +86,7 @@ class GeminiCall:
     output_tokens: int
     model: str
     prep_ms: int = 0
+    gemini_ms: list[int] = field(default_factory=list)  # Gemini 호출마다 걸린 시간(묶음이면 여러 개)
 
 
 @dataclass
@@ -253,7 +254,7 @@ class GeminiRecognizer:
         if not response.text:
             reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
             raise RuntimeError(f"empty response ({reason})")
-        return GeminiCall(json.loads(response.text), latency_ms, inp, out, self.model)
+        return GeminiCall(json.loads(response.text), latency_ms, inp, out, self.model, gemini_ms=[latency_ms])
 
     def recognize(self, jpeg: bytes) -> RecognizeResult:
         c = self.call(jpeg, HAND_PROMPT, HAND_SCHEMA)
@@ -419,11 +420,12 @@ class GeminiRecognizer:
         data["method"] = "frame"
         data["frame"] = {**fr.summary(), "ms": frame_ms}
         return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls),
-                          self.model, prep_ms=prep_ms)
+                          self.model, prep_ms=prep_ms, gemini_ms=[m for c in calls for m in c.gemini_ms])
 
     def observe_seat_wide(self, jpeg: bytes) -> GeminiCall:
         """화료자 쪽 테이블 절반 → 손패 줄·낱장(외톨이 표시)·모서리 울기. 위치는 YOLO11(seat_wide), 종류는 조각 그림 + 참고표를
-        [seat_reads] 번 읽어 칸마다 다수결, 모서리 칸은 통째로 [seat_reads] 번 다수결. 틀을 못 잡으면 row 가 빈 답(method "none")."""
+        [wide_reads] 번(없으면 seat_reads) 읽어 칸마다 다수결, 모서리 칸은 통째로 같은 수만큼 다수결. 한 번만 읽으면 unanimous 는 늘 거짓.
+        틀을 못 잡으면 row 가 빈 답(method "none")."""
         import numpy as np
 
         from . import observe as ob
@@ -446,11 +448,12 @@ class GeminiRecognizer:
         buf = io.BytesIO()
         Image.fromarray(rgb[y0:y1, x0:x1]).save(buf, "JPEG", quality=92)
         res = "MEDIA_RESOLUTION_ULTRA_HIGH"
+        wide_reads = getattr(self, "wide_reads", None) or self.seat_reads
         prep_ms = _ms(t0)
         pieces = [_fanout_pool.submit(self.call, sheet, ob.piece_prompt(n), ob.piece_schema(n), media_resolution=res,
-                                      extra_images=[(REF_SHEET.read_bytes(), None)]) for _ in range(self.seat_reads)]
+                                      extra_images=[(REF_SHEET.read_bytes(), None)]) for _ in range(wide_reads)]
         corners = [_fanout_pool.submit(self.call, buf.getvalue(), ob.CORNER_WIDE_PROMPT_V2, ob.CORNER_SCHEMA_V2, media_resolution=res)
-                   for _ in range(self.seat_reads)]
+                   for _ in range(wide_reads)]
         calls, reads, corner_reads, last_error = [], [], [], None
         for f, into in [(f, reads) for f in pieces] + [(f, corner_reads) for f in corners]:
             try:
@@ -463,7 +466,7 @@ class GeminiRecognizer:
             into.append(ob.normalize_pieces(c.data, n) if into is reads else ob.normalize_corner_v2(c.data))
         if not reads:
             raise last_error or RuntimeError("no seat wide read")
-        unanimous = len(reads) == self.seat_reads
+        unanimous = len(reads) == wide_reads > 1
         tiles: list[dict | None] = []
         for i in range(n):
             votes = Counter(r[i]["tile"] if r[i] else None for r in reads)
@@ -487,7 +490,8 @@ class GeminiRecognizer:
             "frame": {**fr.summary(), "ms": frame_ms},
             "notes": "",
         }
-        return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls), self.model, prep_ms=prep_ms)
+        return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls), self.model, prep_ms=prep_ms,
+                          gemini_ms=[m for c in calls for m in c.gemini_ms])
 
     def _observe_seat(self, jpeg: bytes, resolution: str | None, prompt: str | None = None, schema: dict | None = None,
                       norm=None, t0: float | None = None) -> GeminiCall:
@@ -517,4 +521,4 @@ class GeminiRecognizer:
         if len(calls) < self.seat_reads:
             data["agreement"]["unanimous"] = False  # 읽기가 빠지면 만장일치로 치지 않는다
         return GeminiCall(data, _ms(t0), sum(c.input_tokens for c in calls), sum(c.output_tokens for c in calls),
-                          self.model, prep_ms=prep_ms)
+                          self.model, prep_ms=prep_ms, gemini_ms=[m for c in calls for m in c.gemini_ms])

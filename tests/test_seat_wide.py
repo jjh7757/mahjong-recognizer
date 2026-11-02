@@ -200,6 +200,18 @@ def test_observe_seat_wide_reads_pieces_and_corner(monkeypatch):
     assert len(seen) == 6 and c.input_tokens == 450
 
 
+def test_observe_seat_wide_single_read_is_not_unanimous(monkeypatch):
+    monkeypatch.setattr(sw, "WIN", 4000)
+    row = _row(10)
+    a = " ".join(["1m"] * 10)
+    r, seen = _recognizer(row, iter([a]))
+    r.wide_reads = 1
+    d = r.observe_seat_wide(_jpeg(_canvas(row))).data
+    assert [t["tile"] for t in d["row"]] == ["1m"] * 10
+    assert d["melds"][0]["tiles"] == ["5z"] * 3
+    assert d["agreement"]["unanimous"] is False and len(seen) == 2
+
+
 def test_observe_seat_wide_majority_per_cell(monkeypatch):
     monkeypatch.setattr(sw, "WIN", 4000)
     row = _row(10)

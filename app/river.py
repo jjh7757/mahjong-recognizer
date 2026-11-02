@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import statistics
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,6 +41,18 @@ class RiverFrame:
 
 # ---------------------------------------------------------------- 검출(onnxruntime)
 
+_gate_wait = threading.local()
+
+
+def reset_gate_wait() -> None:
+    _gate_wait.s = 0.0
+
+
+def gate_wait_ms() -> int:
+    """이 스레드가 [reset_gate_wait] 뒤로 검출 차례를 기다린 시간(응답 `timing.gate_ms`)."""
+    return round(getattr(_gate_wait, "s", 0.0) * 1000)
+
+
 class PriorityGate:
     """검출을 한 번에 하나만, 우선 작업(자리·강 틀 잡기)이 진행 중이면 뒤로 미룰 수 있는 작업(넓은 구역 틀 잡기)은 기다린다.
 
@@ -68,10 +81,12 @@ class PriorityGate:
         return _Ctx()
 
     def run(self, fn, low: bool = False):
+        t0 = time.perf_counter()
         with self._cv:
             while self._busy or (low and self._high > 0):
                 self._cv.wait()
             self._busy = True
+        _gate_wait.s = getattr(_gate_wait, "s", 0.0) + time.perf_counter() - t0
         try:
             return fn()
         finally:

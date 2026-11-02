@@ -279,3 +279,11 @@ def test_responses_carry_prep_ms(monkeypatch):
         server.recognizer.observe = lambda j, kind, **kw: GeminiCall({"notes": ""}, 120, 1, 1, "fake", prep_ms=45)
         body = client.post("/v2/river", files=_upload()).json()
         assert body["latency_ms"] == 120 and body["prep_ms"] == 45
+
+
+def test_responses_carry_stage_timing(monkeypatch):
+    with _client(monkeypatch) as client:
+        server.recognizer.observe = lambda j, kind, **kw: GeminiCall({"notes": ""}, 120, 1, 1, "fake", prep_ms=45, gemini_ms=[70, 75])
+        t = client.post("/v2/river", files=_upload()).json()["timing"]
+    assert t["prep_ms"] == 45 and t["work_ms"] == 120 and t["gemini_ms"] == [70, 75]
+    assert t["handler_ms"] >= t["decode_ms"] >= 0 and t["queue_ms"] >= 0 and t["gate_ms"] == 0

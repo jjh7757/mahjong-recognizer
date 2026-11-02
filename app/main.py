@@ -33,12 +33,14 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 
 from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from .observe import LAST_MULTI_MAX
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
+from .river import gate_wait_ms, reset_gate_wait
 
 log = logging.getLogger("recognizer")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -59,6 +61,8 @@ ULTRA_HIGH_KINDS = {k for k in os.environ.get("ULTRA_HIGH_KINDS", "seat,handonly
 WALL_THINKING = os.environ.get("WALL_THINKING", "low")
 # 자리 판독(/v2/seat)을 몇 번 동시에 읽어 맞춰 볼지. 모두 같아야 확신(다르면 다른 패의 확신도를 0 으로).
 SEAT_READS = int(os.environ.get("SEAT_READS", 3))
+# /v2/seatwide 조각·모서리를 각각 몇 번 읽나. 0 이면 SEAT_READS. 1 번도 3 번과 정답이 같고 호출은 ⅓(mahjong_calc metrics 표 1-25)
+WIDE_READS = int(os.environ.get("WIDE_READS", 1))
 MAX_UPLOAD = int(os.environ.get("MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
 # Content-Length 선검사에서 multipart 겉포장(경계·헤더·파일 이름)에 주는 여유.
 MULTIPART_SLACK = 64 * 1024
@@ -94,6 +98,7 @@ SEAT_TABLE = os.environ.get("SEAT_TABLE", "0") == "1"
 app = FastAPI(title="mahjong-recognizer", version="0.4.0")
 recognizer: GeminiRecognizer | None = None
 _sem = asyncio.Semaphore(MAX_CONCURRENT)
+_stages: ContextVar[dict | None] = ContextVar("stages", default=None)  # 이 요청의 단계별 시간(응답 `timing`)
 # Gemini 호출·디코딩이 도는 스레드. asyncio.to_thread 의 기본 실행기는 min(32, cpu+4) 라 2 vCPU 에서 6개 — 세마포어 16 이
 # 무의미하고 판독이 여섯 개씩 줄을 섰다(2026-10-30). 세마포어 안의 호출 16 + 디코딩 몫 4.
 _executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT + 4, thread_name_prefix="call")
@@ -190,6 +195,7 @@ def startup() -> None:
                                       locate_thinking=LOCATE_THINKING, seat_reads=SEAT_READS, river_locator=locator,
                                       seat_locator=seat_locator, handonly_frame=HANDONLY_FRAME)
         recognizer.wall_thinking = WALL_THINKING
+        recognizer.wide_reads = WIDE_READS or None
         log.info("gemini recognizer ready: model=%s thinking=%s locate_thinking=%s max_concurrent=%d seat_reads=%d "
                  "river_frame=%s(conf %.2f) seat_frame=%s handonly_frame=%s seat_split=%s seat_table=%s", GEMINI_MODEL,
                  GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT, SEAT_READS, RIVER_FRAME, RIVER_CONF, SEAT_FRAME,
@@ -220,6 +226,7 @@ def _check_key(x_api_key: str | None) -> None:
 
 def _gate(x_api_key: str | None) -> None:
     """키·설정·요청 제한. 요청당 한 번(사진 수와 무관)."""
+    _stages.set({"t0": time.perf_counter(), "decode_ms": 0, "queue_ms": 0, "gate_ms": 0})
     _check_key(x_api_key)
     if recognizer is None:
         raise HTTPException(status_code=503, detail="recognizer not configured")
@@ -244,10 +251,14 @@ async def _read_image(image: UploadFile, max_side: int = 1568) -> bytes:
         if total > MAX_UPLOAD:
             raise HTTPException(status_code=413, detail=f"image too large (> {MAX_UPLOAD} bytes)")
         chunks.append(chunk)
+    t0 = time.perf_counter()
     try:
         return await _run(prepare_image, b"".join(chunks), max_side)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
+    finally:
+        if (stages := _stages.get()) is not None:
+            stages["decode_ms"] += round((time.perf_counter() - t0) * 1000)
 
 
 async def _accept(image: UploadFile, x_api_key: str | None, max_side: int = 1568) -> bytes:
@@ -262,14 +273,34 @@ def _usage(input_tokens: int, output_tokens: int) -> dict:
 
 
 def _timing(c: GeminiCall) -> dict:
+    """`timing`: handler_ms = 키 검사부터 응답 직전까지, decode_ms = 디코딩·줄이기, queue_ms = 세마포어·실행기 대기, prep_ms·work_ms =
+    판독 함수의 전처리·전체, gate_ms = 검출 차례 대기(prep_ms 안), gemini_ms = Gemini 호출마다. 앱의 호출 시간 − handler_ms = 망·업로드·파싱."""
+    stages = _stages.get()
+    timing = {"prep_ms": c.prep_ms, "work_ms": c.latency_ms, "gemini_ms": c.gemini_ms}
+    if stages is not None:
+        timing |= {k: stages[k] for k in ("decode_ms", "queue_ms", "gate_ms")}
+        timing["handler_ms"] = round((time.perf_counter() - stages["t0"]) * 1000)
     return {"model": c.model, "latency_ms": c.latency_ms, "prep_ms": c.prep_ms,
-            "usage": _usage(c.input_tokens, c.output_tokens)}
+            "usage": _usage(c.input_tokens, c.output_tokens), "timing": timing}
 
 
 async def _call(fn: Callable[[bytes], object], jpeg):
+    stages = _stages.get()
+    t0 = time.perf_counter()
+
+    def timed(j):
+        if stages is not None:
+            stages["queue_ms"] = round((time.perf_counter() - t0) * 1000)
+        reset_gate_wait()
+        try:
+            return fn(j)
+        finally:
+            if stages is not None:
+                stages["gate_ms"] = gate_wait_ms()
+
     async with _sem:
         try:
-            return await _run(fn, jpeg)
+            return await _run(timed, jpeg)
         except Exception as e:  # noqa: BLE001
             if rate_limited(e):
                 # Gemini 429 가 재시도(recognizer.call) 뒤에도 남았다: 앱이 쉬고 다시 보내게 429 + Retry-After.

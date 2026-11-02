@@ -72,6 +72,60 @@ def test_read_seat_with_real_models_finds_no_frame_on_empty_felt():
     assert r.read_rivers([_jpeg(_canvas([]))])["rivers"] == [None]
 
 
+def _wall_canvas(faces: list, backs: list) -> np.ndarray:
+    im = Image.fromarray(_canvas(faces))
+    d = ImageDraw.Draw(im)
+    for x, y, w, h in backs:
+        d.rectangle((x, y, x + w, y + h), fill=(190, 185, 240))  # 연보라 뒷면
+    return np.asarray(im)
+
+
+def test_wall_score_prefers_tile_between_backs():
+    wall = (500, 100, 60, 80)
+    river = (800, 400, 60, 80)
+    end = (1000, 100, 60, 80)
+    backs = [(438, 100, 60, 80), (562, 100, 60, 80), (938, 100, 60, 80)]
+    rgb = _wall_canvas([wall, river, end], backs)
+    assert lr.wall_score(rgb, wall)[0] == 2
+    assert lr.wall_score(rgb, end)[0] == 1
+    assert lr.wall_score(rgb, river) == (0, 0.0)
+
+
+def test_wall_score_ignores_felt_skin_and_white():
+    b = (500, 100, 60, 80)
+    im = Image.fromarray(_canvas([b, (562, 100, 60, 80)]))  # 오른쪽 이웃은 앞면 패(흰 면)
+    ImageDraw.Draw(im).rectangle((438, 100, 498, 180), fill=(225, 175, 145))  # 왼쪽은 피부색
+    assert lr.wall_score(np.asarray(im), b)[0] == 0
+
+
+class _Wall(lr.LocalReader):
+    def __init__(self, faces, conf):
+        super().__init__()
+        self.faces, self.conf = faces, conf
+
+    def detect(self, rgb, low=True):
+        return self.faces
+
+    def read_any(self, rgb, b):
+        return "5s", self.conf
+
+
+def test_read_wall_answers_only_flanked_and_confident_tile():
+    wall = (500, 100, 60, 80)
+    jpeg = _jpeg(_wall_canvas([wall], [(438, 100, 60, 80), (562, 100, 60, 80)]))
+    assert _Wall([wall], 0.9).read_wall(jpeg)["indicators"] == [{"tile": "5s", "conf": 0.9}]
+    low = _Wall([wall], 0.5).read_wall(jpeg)
+    assert low["indicators"] == [] and low["box"] == list(wall)
+    assert _Wall([(800, 400, 60, 80)], 0.9).read_wall(jpeg)["indicators"] == []
+    assert _Wall([], 0.9).read_wall(jpeg)["indicators"] == []
+
+
+def test_localdora_route_uses_reader(monkeypatch):
+    client = _client(monkeypatch, _Wall([], 0.9))
+    r = client.post("/v2/localdora", files=_files())
+    assert r.status_code == 200 and r.json()["indicators"] == []
+
+
 class _Fake:
     model = "fake"
 

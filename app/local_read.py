@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import statistics
 import threading
 import time
@@ -22,8 +23,9 @@ from . import seat as st
 
 log = logging.getLogger("local_read")
 
-DET_MODEL = Path(__file__).parent / "assets" / "tile-yolo26n.onnx"
-CLS_MODEL = Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx"
+# 환경 변수는 측정용: 그 사진을 학습하지 않은 나눔 모델로 재기 위해.
+DET_MODEL = Path(os.environ.get("LOCAL_DET_MODEL") or Path(__file__).parent / "assets" / "tile-yolo26n.onnx")
+CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
 CLASSES = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + ["0m", "0p", "0s"] + [f"{n}z" for n in range(1, 8)]
 IMG = 1280
 CONF, IOU = 0.25, 0.7
@@ -38,6 +40,9 @@ LINE_TOL = 0.30  # 손패 줄 직선 허용(패 높이 비율, 운영 틀 0.25)
 ABOVE = 1.5  # 손패 줄보다 패 몇 개 위(가운데 쪽)까지 울기 후보로 보나
 STRAY_UP, STRAY_DOWN = 1.0, 3.5  # 떼어 둔 패: 손패 줄 기준 패 몇 개 위·아래까지
 ANGLES = range(0, 360, 15)
+
+WALL_SIDE = 0.5  # 패산 표시패: 앞면 패 바로 옆 칸이 이 비율 이상 패 뒷면이면 그쪽에 패산이 붙어 있다
+WALL_CONF = 0.7  # 이보다 확신이 낮으면 답을 내지 않는다(측정에서 맞은 답 0.81 이상, 돌아가 겹친 패 0.33·0.58, metrics 표 1-35)
 
 
 def _ms(t0: float) -> int:
@@ -176,6 +181,32 @@ def cut(rgb: np.ndarray, b) -> Image.Image:
 
 # ---------------------------------------------------------------- 모델
 
+def _back_mask(rgb: np.ndarray) -> np.ndarray:
+    """패 뒷면 후보: 펠트(초록)·피부·흰 면·어두운 곳이 아닌 색 있는 면. PIL HSV 0~255."""
+    h, s, v = np.moveaxis(np.asarray(Image.fromarray(rgb).convert("HSV")), 2, 0)
+    return (s >= 25) & (v >= 150) & (h > 30) & ((h < 55) | (h > 130))
+
+
+def wall_score(rgb: np.ndarray, b) -> tuple[int, float]:
+    """앞면 패 상자의 앞뒤(한 축)에 패 뒷면이 붙은 정도: (붙은 쪽 수, 점수). 패산에 뒤집어 둔 표시패면 높다."""
+    x, y, w, h = (int(v) for v in b)
+    H, W = rgb.shape[:2]
+    x0, y0, x1, y1 = max(0, x - w - 2), max(0, y - h - 2), min(W, x + 2 * w + 2), min(H, y + 2 * h + 2)
+    if x1 <= x0 or y1 <= y0:
+        return 0, 0.0
+    m = _back_mask(rgb[y0:y1, x0:x1])
+
+    def frac(a: int, c: int, p: int, q: int) -> float:
+        a, c, p, q = max(a - x0, 0), max(c - y0, 0), min(p - x0, x1 - x0), min(q - y0, y1 - y0)
+        return float(m[c:q, a:p].mean()) if p > a and q > c else 0.0
+
+    across = [frac(x - w - 2, y, x - 2, y + h), frac(x + w + 2, y, x + 2 * w + 2, y + h)]
+    along = [frac(x, y - h - 2, x + w, y - 2), frac(x, y + h + 2, x + w, y + 2 * h + 2)]
+    pair = across if sum(across) >= sum(along) else along
+    n = sum(p >= WALL_SIDE for p in pair)
+    return n, n + sum(pair) / 2
+
+
 class LocalReader:
     """처음 쓸 때 모델을 올린다. [gate] 를 주면 검출·분류를 낮은 우선순위로(자리·강 틀 잡기가 진행 중이면 기다린다)."""
 
@@ -272,6 +303,28 @@ class LocalReader:
         return CLASSES[int(p.max(0).argmax())]
 
     # ------------------------------------------------------------ 판독
+
+    def read_wall(self, jpeg: bytes) -> dict:
+        """테이블 전체 사진 → 패산에 뒤집어 둔 표시패 한 장. 옆에 패 뒷면이 가장 많이 붙은 앞면 패를 고른다.
+        못 찾거나 확신이 낮으면 indicators 가 빈다(白 은 검출기가 자주 놓친다). 리치 화료의 표시패 짝은 다루지 않는다.
+        측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진)."""
+        t0 = time.perf_counter()
+        rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+        t_dec = time.perf_counter()
+        faces = self.detect(rgb)
+        t_det = time.perf_counter()
+        scored = sorted(((*wall_score(rgb, b), b) for b in faces), key=lambda c: -c[1])
+        top = scored[0] if scored and scored[0][0] else None
+        t_rule = time.perf_counter()
+        out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces)}
+        if top:
+            tile, conf = self.read_any(rgb, top[2])
+            out.update(box=list(top[2]), sides=top[0], conf=conf)
+            if conf >= WALL_CONF:
+                out["indicators"] = [{"tile": tile, "conf": conf}]
+        out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
+        out["rss_mb"] = rss_mb()
+        return out
 
     def read_seat(self, jpeg: bytes, hand_frac: float | None) -> dict:
         """자리 크롭(그 자리 방향으로 세운 것) → framed, hand(떼어 둔 패는 끝에), melds, block(홀로 놓인 패가 둘 이상), 시간."""

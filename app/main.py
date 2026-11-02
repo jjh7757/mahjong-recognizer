@@ -530,6 +530,15 @@ async def observe_walldora(image: UploadFile = File(...), x_api_key: str | None 
     return await _observe("walldora", image, x_api_key)
 
 
+@app.post("/v2/localdora")
+async def observe_local_dora(image: UploadFile = File(...), x_api_key: str | None = Header(default=None)) -> dict:
+    """테이블 전체 사진 → 패산에 뒤집어 둔 표시패(자체 모델, Gemini 없음). 찾지 못하면 indicators 가 빈다."""
+    jpeg = await _accept(image, x_api_key, max_side=4080)
+    out = await _run(_get_local_reader().read_wall, jpeg)
+    log.info("localdora %s -> %s", image.filename, str(out)[:300])
+    return out
+
+
 @app.post("/v2/handonly")
 async def observe_handonly(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
                            melds: int = Query(0, ge=0, le=4)) -> dict:

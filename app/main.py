@@ -288,7 +288,7 @@ def _timing(c: GeminiCall) -> dict:
 # ---------------------------------------------------------------- 자체 모델 그림자(app/local_read.py)
 # 같은 사진을 자체 모델로도 읽어 응답 `local` 과 서버 로그에 남긴다. 답에는 쓰지 않고, 기다리지 않으며, 실패해도 판독에 영향이 없다.
 # 스레드 하나에서 차례로, 밀리면 건너뛴다(화료자를 몰라 네 자리를 읽는 장면 등).
-# 기본 끔: 운영 80d48ac 에서 켜 보니 seatwide 전처리 9.0 → 11.5초, 프로세스 최대 메모리 1054MB(mahjong_calc metrics 표 1-30).
+# 기본 끔: 운영 80d48ac 에서 켜 보니 seatwide 전처리 9.0 → 11.5초(mahjong_calc metrics 표 1-30). 평가는 저장 사진으로 따로 한다.
 LOCAL_SHADOW = os.environ.get("LOCAL_SHADOW", "0") == "1"
 LOCAL_QUEUE = 3
 _local_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local")

@@ -46,6 +46,7 @@ ANGLES = range(0, 360, 15)
 FACE_UP_MIN = 8  # 틀을 못 잡아도 앞면 패가 이만큼 보이면 화료자 자리로 친다
 WALL_SIDE = 0.5  # 패산 표시패: 앞면 패 바로 옆 칸이 이 비율 이상 패 뒷면이면 그쪽에 패산이 붙어 있다
 LOCAL_SIDEWAYS_HEIGHT = (0.6, 0.9)  # YOLO26 상자는 눕힌 패 높이가 운영 기준(YOLO11, ~0.8)보다 크게 잡힌다(metrics 표 3-2)
+SMALL_TILE = CLS_SIZE * 3 // 4  # 이보다 작은 상자(추적 프레임의 패 약 30px)는 키워서 읽는다(metrics 표 1-34·1-53)
 WALL_CONF = 0.7  # 이보다 확신이 낮으면 답을 내지 않는다(측정에서 맞은 답 0.81 이상, 돌아가 겹친 패 0.33·0.58, metrics 표 1-35)
 
 # 白 채우기(metrics 표 1-33). 뒷면이 색 있는 패 세트에서는 무늬 없는 흰 앞면 = 白 이라 위치만 찾으면 종류가 정해진다.
@@ -60,6 +61,55 @@ SEAM_JUMP, SEAM_MIN = 0.12, 0.6  # 패 나누기: 위쪽 끝 꺾임 최소(패 �
 TILE_W_MAX, TILE_H = 1.3, 1.05  # 모서리 패 상자: 폭 상한(패 폭 배수), 높이(패 높이 배수)
 EDGE = 0.1  # 모서리 무늬 검사에서 뺄 경계 폭(패 폭 배수)
 CORNER_INK = 0.03  # 모서리 칸 무늬 비율 상한. 패 옆면 줄이 조금 들어와 낱장 기준 0.01 보다 넉넉히
+
+
+HAND_EDGE = 0.01  # 강 크롭 아래 끝에서 이 비율 안까지 닿는 상자는 잘린 손패다
+RIVER_GAP = 1.2  # 강 묶기 틈(패 폭 배수). 검출기가 놓친 패(白 등) 한 장은 건너 잇는다
+SIDE_ROW = 0.5  # 눕힌 패가 줄 높이에서 벗어나도 되는 폭(패 높이 배수, rv.to_rows 와 같은 기준). 기기 옆 옆자리 패는 줄보다 위에 있다
+RIVER_ROW_MIN = 4  # 아래 줄이 있는 줄의 세운 패 최소 수: 6장에서 눕힌 패 1장·검출 누락 1장을 뺀 값
+
+
+def _split_piece(b, faces: list, th: float) -> bool:
+    """세운 패 하나가 위아래 두 상자로 쪼개진 조각인가: 바로 위나 아래에 붙은 상자와 합쳐 패 한 장 높이. rv.sideways 는 겹친 상자만 본다."""
+    for o in faces:
+        if o == b or min(b[0] + b[2], o[0] + o[2]) - max(b[0], o[0]) <= 0.5 * min(b[2], o[2]):
+            continue
+        if abs(max(o[1] - (b[1] + b[3]), b[1] - (o[1] + o[3]))) < 0.1 * th and b[3] + o[3] <= 1.2 * th:
+            return True
+    return False
+
+
+def river_frame(rgb: np.ndarray, boxes: list, height: tuple = LOCAL_SIDEWAYS_HEIGHT) -> rv.RiverFrame | None:
+    """그 자리 쪽으로 세운 강 크롭 → 그 사람 강. 운영 rv.frame 은 크롭 아래쪽 패부터 묶어 공개한 손패 줄이나 옆 자리 강을 강으로 잡았다.
+    크롭 아래 끝에 걸린 상자(잘린 손패)를 빼고, 세운 패끼리 묶어 가장 큰 묶음을 강으로 본다(옆 자리 강은 눕혀 보여 안 묶인다).
+    눕힌 패는 그 강의 줄에 나란히 붙은 것만 더한다(리치 선언패)."""
+    H, W = rgb.shape[:2]
+    faces = [b for b in rv.dedupe(rv.keep_faces(boxes, rv.white_mask(rgb))) if b[1] + b[3] < (1 - HAND_EDGE) * H]
+    stand = [b for b in faces if b[2] <= rv.SIDEWAYS_RATIO * b[3]]
+    if not stand:
+        return None
+    tw, th = statistics.median(b[2] for b in stand), statistics.median(b[3] for b in stand)
+    # 한 줄에 7장 넘는 묶음은 손패 줄이다(강은 앞 줄을 6장 채워야 다음 줄로 가므로 첫 줄은 6장까지)
+    groups = [g for g in st.cluster(stand, RIVER_GAP * tw, 0.5 * th) if len(g) <= 6 or len(rv.to_rows(g, th)) > 1]
+    if not groups:
+        return None
+    group = max(groups, key=lambda g: (len(g), -min(abs(b[0] + b[2] / 2 - W / 2) + b[1] for b in g)))  # 같으면 기기(크롭 위 가운데)에 가까운 쪽
+    rows = rv.to_rows(group, th)
+    while len(rows) > 1 and len(rows[0]) < RIVER_ROW_MIN:  # 첫 줄이 짧은데 아래 줄이 있으면 옆 자리 패가 붙은 것
+        rows.pop(0)
+    for b in faces:
+        if b in stand or b[3] < height[0] * th:  # 눕힌 패보다 낮으면 쪼개진 조각이다
+            continue
+        cy = b[1] + b[3] / 2
+        for r in rows:
+            near = min(max(b[0] - (x[0] + x[2]), x[0] - (b[0] + b[2])) for x in r) < RIVER_GAP * tw
+            # 강은 앞 줄을 6장 채워야 다음 줄로 간다. 이미 6장인 줄 옆의 눕힌 패는 옆 자리 패다
+            if len(r) < 6 and near and abs(cy - statistics.mean(x[1] + x[3] / 2 for x in r)) < SIDE_ROW * th:
+                r.append(b)
+                r.sort(key=lambda x: x[0])
+                break
+    own = [b for r in rows for b in r]
+    return rv.RiverFrame(rows, len(boxes), [rv.sideways(b, th, own, height) and not _split_piece(b, faces, th) for b in own])
 
 
 def _ms(t0: float) -> int:
@@ -447,6 +497,17 @@ class LocalReader:
         i = int(p.max(1).argmax())
         return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
 
+    def read_small(self, rgb: np.ndarray, b) -> tuple[str, float]:
+        """추적 프레임(1020×764)처럼 패가 작을 때: 크롭을 긴 변 [SMALL_TILE] 로 키워 읽는다. _tensor 는 줄이기만 해서
+        작은 패가 회색 바탕에 그대로 들어가 0/8 이었다(metrics 표 1-34, 키우면 6/8). 자리·강 크롭은 패가 커서 안 거친다."""
+        im = cut(rgb, b)
+        s = SMALL_TILE / max(im.size)
+        im = im.resize((max(1, round(im.width * s)), max(1, round(im.height * s))), Image.BICUBIC)
+        ts = (0, 2) if b[3] > 1.15 * b[2] else (1, 3) if b[2] > 1.15 * b[3] else (0, 1, 2, 3)
+        p = self.probs([im.rotate(90 * k, expand=True) for k in ts])
+        i = int(p.max(1).argmax())
+        return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
+
     def read_meld_tile(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """울기: 세운 패는 그대로, 눕힌 패는 두 방향 중 확신 높은 쪽."""
         im = cut(rgb, b)
@@ -482,15 +543,19 @@ class LocalReader:
         t_rule = time.perf_counter()
         out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces), "pairs": []}
         if top:
-            tile, conf = self.read_any(rgb, top[2])
+            tile, conf = self.read_small(rgb, top[2]) if max(top[2][2], top[2][3]) < SMALL_TILE else self.read_any(rgb, top[2])
             out.update(box=list(top[2]), sides=top[0], conf=conf)
             if conf >= WALL_CONF:
                 out["indicators"] = [{"tile": tile, "conf": conf}]
         tw = statistics.median(min(f[2], f[3]) for f in faces) if faces else 1
+        th = statistics.median(max(f[2], f[3]) for f in faces) if faces else 1
         for group in st.cluster(faces, tw * 0.5, tw * 0.5):  # 리치 화료의 탁자 위 표시패 짝 후보: 딱 2장 붙은 묶음
             if len(group) == 2:
-                read = [self.read_any(rgb, b) for b in group]
-                out["pairs"].append([{"tile": t, "conf": c} for t, c in read])
+                # 비스듬히 내놓은 짝은 0·90° 로는 틀리게 읽힌다(170105: 3p·6z 0.58·0.33 → 돌려 읽으면 5p·5s 0.98). 15° 단위로 돌려 읽는다.
+                # 상자(픽셀)도 같이 돌려줘 앱이 격자 구역(자리 띠·강·리치봉)으로 짝의 자리를 가린다(mahjong_calc metrics 표 1-54).
+                read = [self.read_turned(rgb, b, tw, th) for b in group]
+                out["pairs"].append([{"tile": t, "conf": c, "box": [round(v) for v in b]} for (t, c), b in zip(read, group)])
+        out["size"] = [rgb.shape[1], rgb.shape[0]]
         out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
         out["rss_mb"] = rss_mb()
         return out
@@ -551,7 +616,7 @@ class LocalReader:
         rivers = []
         for j in jpegs:
             rgb = np.asarray(Image.open(io.BytesIO(j)).convert("RGB"))
-            fr = rv.frame(rgb, self.detect(rgb), LOCAL_SIDEWAYS_HEIGHT)
+            fr = river_frame(rgb, self.detect(rgb))
             if fr is None:
                 rivers.append({"last_tile": None, "tile_count": 0, "sideways": []})
                 continue

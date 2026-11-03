@@ -98,6 +98,39 @@ def test_wall_score_ignores_felt_skin_and_white():
     assert lr.wall_score(np.asarray(im), b)[0] == 0
 
 
+def test_river_frame_skips_cut_hand_row_and_whole_hand_row():
+    river = _row(6, 300, 100) + _row(2, 300, 186)
+    cut = [(x, 760, w, 40) for x, _, w, _ in _row(10, 100)]
+    fr = lr.river_frame(_canvas(river + cut), river + cut)
+    assert fr.count == 8 and fr.last == river[-1], "크롭 아래 끝에 잘린 손패가 아니라 기기 쪽 강"
+    whole = _row(9, 100, 600)
+    fr = lr.river_frame(_canvas(river[:5] + whole), river[:5] + whole)
+    assert fr.count == 5 and fr.last == river[4], "한 줄에 7장 넘으면 강이 아니라 손패 줄"
+
+
+def test_river_frame_keeps_riichi_tile_but_not_neighbours():
+    first = _row(5, 300, 200)
+    riichi = (630, 212, 80, 56)  # 첫 줄 끝의 눕힌 패
+    second = _row(3, 300, 286)
+    neighbour_up = (640, 110, 60, 80)  # 첫 줄 바로 위에 붙은 옆 자리 세운 패
+    neighbour_side = (710, 120, 80, 56)  # 그 옆의 옆 자리 눕힌 패
+    boxes = first + second + [riichi, neighbour_up, neighbour_side]
+    fr = lr.river_frame(_canvas(boxes), boxes)
+    seq = [b for r in fr.rows for b in r]
+    assert riichi in seq and neighbour_side not in seq and neighbour_up not in seq
+    assert [b for b, s in zip(seq, fr.sideways) if s] == [riichi]
+    assert fr.last == second[-1]
+    assert lr.river_frame(_canvas([]), []) is None
+
+
+def test_river_frame_split_tile_is_not_riichi():
+    row = _row(5, 300, 200)
+    top, bottom = (630, 200, 70, 52), (630, 252, 70, 28)  # 세운 패 하나가 위아래 두 상자로 쪼개짐
+    boxes = row + [top, bottom]
+    fr = lr.river_frame(_canvas(boxes, blank=(top, bottom)), boxes)
+    assert not any(fr.sideways) and top in fr.rows[0] and bottom not in fr.rows[0]
+
+
 class _Seat(lr.LocalReader):
     """검출은 주어진 상자, 분류는 고정 답."""
 
@@ -151,6 +184,11 @@ class _Wall(lr.LocalReader):
     def read_any(self, rgb, b):
         return "5s", self.conf
 
+    read_small = read_any
+
+    def read_turned(self, rgb, b, tw, th):
+        return "5s", self.conf
+
 
 def test_read_wall_answers_only_flanked_and_confident_tile():
     wall = (500, 100, 60, 80)
@@ -160,6 +198,48 @@ def test_read_wall_answers_only_flanked_and_confident_tile():
     assert low["indicators"] == [] and low["box"] == list(wall)
     assert _Wall([(800, 400, 60, 80)], 0.9).read_wall(jpeg)["indicators"] == []
     assert _Wall([], 0.9).read_wall(jpeg)["indicators"] == []
+
+
+def test_read_wall_upscales_small_tiles():
+    """추적 프레임(1020×764)의 패(약 30px)는 read_small 로, 화료 원본의 패(약 90px)는 read_any 로 읽는다."""
+    calls = []
+
+    class _W(_Wall):
+        def read_any(self, rgb, b):
+            calls.append("any")
+            return "5s", 0.9
+
+        def read_small(self, rgb, b):
+            calls.append("small")
+            return "5s", 0.9
+
+    small = (500, 100, 60, 80)  # 긴 변 80 < SMALL_TILE
+    _W([small], 0.9).read_wall(_jpeg(_wall_canvas([small], [(438, 100, 60, 80), (562, 100, 60, 80)])))
+    big = (500, 100, 90, 120)  # 화료 원본의 패 크기
+    _W([big], 0.9).read_wall(_jpeg(_wall_canvas([big], [(408, 100, 90, 120), (592, 100, 90, 120)])))
+    assert calls == ["small", "any"]
+
+
+def test_read_wall_reads_pairs_turned():
+    """탁자 위 짝은 비스듬할 수 있어 read_turned(15° 단위)로 읽는다."""
+    calls = []
+
+    class _W(_Wall):
+        def read_turned(self, rgb, b, tw, th):
+            calls.append(("turned", b))
+            return "5s", 0.9
+
+    pair = [(800, 400, 60, 80), (862, 400, 60, 80)]
+    _W(pair, 0.9).read_wall(_jpeg(_canvas(pair)))
+    assert [c[0] for c in calls] == ["turned", "turned"]
+
+
+def test_read_small_resizes_crop_to_small_tile(monkeypatch):
+    sizes = []
+    r = lr.LocalReader()
+    monkeypatch.setattr(r, "probs", lambda ims: (sizes.extend(i.size for i in ims), np.eye(len(lr.CLASSES))[:len(ims)])[1])
+    r.read_small(np.zeros((400, 600, 3), np.uint8), (100, 100, 24, 32))
+    assert sizes and all(max(s) == lr.SMALL_TILE for s in sizes), sizes
 
 
 def test_localdora_route_uses_reader(monkeypatch):
@@ -195,6 +275,8 @@ def test_read_wall_reports_lone_pairs():
     row = [(100 + 62 * i, 600, 60, 80) for i in range(3)]
     o = _Wall(pair + row, 0.9).read_wall(_jpeg(_canvas(pair + row)))
     assert len(o["pairs"]) == 1 and [x["tile"] for x in o["pairs"][0]] == ["5s", "5s"]
+    assert sorted(x["box"] for x in o["pairs"][0]) == sorted(list(b) for b in pair), "짝의 상자(픽셀)도 돌려준다"
+    assert o["size"] == [2000, 800]
 
 
 def test_local_routes_answer_in_app_shape(monkeypatch):

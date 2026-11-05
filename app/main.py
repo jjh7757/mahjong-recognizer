@@ -547,6 +547,30 @@ async def observe_local_seat(image: UploadFile = File(...), x_api_key: str | Non
     return await _run(_get_local_reader().read_seat_app, jpeg, hand_frac)
 
 
+@app.post("/v2/localroles")
+async def observe_local_roles(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
+                              side: str = Query(...), x1: int = Query(..., ge=1, le=999), x2: int = Query(..., ge=1, le=999),
+                              y1: int = Query(..., ge=1, le=999), y2: int = Query(..., ge=1, le=999),
+                              sticks: str | None = Query(None), mode: str = Query("hybrid")) -> dict:
+    """사진 전체 + 격자(1000 분율 x1·x2·y1·y2, 리치봉 상자 sticks=ymin,xmin,ymax,xmax) + 화료자 자리 → 상자 배치 역할 모델로 그 자리의
+    손패·울기(/v2/seat 모양, 자체 모델만, Gemini 없음) + 상자별 역할. mode=hybrid(모델이 고른 상자만 규칙 틀에) | model(역할로 바로 묶기)."""
+    from . import roles
+
+    if side not in roles.SIDES or mode not in ("hybrid", "model") or not (x1 < x2 and y1 < y2):
+        raise HTTPException(status_code=422, detail="side/mode/grid")
+    grid: dict = {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
+    if sticks:
+        try:
+            grid["sticks"] = [int(v) for v in sticks.split(",")]
+            assert len(grid["sticks"]) == 4
+        except (ValueError, AssertionError):
+            raise HTTPException(status_code=422, detail="sticks=ymin,xmin,ymax,xmax") from None
+    jpeg = await _accept(image, x_api_key, max_side=4080)
+    out = await _run(roles.read_roles, _get_local_reader(), jpeg, side, grid, mode)
+    log.info("localroles %s %s %s -> %s", image.filename, side, mode, str({k: v for k, v in out.items() if k != "roles"})[:300])
+    return out
+
+
 @app.post("/v2/locallast3")
 async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: str | None = Header(default=None)) -> dict:
     """강 크롭 1~4장 → /v2/last3 모양의 답과 눕힌 패(자체 모델만, Gemini 없음)."""

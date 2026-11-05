@@ -3,12 +3,16 @@
 This server (mahjong-recognizer) is licensed under the GNU Affero General Public License v3.0 (see `LICENSE`).
 It is a non-commercial project. The components below are included or used as described.
 
-## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-cls-mnv3s.onnx`
+## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-obb-r8.onnx`, `app/assets/tile-cls-mnv3s.onnx`, `app/assets/tile-roles.onnx`
 
-Used only for shadow reads (`app/local_read.py`), compared with Gemini and not shown to users. Run with onnxruntime.
+Used by the local (Gemini-free) reads in `app/local_read.py`, `app/obb.py` and `app/roles.py`. Run with onnxruntime.
 
 - `tile-yolo26n.onnx`: Ultralytics YOLO26n trained by this project on its own table photos. Ultralytics states that models
   trained with Ultralytics YOLO are licensed under AGPL-3.0 by default (https://www.ultralytics.com/license).
+- `tile-obb-r8.onnx`: Ultralytics YOLO26n-obb (rotated boxes, tile face and back) trained by this project on its own table
+  photos; same AGPL-3.0 note as above. Used for seat reads.
+- `tile-roles.onnx`: a small set Transformer trained by this project (synthetic layouts + its own table photos) that labels
+  each detected tile box with a role (hand, meld, river, wall, pair, loose).
 - `tile-cls-mnv3s.onnx`: torchvision MobileNetV3 Small (ImageNet weights, BSD-3-Clause code) fine-tuned by this project.
 
 ## Tile detection model — `app/assets/mahjong-yolo11s.onnx`
@@ -73,6 +77,7 @@ pydantic, httpx, anyio, websockets, …) carry their own permissive licenses (MI
 | google-genai | 1.75.0 | Apache-2.0 |
 | onnxruntime | 1.29.0 | MIT |
 | numpy | 2.5.2 | BSD-3-Clause |
+| opencv-python-headless | 5.0.0.93 | Apache-2.0 (OpenCV), wheel bundles third-party libraries under their own licenses |
 
 Base image: `python:3.12-slim` (Debian; Python PSF-2.0, Debian packages under their respective licenses).
 

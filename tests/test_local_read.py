@@ -135,7 +135,7 @@ class _Seat(lr.LocalReader):
     """검출은 주어진 상자, 분류는 고정 답."""
 
     def __init__(self, faces, tile="1m", conf=0.95):
-        super().__init__()
+        super().__init__(seat_model=None)  # 자리 검출도 detect(가짜)로
         self.faces, self.tile, self.conf = faces, tile, conf
 
     def detect(self, rgb, low=True):

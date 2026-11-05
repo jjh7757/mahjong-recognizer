@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from . import obb
 from . import river as rv
 from . import seat as st
 from . import seat_wide as sw
@@ -27,6 +28,9 @@ log = logging.getLogger("local_read")
 
 # 환경 변수는 측정용: 그 사진을 학습하지 않은 나눔 모델로 재기 위해.
 DET_MODEL = Path(os.environ.get("LOCAL_DET_MODEL") or Path(__file__).parent / "assets" / "tile-yolo26n.onnx")
+# 자리 판독(/v2/localseat·/v2/localroles) 검출기: 회전 상자 8회차(app/obb.py). 파일이 없으면 위 DET_MODEL 로 읽는다.
+# 강·표시패(/v2/locallast3·/v2/localdora)는 8회차로 재지 않아 DET_MODEL 그대로.
+SEAT_MODEL = Path(os.environ.get("LOCAL_SEAT_MODEL") or Path(__file__).parent / "assets" / "tile-obb-r8.onnx")
 CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
 CLASSES = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + ["0m", "0p", "0s"] + [f"{n}z" for n in range(1, 8)]
 IMG = 1280
@@ -297,27 +301,70 @@ def first_seam(tops: np.ndarray, tw: float) -> int | None:
 
 
 def corner_blank(rgb: np.ndarray, fr: st.SeatFrame, faces: list) -> list | None:
+    """오른쪽 모서리 白 퐁. 펠트 계단으로 찾고([corner_steps]), 못 찾으면 무늬 없는 상자 2장 이상을 퐁 3장으로([corner_pair])."""
+    return corner_steps(rgb, fr, faces) or corner_pair(rgb, fr, faces)
+
+
+def corner_pair(rgb: np.ndarray, fr: st.SeatFrame, faces: list) -> list | None:
+    """검출기가 모서리 白 을 일부 잡아 계단 찾기가 포기한 경우(겹침): 손패 줄 오른쪽의 손패·울기에 안 쓰인 무늬 없는 상자가
+    이웃해(중심 거리 ≤ 1.6 × 패 긴 변) 2장 이상이면 白 퐁. 2장이면 같은 간격으로 한 칸 더 간 자리에 세 번째 상자.
+    퐁은 3장이라는 규칙에서 나온 값(mahjong_calc metrics 표 1-70, 2026-11-05 사용자 "2개 이상 잡히면 3개로")."""
+    if not fr.hand:
+        return None
+    hand_right = max(b[0] + b[2] for b in fr.hand)
+    used = {tuple(b) for b in fr.hand} | {tuple(b) for m in fr.melds for b in m} | ({tuple(fr.separate)} if fr.separate else set())
+    cand = [b for b in faces if tuple(b) not in used and b[0] > hand_right and st.ink(rgb, tuple(b)) < BLANK]
+    if len(cand) < 2:
+        return None
+    big = 1.6 * max(fr.tw, fr.th)
+    cen = lambda b: np.array([b[0] + b[2] / 2, b[1] + b[3] / 2], float)
+    groups: list[list] = []
+    for b in sorted(cand, key=lambda b: b[0]):
+        for g in groups:
+            if any(np.linalg.norm(cen(b) - cen(x)) <= big for x in g):
+                g.append(b)
+                break
+        else:
+            groups.append([b])
+    g = max(groups, key=len)
+    if len(g) < 2:
+        return None
+    g = sorted(g, key=lambda b: b[0])[:3]
+    if len(g) == 2:
+        a, b = g
+        c = cen(b) + (cen(b) - cen(a))
+        g.append((int(round(c[0] - b[2] / 2)), int(round(c[1] - b[3] / 2)), b[2], b[3]))
+    return [tuple(int(v) for v in x) for x in g]
+
+
+def corner_steps(rgb: np.ndarray, fr: st.SeatFrame, faces: list) -> list | None:
     """오른쪽 모서리 白 퐁: 펠트 아래쪽 경계가 패 3장 폭만큼 올라온 곳. 세 상자(왼쪽부터) 또는 None."""
     felt = st.felt_mask(rgb)
     y_ref = int(max(b[1] + b[3] for b in fr.hand) + fr.th)  # 손패 줄 아래 펠트에서 아래로 내려가며 끝을 찾는다(탁자 밖 초록 옷·그늘을 안 잡게)
     if y_ref >= felt.shape[0]:
         return None
-    cols = np.nonzero(felt[y_ref])[0]
-    if not cols.size:
+    # 오른쪽 탁자 끝 = 패 폭 2개 넘게 이어진 펠트 중 가장 오른쪽(테두리 너머 작은 조각을 안 잡게). 탁자 끝은 모서리 패에 가릴 수 있어
+    # 손패 바로 아래(y_top)부터 y_ref 까지 여러 줄 중 가장 오른쪽 끝(한 줄만 보면 白 위쪽 끝에 닿아 한 장 좁게 읽었다, metrics 표 1-70 171245)
+    y_top = int(max(b[1] + b[3] for b in fr.hand) + 0.15 * fr.th)
+    ends = []
+    for yy in range(y_top, y_ref + 1, 3):
+        cols = np.nonzero(felt[yy])[0]
+        if not cols.size:
+            continue
+        runs = np.split(cols, np.nonzero(np.diff(cols) > 0.5 * fr.tw)[0] + 1)
+        long_runs = [c for c in runs if c[-1] - c[0] >= 2 * fr.tw]
+        if long_runs:
+            ends.append(int(long_runs[-1][-1]))
+    if not ends:
         return None
-    # 오른쪽 탁자 끝 = 패 폭 2개 넘게 이어진 펠트 중 가장 오른쪽(테두리 너머 작은 조각을 안 잡게)
-    runs = np.split(cols, np.nonzero(np.diff(cols) > 0.5 * fr.tw)[0] + 1)
-    long_runs = [c for c in runs if c[-1] - c[0] >= 2 * fr.tw]
-    if not long_runs:
-        return None
-    right = int(long_runs[-1][-1])
+    right = max(ends)
     x0 = max(0, int(right - WINDOW * fr.tw))
 
     def edge(x: int) -> int:
-        if not felt[y_ref, x]:
+        if not felt[y_top, x]:
             return -1  # 손·팔 등으로 가려진 줄
-        stop = np.nonzero(~felt[y_ref:, x])[0]
-        return y_ref + int(stop[0]) if stop.size else felt.shape[0]
+        stop = np.nonzero(~felt[y_top:, x])[0]
+        return y_top + int(stop[0]) if stop.size else felt.shape[0]
 
     prof = np.array([edge(x) for x in range(x0, right + 1)])
     # 탁자 끝은 손패 줄과 나란하다. 그만큼 빼고 봐야 기운 사진의 비스듬한 끝을 패로 잘못 보지 않는다
@@ -386,6 +433,10 @@ def fill(rgb: np.ndarray, faces: list, split: int) -> tuple[st.SeatFrame | None,
 
 
 def cut(rgb: np.ndarray, b) -> Image.Image:
+    """분류기 크롭. 자리 판독 중 회전 상자로 검출한 상자면 세워 자른다(obb.crop_box), 아니면 축 상자 + 여유."""
+    got = obb.crop_box(rgb, b, PAD)
+    if got is not None:
+        return got
     x, y, w, h = b
     H, W = rgb.shape[:2]
     px, py = int(w * PAD), int(h * PAD)
@@ -420,13 +471,26 @@ def wall_score(rgb: np.ndarray, b) -> tuple[int, float]:
     return n, n + sum(pair) / 2
 
 
+def _letterbox(rgb: np.ndarray) -> tuple[np.ndarray, float, int, int]:
+    """ultralytics 예측과 같게: 긴 변 1280, 짧은 변은 32 배수로 가운데 패딩."""
+    H, W = rgb.shape[:2]
+    r = min(IMG / H, IMG / W)
+    nw, nh = round(W * r), round(H * r)
+    cw, ch = -(-nw // 32) * 32, -(-nh // 32) * 32
+    left, top = round((cw - nw) / 2 - 0.1), round((ch - nh) / 2 - 0.1)
+    canvas = np.full((ch, cw, 3), 114, np.uint8)
+    canvas[top:top + nh, left:left + nw] = np.asarray(Image.fromarray(rgb).resize((nw, nh), Image.BILINEAR))
+    return canvas.transpose(2, 0, 1)[None].astype(np.float32) / 255, r, left, top
+
+
 class LocalReader:
     """처음 쓸 때 모델을 올린다. [gate] 를 주면 검출·분류를 낮은 우선순위로(자리·강 틀 잡기가 진행 중이면 기다린다)."""
 
-    def __init__(self, gate=None, threads: int = 2, det_model: Path = DET_MODEL, cls_model: Path = CLS_MODEL):
+    def __init__(self, gate=None, threads: int = 2, det_model: Path = DET_MODEL, cls_model: Path = CLS_MODEL, seat_model: Path | None = SEAT_MODEL):
         self.gate, self.threads, self.det_model, self.cls_model = gate, threads, det_model, cls_model
+        self.seat_model = seat_model if seat_model is not None and Path(seat_model).exists() else None
         self._lock = threading.Lock()
-        self._det = self._cls = None
+        self._det = self._cls = self._seat = None
 
     def _sessions(self):
         with self._lock:
@@ -438,6 +502,8 @@ class LocalReader:
                 opts.enable_cpu_mem_arena = False  # 쓰지 않을 때 메모리를 쥐고 있지 않게(작은 서버)
                 self._det = ort.InferenceSession(str(self.det_model), sess_options=opts, providers=["CPUExecutionProvider"])
                 self._cls = ort.InferenceSession(str(self.cls_model), sess_options=opts, providers=["CPUExecutionProvider"])
+                if self.seat_model is not None:
+                    self._seat = ort.InferenceSession(str(self.seat_model), sess_options=opts, providers=["CPUExecutionProvider"])
             return self._det, self._cls
 
     def _run(self, fn):
@@ -470,6 +536,26 @@ class LocalReader:
                     rest.append(j)
             order = rest
         return [(int(a), int(b), int(p - a), int(q - b)) for a, b, p, q in boxes if p - a >= 2 and q - b >= 2]
+
+    def detect_seat(self, rgb: np.ndarray) -> list:
+        """자리 판독 검출: 회전 상자 모델로, 크롭 끝에 잘린 조각을 버리고, 안깡(앞면 2 + 양끝 뒷면)의 뒷면 상자를 끼운다.
+        회전 상자·안깡 기록은 obb.session() 안에서만 남는다(분류기 크롭이 세워 자를 때 쓴다). 모델이 없으면 [detect]."""
+        self._sessions()
+        if self._seat is None:
+            return self.detect(rgb)
+        x, r, left, top = _letterbox(rgb)
+        sess = self._seat
+        out = self._run(lambda: sess.run(None, {sess.get_inputs()[0].name: x})[0][0])
+        H, W = rgb.shape[:2]
+        res = obb.slivers(obb.decode(out, r, left, top, W, H), W, H)
+        pairs = obb.kans(res, obb.decode(out, r, left, top, W, H, cls=1)) if out.shape[0] >= 7 else []
+        return obb.record(rgb, res, pairs)
+
+    @staticmethod
+    def keep_seat(rgb: np.ndarray, boxes: list) -> list:
+        """앞면 거르기(흰 비율) + 겹침 정리. 안깡 뒷면 상자는 흰 비율 거르기를 건너뛴다."""
+        backs = [b for b in boxes if obb.is_kan_back(b)]
+        return rv.dedupe(rv.keep_faces([b for b in boxes if b not in backs], rv.white_mask(rgb)) + backs)
 
     def _tensor(self, im: Image.Image) -> np.ndarray:
         im = im.copy()
@@ -563,11 +649,15 @@ class LocalReader:
     def read_seat(self, jpeg: bytes, hand_frac: float | None, fill_blank: bool = True) -> dict:
         """자리 크롭(그 자리 방향으로 세운 것) → framed, hand(떼어 둔 패는 끝에)·hand_conf, melds·meld_conf(묶음에서 가장 낮은 값),
         block(홀로 놓인 패가 둘 이상), filled(코드로 채운 白 장수), 시간."""
+        with obb.session():
+            return self._read_seat(jpeg, hand_frac, fill_blank)
+
+    def _read_seat(self, jpeg: bytes, hand_frac: float | None, fill_blank: bool) -> dict:
         t0 = time.perf_counter()
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
-        boxes = self.detect(rgb)
+        boxes = self.detect_seat(rgb)
         t_det = time.perf_counter()
-        faces = rv.dedupe(rv.keep_faces(boxes, rv.white_mask(rgb)))
+        faces = self.keep_seat(rgb, boxes)
         split = int(rgb.shape[1] * (hand_frac if hand_frac else 0.7))
         fr = split_frame(rgb, faces, split)
         framed = frame_ok(fr, rgb)

@@ -7,3 +7,5 @@ google-genai==1.75.0
 # 강 끝 판독의 강 틀(app/river.py): YOLO11 ONNX 를 ultralytics 없이 돌린다
 onnxruntime==1.29.0
 numpy==2.5.2
+# 자리 판독 회전 상자(app/obb.py): 회전 상자 꼭짓점·세워 자르기(화면 없는 판)
+opencv-python-headless==5.0.0.93

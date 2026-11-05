@@ -256,8 +256,7 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
     if len(near) != 1:
         return
     full = lr.decode_rgb(jpeg)  # _read_roles 가 디코딩한 것을 다시 쓴다
-    tile, conf = reader.read_any(full, tuple(near[0]["box"]))
-    out["separate_tile"] = {"tile": tile, "conf": conf, "box": near[0]["box"], "from": "loose_outside"}
+    out["separate_tile"] = {**lr.tile_json(reader.read_any2(full, tuple(near[0]["box"]))), "box": near[0]["box"], "from": "loose_outside"}
 
 
 def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str, net: RoleNet | None) -> dict:
@@ -302,21 +301,23 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         filled = set(map(tuple, added))
 
         def blank_or(b, read):
-            return ("5z", lr.FILLED_CONF) if filled and (tuple(b) in filled or st.ink(rgb, b) < lr.BLANK) else read(b)
+            return ("5z", lr.FILLED_CONF, None, None) if filled and (tuple(b) in filled or st.ink(rgb, b) < lr.BLANK) else read(b)
 
-        hand = [blank_or(b, lambda x: reader.read([lr.cut(rgb, x)])[0]) for b in fr.hand]
-        sep = blank_or(fr.separate, lambda x: reader.read([lr.cut(rgb, x)])[0]) if fr.separate else None
-        melds = [[blank_or(b, lambda x: reader.read_meld_tile(rgb, x)) for b in m] for m in fr.melds]
+        # 패마다 (종류, 확신도, 분류기 2순위, 그 확신도) — 2순위는 답을 안 바꾸는 부가 정보(개선 계획 4단계 V3 후보용, 2026-11-05)
+        hand = [blank_or(b, lambda x: reader.read2([lr.cut(rgb, x)])[0]) for b in fr.hand]
+        sep = blank_or(fr.separate, lambda x: reader.read2([lr.cut(rgb, x)])[0]) if fr.separate else None
+        melds = [[blank_or(b, lambda x: reader.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
         block = False
         if fr.count == 13 and not fr.separate and not added:
             got = lr.strays(fr, faces, rgb)
             if len(got) == 1:
-                sep = reader.read_turned(rgb, got[0], fr.tw, fr.th)
+                sep = reader.read_turned2(rgb, got[0], fr.tw, fr.th)
             elif got:
                 block = True
-        out["tiles"] = [{"tile": t, "conf": c} for t, c in hand]
-        out["separate_tile"] = {"tile": sep[0], "conf": sep[1]} if sep else None
-        out["melds"] = [{"tiles": [t for t, _ in m], "sideways": [], "face_down": [], "conf": min(c for _, c in m)} for m in melds]
+        out["tiles"] = [lr.tile_json(t) for t in hand]
+        out["separate_tile"] = lr.tile_json(sep) if sep else None
+        out["melds"] = [{"tiles": [t[0] for t in m], "sideways": [], "face_down": [], "conf": min(t[1] for t in m),
+                         "alts": [t[2] for t in m], "conf2s": [t[3] for t in m]} for m in melds]
         out["block"] = block
     out["counts"] = dict(Counter(seat_roles))
     out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "roles": round((t_role - t_det) * 1000), "read": lr._ms(t_role), "total": lr._ms(t0)}

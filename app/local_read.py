@@ -492,6 +492,20 @@ def wall_score(rgb: np.ndarray, b) -> tuple[int, float]:
     return n, n + sum(pair) / 2
 
 
+def top2(q: np.ndarray) -> tuple[str, float, str, float]:
+    """확률 벡터 → (1순위, 확신도, 2순위, 그 확신도). 1순위는 예전 `CLASSES[argmax]`·`round(max, 3)` 그대로."""
+    i = int(q.argmax())
+    rest = q.copy()
+    rest[i] = -1.0
+    j = int(rest.argmax())
+    return CLASSES[i], round(float(q[i]), 3), CLASSES[j], round(float(q[j]), 3)
+
+
+def tile_json(r: tuple) -> dict:
+    """(종류, 확신도[, 2순위, 그 확신도]) → 응답의 패 한 장. 2순위가 없는 것(白 채우기)은 예전 모양 그대로 alt·conf2 를 안 넣는다."""
+    return {"tile": r[0], "conf": r[1], **({"alt": r[2], "conf2": r[3]} if len(r) > 3 and r[2] is not None else {})}
+
+
 def _letterbox(rgb: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     """ultralytics 예측과 같게: 긴 변 1280, 짧은 변은 32 배수로 가운데 패딩."""
     H, W = rgb.shape[:2]
@@ -619,15 +633,23 @@ class LocalReader:
 
     def read(self, ims: list[Image.Image]) -> list[tuple[str, float]]:
         """자리 크롭처럼 이미 세운 패. (종류, 확신도)."""
-        return [(CLASSES[int(q.argmax())], round(float(q.max()), 3)) for q in self.probs(ims)] if ims else []
+        return [r[:2] for r in self.read2(ims)]
+
+    def read2(self, ims: list[Image.Image]) -> list[tuple[str, float, str, float]]:
+        """[read] + 분류기 2순위(종류, 확신도). 답(1순위)은 read 와 같다(개선 계획 4단계 V3 후보용, 2026-11-05)."""
+        return [top2(q) for q in self.probs(ims)] if ims else []
 
     def read_any(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """방향을 모르는 패: 상자 모양에 맞는 방향 중 확신이 가장 높은 값(매장 강 패는 뒤집혀 놓이기도 한다)."""
+        return self.read_any2(rgb, b)[:2]
+
+    def read_any2(self, rgb: np.ndarray, b) -> tuple[str, float, str, float]:
+        """[read_any] + 고른 방향에서의 2순위."""
         im = cut(rgb, b)
         ts = (0, 2) if b[3] > 1.15 * b[2] else (1, 3) if b[2] > 1.15 * b[3] else (0, 1, 2, 3)
         p = self.probs([im.rotate(90 * k, expand=True) for k in ts])
         i = int(p.max(1).argmax())
-        return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
+        return top2(p[i])
 
     def read_small(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """추적 프레임(1020×764)처럼 패가 작을 때: 크롭을 긴 변 [SMALL_TILE] 로 키워 읽는다. _tensor 는 줄이기만 해서
@@ -642,22 +664,30 @@ class LocalReader:
 
     def read_meld_tile(self, rgb: np.ndarray, b) -> tuple[str, float]:
         """울기: 세운 패는 그대로, 눕힌 패는 두 방향 중 확신 높은 쪽."""
+        return self.read_meld_tile2(rgb, b)[:2]
+
+    def read_meld_tile2(self, rgb: np.ndarray, b) -> tuple[str, float, str, float]:
+        """[read_meld_tile] + 2순위."""
         im = cut(rgb, b)
         if b[2] <= 1.15 * b[3]:
-            return self.read([im])[0]
+            return self.read2([im])[0]
         p = self.probs([im.rotate(90 * k, expand=True) for k in (1, 3)])
         i = int(p.max(1).argmax())
-        return CLASSES[int(p[i].argmax())], round(float(p[i].max()), 3)
+        return top2(p[i])
 
     def read_turned(self, rgb: np.ndarray, b, tw: float, th: float) -> tuple[str, float]:
         """돌아간 낱장: 각도마다 패 크기로 잘라 가장 확신 높은 값."""
+        return self.read_turned2(rgb, b, tw, th)[:2]
+
+    def read_turned2(self, rgb: np.ndarray, b, tw: float, th: float) -> tuple[str, float, str, float]:
+        """[read_turned] + 2순위(각도별 최댓값 벡터에서)."""
         cx, cy, r = b[0] + b[2] / 2, b[1] + b[3] / 2, int(max(b[2], b[3], th))
         H, W = rgb.shape[:2]
         part = Image.fromarray(rgb).crop((max(0, int(cx - r)), max(0, int(cy - r)), min(W, int(cx + r)), min(H, int(cy + r))))
         m = part.width / 2, part.height / 2
         box = (int(m[0] - tw / 2), int(m[1] - th / 2), int(m[0] + tw / 2), int(m[1] + th / 2))
         p = self.probs([part.rotate(a).crop(box) for a in ANGLES]).max(0)
-        return CLASSES[int(p.argmax())], round(float(p.max()), 3)
+        return top2(p)
 
     # ------------------------------------------------------------ 판독
 
@@ -723,18 +753,21 @@ class LocalReader:
 
             def blank_or(b, read):
                 """白 을 채운 사진은 무늬 없는 상자도 白 으로(분류기 답을 안 쓴다). 틀을 그냥 잡은 사진은 분류기 답 그대로."""
-                return ("5z", FILLED_CONF) if filled and (b in filled or st.ink(rgb, b) < BLANK) else read(b)
+                return ("5z", FILLED_CONF, None, None) if filled and (b in filled or st.ink(rgb, b) < BLANK) else read(b)
 
-            hand = [blank_or(b, lambda x: self.read([cut(rgb, x)])[0]) for b in fr.hand + ([fr.separate] if fr.separate else [])]
-            melds = [[blank_or(b, lambda x: self.read_meld_tile(rgb, x)) for b in m] for m in fr.melds]
+            hand = [blank_or(b, lambda x: self.read2([cut(rgb, x)])[0]) for b in fr.hand + ([fr.separate] if fr.separate else [])]
+            melds = [[blank_or(b, lambda x: self.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
             if fr.count == 13 and not fr.separate and not added:
                 got = strays(fr, faces, rgb)
                 if len(got) == 1:
-                    hand.append(self.read_turned(rgb, got[0], fr.tw, fr.th))
+                    hand.append(self.read_turned2(rgb, got[0], fr.tw, fr.th))
                 elif got:
                     out["block"] = True
-            out["hand"], out["hand_conf"] = [t for t, _ in hand], [c for _, c in hand]
-            out["melds"], out["meld_conf"] = [" ".join(t for t, _ in m) for m in melds], [min(c for _, c in m) for m in melds]
+            out["hand"], out["hand_conf"] = [t[0] for t in hand], [t[1] for t in hand]
+            out["melds"], out["meld_conf"] = [" ".join(t[0] for t in m) for m in melds], [min(t[1] for t in m) for m in melds]
+            # 분류기 2순위(답은 위 그대로, 개선 계획 4단계 V3 후보용)
+            out["hand_alt"], out["hand_conf2"] = [t[2] for t in hand], [t[3] for t in hand]
+            out["meld_alts"], out["meld_conf2s"] = [[t[2] for t in m] for m in melds], [[t[3] for t in m] for m in melds]
         out["ms"] = {"detect": round((t_det - t0) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
         out["rss_mb"] = rss_mb()
         return out
@@ -745,9 +778,12 @@ class LocalReader:
         count = len(r["hand"]) + 3 * len(r["melds"])
         separate = r["hand"][-1] if r["hand"] and count % 3 == 2 else None
         hand = r["hand"][:-1] if separate else r["hand"]
-        tiles = [{"tile": t, "conf": c} for t, c in zip(r["hand"], r["hand_conf"])]
+        none = [None] * len(r["hand"])
+        tiles = [tile_json(x) for x in zip(r["hand"], r["hand_conf"], r.get("hand_alt", none), r.get("hand_conf2", none))]
         return {"face_up": r["framed"] or r["faces"] >= FACE_UP_MIN, "tiles": tiles[:len(hand)], "separate_tile": tiles[-1] if separate else None,
-                "melds": [{"tiles": m.split(), "sideways": [], "face_down": [], "conf": c} for m, c in zip(r["melds"], r["meld_conf"])], "loose": [],
+                "melds": [{"tiles": m.split(), "sideways": [], "face_down": [], "conf": c, "alts": a, "conf2s": c2}
+                          for m, c, a, c2 in zip(r["melds"], r["meld_conf"], r.get("meld_alts", [None] * len(r["melds"])),
+                                                 r.get("meld_conf2s", [None] * len(r["melds"])))], "loose": [],
                 "framed": r["framed"], "filled": r["filled"], "ms": r["ms"], "rss_mb": r["rss_mb"]}
 
     def read_rivers_app(self, jpegs: list[bytes]) -> dict:

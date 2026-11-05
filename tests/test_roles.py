@@ -187,3 +187,26 @@ def test_role_model_onnx_runs():
     x[:, 8] = 1
     r, c = net.predict(x)
     assert len(r) == 5 and all(v in roles.ROLES for v in r) and all(0 <= v <= 1 for v in c)
+
+
+def test_read_roles_adds_classifier_second_choice(monkeypatch):
+    """/v2/localroles 패마다 alt·conf2(분류기 2순위, 개선 계획 4단계). 답(tile·conf)은 그대로."""
+    W, H = 2000, 1500
+    hand = [(600 + 66 * i, 1120, 60, 80) for i in range(13)]
+    im = _table(hand, (W, H))
+    r = lr.LocalReader(seat_model=None)
+    ymin, xmin, _, _ = roles.seat_box(GRID, "bottom")
+    x0, y0 = round(xmin * W / 1000), round(ymin * H / 1000)
+    monkeypatch.setattr(r, "detect", lambda rgb, low=True: hand if rgb.shape[0] == H else [(x - x0, y - y0, w, h) for x, y, w, h in hand])
+
+    def probs(ims):
+        p = np.zeros((len(ims), len(lr.CLASSES)))
+        p[:, lr.CLASSES.index("3p")] = 0.7
+        p[:, lr.CLASSES.index("0p")] = 0.2
+        p[:, lr.CLASSES.index("1z")] = 0.1
+        return p
+
+    monkeypatch.setattr(r, "probs", probs)
+    out = roles.read_roles(r, _jpeg(im), "bottom", GRID, "model", net=_Net())
+    assert out["framed"] and len(out["tiles"]) == 13
+    assert all(t == {"tile": "3p", "conf": 0.7, "alt": "0p", "conf2": 0.2} for t in out["tiles"])

@@ -350,3 +350,22 @@ def test_other_kinds_have_no_shadow(monkeypatch):
             raise AssertionError("부르면 안 된다")
 
     assert "local" not in _client(monkeypatch, R()).post("/v2/sticks", files=_files()).json()
+
+
+def test_top2_keeps_first_choice_and_adds_second():
+    """분류기 2순위(개선 계획 4단계): 1순위·확신도는 예전 argmax·round(max, 3) 그대로, 2순위는 그다음 큰 값."""
+    rng = np.random.default_rng(4)
+    for _ in range(50):
+        q = rng.dirichlet(np.ones(len(lr.CLASSES)))
+        t, c, alt, c2 = lr.top2(q)
+        assert (t, c) == (lr.CLASSES[int(q.argmax())], round(float(q.max()), 3))
+        assert alt != t and c2 == round(float(np.sort(q)[-2]), 3)
+
+
+def test_read_seat_reports_second_choice_without_changing_answer():
+    hand = _row(13)
+    o = _Seat(hand, conf=0.62).read_seat(_jpeg(_canvas(hand)), 0.7)
+    assert o["hand"] == ["1m"] * 13 and o["hand_conf"] == [0.62] * 13
+    assert o["hand_alt"] == ["2m"] * 13 and o["hand_conf2"] == [round(0.38 / (len(lr.CLASSES) - 1), 3)] * 13
+    t = _Seat(hand, conf=0.62).read_seat_app(_jpeg(_canvas(hand)), 0.7)["tiles"][0]
+    assert t == {"tile": "1m", "conf": 0.62, "alt": "2m", "conf2": round(0.38 / (len(lr.CLASSES) - 1), 3)}

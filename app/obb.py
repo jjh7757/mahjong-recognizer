@@ -117,6 +117,7 @@ class SeatDet:
         self.rects: dict = {}
         self.kan_read: dict = {}
         self.kan_backs: set = set()
+        self.backs: dict = {}  # {그림 지문: [(축 상자, 회전 상자)]} 뒷면 검출(역할 모델 입력용, 2026-11-05)
 
 
 _CUR: contextvars.ContextVar[SeatDet | None] = contextvars.ContextVar("seat_det", default=None)
@@ -136,8 +137,8 @@ def current() -> SeatDet | None:
     return _CUR.get()
 
 
-def record(rgb: np.ndarray, res: list, kan_pairs: list) -> list:
-    """검출 결과를 지금 기록에 남기고 축 상자 목록을 돌려준다(안깡 뒷면 상자 포함)."""
+def record(rgb: np.ndarray, res: list, kan_pairs: list, backs: list | None = None) -> list:
+    """검출 결과를 지금 기록에 남기고 축 상자 목록을 돌려준다(안깡 뒷면 상자 포함). backs = 뒷면 검출 [(축 상자, 회전 상자)] 는 기록만(역할 모델용)."""
     d = _CUR.get()
     boxes = [b for b, _ in res]
     fp = fingerprint(rgb)
@@ -149,7 +150,36 @@ def record(rgb: np.ndarray, res: list, kan_pairs: list) -> list:
             d.kan_backs.add(bb)
     if d is not None:
         d.rects.update({(fp, b): rc for b, rc in res})
+        if backs is not None:
+            d.backs[fp] = list(backs)
     return boxes
+
+
+def backs_of(rgb: np.ndarray) -> list:
+    """지금 요청에서 이 그림을 검출했을 때의 뒷면 [(축 상자, 회전 상자)]. 기록 없으면 []."""
+    d = _CUR.get()
+    return [] if d is None else list(d.backs.get(fingerprint(rgb), []))
+
+
+def corners(rect) -> np.ndarray:
+    """회전 상자 → 네 꼭짓점 (4, 2)."""
+    return cv2.boxPoints(((float(rect[0][0]), float(rect[0][1])), (float(rect[1][0]), float(rect[1][1])), float(rect[2])))
+
+
+def tile_geom(box, pts) -> tuple[float, float, float]:
+    """(패 폭, 패 높이, 기울기°) 그림 좌표. pts = 회전 상자 네 꼭짓점(각도 규약과 무관하게 변 길이·방향으로 잰다): 격자 축에 가까운 변이 폭,
+    기울기는 그 변이 축에서 벗어난 각 −45~45(시계 방향 +). pts 없으면 축 상자, 기울기 0. mahjong_calc role_set.tile_geom 과 같아야 한다."""
+    if pts is None:
+        return float(box[2]), float(box[3]), 0.0
+    p = np.asarray(pts, float)
+    e1, e2 = p[1] - p[0], p[2] - p[1]
+    a1 = np.degrees(np.arctan2(e1[1], e1[0])) % 180
+    if 45 < a1 < 135:
+        h, w, ea = float(np.hypot(*e1)), float(np.hypot(*e2)), e2
+    else:
+        w, h, ea = float(np.hypot(*e1)), float(np.hypot(*e2)), e1
+    tilt = ((np.degrees(np.arctan2(ea[1], ea[0])) + 45) % 90) - 45
+    return w, h, float(tilt)
 
 
 def crop_box(rgb: np.ndarray, b, pad: float) -> Image.Image | None:

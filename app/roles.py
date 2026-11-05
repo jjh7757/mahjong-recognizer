@@ -5,7 +5,9 @@ experiments/tile_classifier/role_set.py, 합성 배치 사전학습 + 매장 25�
 흐름: 사진 전체 검출(맥락) + 자리 크롭(격자 40 키움, 그 자리 방향으로 세움) 검출(고해상) → 크롭 상자를 원본 좌표로 → 펠트 격자 기준 벡터 → 역할 →
       hybrid: 모델이 이 자리 것으로 고른 상자만 split_frame(규칙)에 / model: 역할로 바로 줄·울기 묶기 → 패 읽기(read_seat 과 같은 분류기·白 채우기).
 입력 벡터(role_set.scene_tokens 과 같아야 한다): 펠트 격자(x1·x2·y1·y2, 1000 분율) 기준 0~1 좌표·크기×10, 화료자 자리가 아래로 오게 돌림,
-  뒷면 플래그(서버는 늘 0), 눕힘, 리치봉 상자 중심과의 차, 1.
+  뒷면 플래그, 눕힘, 리치봉 상자 중심과의 차, 1.
+  모델이 11칸(2026-11-05 회전 상자 특징, ONNX 입력 모양에서 읽음)이면 크기·눕힘은 회전 상자(패에 맞는 변)로 재고 sin·cos(2×기울기)를 더하며,
+  검출기의 뒷면 상자(obb.backs_of)도 뒷면 플래그 1 로 넣는다(역할 결과에는 안 나감). 9칸(예전 모델)이면 축 상자·뒷면 없음 그대로.
 """
 from __future__ import annotations
 
@@ -24,13 +26,16 @@ from . import local_read as lr
 from . import obb
 from . import seat as st
 
-ROLE_MODEL = Path(os.environ.get("LOCAL_ROLE_MODEL") or Path(__file__).parent / "assets" / "tile-roles.onnx")
+# 역할 모델: 11칸(회전 상자 크기·기울기 + 뒷면 토큰, 라벨 수정 뒤 재학습, mahjong_calc metrics 표 1-78·1-79, 2026-11-05 사용자 "11칸 서버 코드 변경").
+# 예전 9칸 tile-roles.onnx(124654·125839 손패 끝 3장을 울기로 배운 라벨)는 되돌리기용으로 남김 — LOCAL_ROLE_MODEL 로 끼우면 tokens 가 입력 모양으로 9칸을 만든다.
+ROLE_MODEL = Path(os.environ.get("LOCAL_ROLE_MODEL") or Path(__file__).parent / "assets" / "tile-roles-rot.onnx")
 ROLES = ["hand", "meld", "river", "wall", "pair", "loose"]
 SIDES = ("bottom", "right", "top", "left")
 ROT_CW = {"bottom": 0, "right": 90, "top": 180, "left": 270}
 GROW = 40  # 앱 seatReadGrow
 LOOSE_REACH = 3.0  # 크롭 밖 떼어 둔 화료패: 손패 패 높이의 몇 배 안
-FEAT = 9
+FEAT = 9  # 예전 특징(축 상자, 뒷면 없음)
+FEAT_ROT = 11  # 회전 상자 특징(+ sin·cos 2×기울기, 뒷면 상자 넣음)
 
 
 def seat_box(g: dict, side: str, grow: int = GROW) -> tuple[int, int, int, int]:
@@ -54,20 +59,30 @@ def turn(u: float, v: float, side: str) -> tuple[float, float, bool]:
     return v, 1 - u, True
 
 
-def tokens(boxes: list, W: int, H: int, g: dict, side: str) -> np.ndarray:
+def tokens(boxes: list, W: int, H: int, g: dict, side: str, feat: int = FEAT, pts: list | None = None, backs: list | None = None) -> np.ndarray:
+    """상자 벡터 (N, feat). pts = 상자마다 회전 상자 꼭짓점(원본 좌표) 또는 None, backs = [(축 상자, 꼭짓점)] 뒷면(feat 11 일 때만 뒤에 붙음)."""
     x1, x2, y1, y2 = (g[k] / 1000 for k in ("x1", "x2", "y1", "y2"))
     fw, fh = max(x2 - x1, 1e-3), max(y2 - y1, 1e-3)
     s = g.get("sticks")
     su, sv = ((s[1] + s[3]) / 2000, (s[0] + s[2]) / 2000) if s else ((x1 + x2) / 2, (y1 + y2) / 2)
     su, sv, _ = turn((su - x1) / fw, (sv - y1) / fh, side)
+    rot = feat == FEAT_ROT
+    items = [(b, (pts[i] if rot and pts else None), 0.0) for i, b in enumerate(boxes)]
+    if rot and backs:
+        items += [(b, p, 1.0) for b, p in backs]
     rows = []
-    for x, y, w, h in boxes:
+    for (x, y, w, h), p, back in items:
         u, v, swap = turn(((x + w / 2) / W - x1) / fw, ((y + h / 2) / H - y1) / fh, side)
-        bw, bh = w / W / fw, h / H / fh
+        pw, ph, tilt = obb.tile_geom((x, y, w, h), p if rot else None)
+        bw, bh = pw / W / fw, ph / H / fh
         if swap:
             bw, bh = bh, bw
-        rows.append([u, v, bw * 10, bh * 10, 0.0, float(bw > bh * 1.15), u - su, v - sv, 1.0])
-    return np.array(rows, np.float32).reshape(-1, FEAT)
+        row = [u, v, bw * 10, bh * 10, back, float(bw > bh * 1.15), u - su, v - sv, 1.0]
+        if rot:
+            t = np.radians(2 * tilt)
+            row += [float(np.sin(t)), float(np.cos(t))]
+        rows.append(row)
+    return np.array(rows, np.float32).reshape(-1, feat)
 
 
 def unrotate(b, rot: int, cw: int, ch: int) -> tuple:
@@ -84,6 +99,27 @@ def unrotate(b, rot: int, cw: int, ch: int) -> tuple:
         back = pts
     xs, ys = [p[0] for p in back], [p[1] for p in back]
     return (min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+
+
+def unrotate_pts(pts, rot: int, cw: int, ch: int, x0: int = 0, y0: int = 0) -> np.ndarray:
+    """세운 크롭 좌표의 꼭짓점들 → 원본 사진 좌표(돌리기 전 크롭 + 크롭 원점)."""
+    out = []
+    for px, py in np.asarray(pts, float):
+        if rot == 90:
+            q = (py, ch - px)
+        elif rot == 180:
+            q = (cw - px, ch - py)
+        elif rot == 270:
+            q = (cw - py, px)
+        else:
+            q = (px, py)
+        out.append((q[0] + x0, q[1] + y0))
+    return np.array(out, float)
+
+
+def _pts_of(rgb: np.ndarray, b) -> np.ndarray | None:
+    rc = obb.rect_of(rgb, b)
+    return None if rc is None else obb.corners(rc)
 
 
 def crop_seat(im: Image.Image, g: dict, side: str) -> tuple[Image.Image, tuple[int, int, int, int]]:
@@ -120,6 +156,12 @@ class RoleNet:
                 opts.enable_cpu_mem_arena = False
                 self._sess = ort.InferenceSession(str(self.path), sess_options=opts, providers=["CPUExecutionProvider"])
             return self._sess
+
+    @property
+    def feat(self) -> int:
+        """모델 입력 칸 수(ONNX 입력 모양 [1, n, feat]) — 9 = 예전, 11 = 회전 상자 특징."""
+        shape = self._session().get_inputs()[0].shape
+        return int(shape[-1]) if isinstance(shape[-1], int) else FEAT
 
     def predict(self, x: np.ndarray) -> tuple[list[str], list[float]]:
         if len(x) == 0:
@@ -232,20 +274,31 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
     faces = reader.keep_seat(rgb, reader.detect_seat(rgb))
     t_det = time.perf_counter()
     rot = ROT_CW[side]
-    faces_full = []
+    faces_full, pts = [], []
     for b in faces:
         x, y, w, h = unrotate(b, rot, cw, ch)
         faces_full.append((x + x0, y + y0, w, h))
+        p = _pts_of(rgb, b)
+        pts.append(None if p is None else unrotate_pts(p, rot, cw, ch, x0, y0))
     # 크롭 상자 우선, 크롭과 겹치지 않는 전체 사진 상자를 맥락으로 더한다
     extra = [b for b in ctx if all(iou(b, f) < 0.3 for f in faces_full)]
     allb = faces_full + extra
-    roles, confs = net.predict(tokens(allb, W, H, grid, side))
+    pts += [_pts_of(full, b) for b in extra]
+    backs: list = []
+    if net.feat == FEAT_ROT:  # 뒷면 상자(패산·다른 자리 손패·안깡 양끝): 크롭 것 우선, 겹치지 않는 전체 사진 것
+        for b, rc in obb.backs_of(rgb):
+            x, y, w, h = unrotate(b, rot, cw, ch)
+            backs.append(((x + x0, y + y0, w, h), unrotate_pts(obb.corners(rc), rot, cw, ch, x0, y0)))
+        backs += [(b, obb.corners(rc)) for b, rc in obb.backs_of(full) if all(iou(b, f) < 0.3 for f, _ in backs) and all(iou(b, f) < 0.3 for f in allb)]
+    roles, confs = net.predict(tokens(allb, W, H, grid, side, net.feat, pts, backs))
+    roles, confs = roles[: len(allb)], confs[: len(allb)]  # 뒷면 토큰의 역할은 버린다
     seat_roles = roles[: len(faces)]
     t_role = time.perf_counter()
     split = int(rgb.shape[1] * hand_frac(grid, side))
     fr, added = frame_from_roles(rgb, faces, seat_roles, split, mode) if faces else (None, [])
     out = {"face_up": fr is not None or len(faces) >= lr.FACE_UP_MIN, "tiles": [], "separate_tile": None, "melds": [], "loose": [], "framed": fr is not None,
-           "filled": len(added), "mode": mode, "roles": [{"box": [round(v) for v in b], "role": r, "conf": c, "in_seat": i < len(faces)} for i, (b, r, c) in enumerate(zip(allb, roles, confs))]}
+           "filled": len(added), "mode": mode, "roles": [{"box": [round(v) for v in b], "role": r, "conf": c, "in_seat": i < len(faces)} for i, (b, r, c) in enumerate(zip(allb, roles, confs))],
+           "backs": len(backs), "feat": net.feat}
     if fr is not None:
         filled = set(map(tuple, added))
 

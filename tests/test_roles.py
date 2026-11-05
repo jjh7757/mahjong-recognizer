@@ -94,8 +94,45 @@ def test_frame_from_roles_needs_two_hand_tiles():
 class _Net:
     """상자 위치로 역할을 정하는 가짜 모델: 아래 띠(v > 0.97)는 손패, 나머지는 강."""
 
+    feat = roles.FEAT
+
     def predict(self, x):
         return ["hand" if r[1] > 0.97 else "river" for r in x], [0.9] * len(x)
+
+
+def test_tokens_rot_features_use_tilted_rect_and_backs():
+    W, H = 2000, 1500
+    box = (1000, 1200, 100, 100)  # 기운 패를 감싸는 축 상자(정사각형)
+    # 패 폭 60·높이 80 을 30° 기울인 회전 상자의 꼭짓점(obb.corners 와 같은 cv2 규약)
+    import cv2
+
+    pts = cv2.boxPoints(((1050.0, 1250.0), (60.0, 80.0), 30.0))
+    t9 = roles.tokens([box], W, H, GRID, "bottom")[0]
+    t11 = roles.tokens([box], W, H, GRID, "bottom", roles.FEAT_ROT, [pts])[0]
+    assert len(t9) == 9 and len(t11) == 11
+    # 폭·높이는 펠트 폭·높이로 따로 나누므로 비율만 본다: 축 상자(100×100) 대비 회전 상자(60×80)
+    assert abs((t11[2] / t11[3]) / (t9[2] / t9[3]) - 60 / 80) < 0.05, "회전 상자 특징은 패 폭·높이"
+    tilt = np.degrees(np.arctan2(t11[9], t11[10]) / 2)
+    assert abs(abs(tilt) - 30) < 1.0, tilt
+    axis = roles.tokens([box], W, H, GRID, "bottom", roles.FEAT_ROT, [None])[0]
+    assert axis[9] == 0.0 and axis[10] == 1.0 and axis[2] == t9[2] and axis[3] == t9[3], "회전 상자 모르면 축·기울기 0"
+    # 뒷면은 11칸일 때만 뒤에 붙고 플래그 1
+    with_backs = roles.tokens([box], W, H, GRID, "bottom", roles.FEAT_ROT, [pts], [((500, 1200, 60, 80), None)])
+    assert with_backs.shape == (2, 11) and with_backs[1][4] == 1.0 and with_backs[0][4] == 0.0
+    assert roles.tokens([box], W, H, GRID, "bottom", roles.FEAT, None, [((500, 1200, 60, 80), None)]).shape == (1, 9)
+    # 90° 돌린 자리에서도 기울기는 같은 값(접은 각)
+    tr = roles.tokens([box], W, H, GRID, "right", roles.FEAT_ROT, [pts])[0]
+    assert abs(abs(np.degrees(np.arctan2(tr[9], tr[10]) / 2)) - 30) < 1.0
+
+
+def test_unrotate_pts_matches_unrotate_box():
+    cw, ch = 600, 400
+    b = (50, 60, 70, 30)
+    for rot in (0, 90, 180, 270):
+        x, y, w, h = roles.unrotate(b, rot, cw, ch)
+        pts = roles.unrotate_pts([(b[0], b[1]), (b[0] + b[2], b[1]), (b[0] + b[2], b[1] + b[3]), (b[0], b[1] + b[3])], rot, cw, ch, 10, 20)
+        assert abs(pts[:, 0].min() - (x + 10)) < 1e-6 and abs(pts[:, 1].min() - (y + 20)) < 1e-6
+        assert abs(pts[:, 0].max() - pts[:, 0].min() - w) < 1e-6 and abs(pts[:, 1].max() - pts[:, 1].min() - h) < 1e-6
 
 
 def test_read_roles_reads_winner_hand_from_full_photo(monkeypatch):
@@ -144,7 +181,9 @@ def test_localroles_route_validates_and_answers_in_app_shape(monkeypatch):
 
 @pytest.mark.skipif(not roles.ROLE_MODEL.exists(), reason="역할 모델 없음")
 def test_role_model_onnx_runs():
-    x = np.zeros((5, roles.FEAT), np.float32)
+    net = roles.RoleNet()
+    assert net.feat in (roles.FEAT, roles.FEAT_ROT)
+    x = np.zeros((5, net.feat), np.float32)
     x[:, 8] = 1
-    r, c = roles.RoleNet().predict(x)
+    r, c = net.predict(x)
     assert len(r) == 5 and all(v in roles.ROLES for v in r) and all(0 <= v <= 1 for v in c)

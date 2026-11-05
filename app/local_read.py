@@ -29,7 +29,11 @@ log = logging.getLogger("local_read")
 # 환경 변수는 측정용: 그 사진을 학습하지 않은 나눔 모델로 재기 위해.
 DET_MODEL = Path(os.environ.get("LOCAL_DET_MODEL") or Path(__file__).parent / "assets" / "tile-yolo26n.onnx")
 # 자리 판독(/v2/localseat·/v2/localroles) 검출기: 회전 상자 8회차(app/obb.py). 파일이 없으면 위 DET_MODEL 로 읽는다.
-# 강·표시패(/v2/locallast3·/v2/localdora)는 8회차로 재지 않아 DET_MODEL 그대로.
+# 강·표시패(/v2/locallast3·/v2/localdora)는 DET_MODEL(2회차) 그대로: 8회차로 바꾸면 헛 리치·강 끝·표시패 짝이 나빠졌다
+# (mahjong_calc metrics 표 1-80, 강 틀·눕힌 패·짝 규칙이 2회차 상자에 맞춰져 있음).
+# LOCAL_OTHER_DET: 강·표시패 검출도 자리 판독 검출기(SEAT_MODEL)로(시험, 기본 끔). "obb" = 회전 상자를 감싸는 축 상자만,
+# "obb-up" = 거기에 분류기 크롭을 회전 상자대로 세워 자르기(자리 판독과 같음). 앞면만 쓰고 뒷면·조각 버리기·안깡은 안 씀.
+OTHER_DET = os.environ.get("LOCAL_OTHER_DET", "")
 SEAT_MODEL = Path(os.environ.get("LOCAL_SEAT_MODEL") or Path(__file__).parent / "assets" / "tile-obb-r8.onnx")
 ROT_WHITE = os.environ.get("LOCAL_ROT_WHITE", "1") == "1"  # 자리 판독 흰 비율을 회전 상자 안에서(metrics 표 1-73, 2026-11-05 켬)
 CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
@@ -549,8 +553,22 @@ class LocalReader:
         out = self._run(lambda: sess.run(None, {sess.get_inputs()[0].name: x})[0][0])
         H, W = rgb.shape[:2]
         res = obb.slivers(obb.decode(out, r, left, top, W, H), W, H)
-        pairs = obb.kans(res, obb.decode(out, r, left, top, W, H, cls=1)) if out.shape[0] >= 7 else []
-        return obb.record(rgb, res, pairs)
+        backs = obb.decode(out, r, left, top, W, H, cls=1) if out.shape[0] >= 7 else []
+        pairs = obb.kans(res, backs) if backs else []
+        return obb.record(rgb, res, pairs, backs)
+
+    def detect_other(self, rgb: np.ndarray) -> list:
+        """강·표시패 검출. [OTHER_DET] 가 켜져 있고 자리 판독 검출기가 있으면 그 모델의 앞면(감싸는 축 상자), 아니면 [detect].
+        "obb-up" 이면 회전 상자를 지금 기록(obb.session 안일 때)에 남겨 분류기 크롭이 세워 자른다."""
+        self._sessions()
+        if not OTHER_DET or self._seat is None:
+            return self.detect(rgb)
+        x, r, left, top = _letterbox(rgb)
+        sess = self._seat
+        out = self._run(lambda: sess.run(None, {sess.get_inputs()[0].name: x})[0][0])
+        H, W = rgb.shape[:2]
+        res = obb.decode(out, r, left, top, W, H)
+        return obb.record(rgb, res, []) if OTHER_DET == "obb-up" else [b for b, _ in res]
 
     @staticmethod
     def keep_seat(rgb: np.ndarray, boxes: list) -> list:
@@ -628,13 +646,17 @@ class LocalReader:
     # ------------------------------------------------------------ 판독
 
     def read_wall(self, jpeg: bytes) -> dict:
+        with obb.session():
+            return self._read_wall(jpeg)
+
+    def _read_wall(self, jpeg: bytes) -> dict:
         """테이블 전체 사진 → 패산에 뒤집어 둔 표시패 한 장. 옆에 패 뒷면이 가장 많이 붙은 앞면 패를 고른다.
         못 찾거나 확신이 낮으면 indicators 가 빈다(白 은 검출기가 자주 놓친다). 리치 화료의 표시패 짝은 다루지 않는다.
         측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진)."""
         t0 = time.perf_counter()
         rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
         t_dec = time.perf_counter()
-        faces = self.detect(rgb)
+        faces = self.detect_other(rgb)
         t_det = time.perf_counter()
         scored = sorted(((*wall_score(rgb, b), b) for b in faces), key=lambda c: -c[1])
         top = scored[0] if scored and scored[0][0] else None
@@ -714,11 +736,15 @@ class LocalReader:
 
     def read_rivers_app(self, jpegs: list[bytes]) -> dict:
         """강 크롭들 → 앱의 /v2/last3 응답 모양(마지막 패·장수·눕힌 패 순번). 못 잡은 자리는 패 없음."""
+        with obb.session():
+            return self._read_rivers_app(jpegs)
+
+    def _read_rivers_app(self, jpegs: list[bytes]) -> dict:
         t0 = time.perf_counter()
         rivers = []
         for j in jpegs:
             rgb = np.asarray(Image.open(io.BytesIO(j)).convert("RGB"))
-            fr = river_frame(rgb, self.detect(rgb))
+            fr = river_frame(rgb, self.detect_other(rgb))
             if fr is None:
                 rivers.append({"last_tile": None, "tile_count": 0, "sideways": []})
                 continue

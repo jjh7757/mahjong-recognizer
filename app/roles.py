@@ -11,7 +11,6 @@ experiments/tile_classifier/role_set.py, 합성 배치 사전학습 + 매장 25�
 """
 from __future__ import annotations
 
-import io
 import os
 import statistics
 import threading
@@ -256,7 +255,7 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
             and min(np.linalg.norm(cen(x["box"]) - cen(h)) for h in hand) <= LOOSE_REACH * th]
     if len(near) != 1:
         return
-    full = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+    full = lr.decode_rgb(jpeg)  # _read_roles 가 디코딩한 것을 다시 쓴다
     tile, conf = reader.read_any(full, tuple(near[0]["box"]))
     out["separate_tile"] = {"tile": tile, "conf": conf, "box": near[0]["box"], "from": "loose_outside"}
 
@@ -264,9 +263,9 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
 def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str, net: RoleNet | None) -> dict:
     t0 = time.perf_counter()
     net = net or role_net()
-    im = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    full = lr.decode_rgb(jpeg)  # 같은 사진을 받은 /v2/localdora 와 디코딩을 나눈다(app/shared.py)
+    im = Image.fromarray(full)
     W, H = im.size
-    full = np.asarray(im)
     t_dec = time.perf_counter()
     ctx = reader.detect_seat(full)  # 맥락용(작게 보이는 다른 자리 패)
     crop_im, (x0, y0, cw, ch) = crop_seat(im, grid, side)

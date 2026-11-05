@@ -23,6 +23,7 @@ from . import obb
 from . import river as rv
 from . import seat as st
 from . import seat_wide as sw
+from .shared import Shared, digest
 
 log = logging.getLogger("local_read")
 
@@ -123,6 +124,21 @@ def river_frame(rgb: np.ndarray, boxes: list, height: tuple = LOCAL_SIDEWAYS_HEI
 
 def _ms(t0: float) -> int:
     return round((time.perf_counter() - t0) * 1000)
+
+
+# 사진 전체 디코딩을 같은 바이트면 한 번만(/v2/localroles·/v2/localdora 가 같은 화료 사진을 받는다, app/shared.py).
+# 12MP 배열은 36MB 라 하나만, 화료 한 번의 요청들이 다 들어올 만큼만 들고 있는다. 배열은 읽기 전용(전에도 np.asarray(PIL) 이라 같음).
+_decoded = Shared(size=1, ttl=10.0)
+
+
+def _decode(jpeg: bytes) -> np.ndarray:
+    a = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+    a.flags.writeable = False
+    return a
+
+
+def decode_rgb(jpeg: bytes) -> np.ndarray:
+    return _decoded.get(digest(jpeg), lambda: _decode(jpeg))
 
 
 def rss_mb() -> int | None:
@@ -654,7 +670,7 @@ class LocalReader:
         못 찾거나 확신이 낮으면 indicators 가 빈다(白 은 검출기가 자주 놓친다). 리치 화료의 표시패 짝은 다루지 않는다.
         측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진)."""
         t0 = time.perf_counter()
-        rgb = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
+        rgb = decode_rgb(jpeg)
         t_dec = time.perf_counter()
         faces = self.detect_other(rgb)
         t_det = time.perf_counter()

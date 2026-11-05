@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse
 from .observe import LAST_MULTI_MAX
 from .local_read import rss_mb
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
+from .shared import Shared, digest
 from .river import gate_wait_ms, reset_gate_wait
 
 log = logging.getLogger("recognizer")
@@ -242,6 +243,18 @@ async def _run(fn: Callable, *args):
     return await asyncio.get_running_loop().run_in_executor(_executor, functools.partial(fn, *args))
 
 
+# 같은 원본(앱이 /v2/localroles·/v2/localdora 에 같이 보내는 화료 사진)은 prepare_image(12MP 디코딩 + 재인코딩)를 한 번만
+# (app/shared.py, metrics 표 1-86). 큰 사진만: 작은 크롭은 요청마다 다르고, 테스트의 작은 그림이 설정을 바꿔 가며 재사용되지 않게.
+SHARE_MIN_BYTES = 512 * 1024
+_prepared = Shared(size=2, ttl=10.0)
+
+
+def _prepare_shared(data: bytes, max_side: int) -> bytes:
+    if len(data) < SHARE_MIN_BYTES:
+        return prepare_image(data, max_side)
+    return _prepared.get((digest(data), max_side), lambda: prepare_image(data, max_side))
+
+
 async def _read_image(image: UploadFile, max_side: int = 1568) -> bytes:
     """크기(파일 크기, 넘는 순간 중단)·디코딩 검사를 거친 JPEG 바이트."""
     if image.size is not None and image.size > MAX_UPLOAD:
@@ -254,7 +267,7 @@ async def _read_image(image: UploadFile, max_side: int = 1568) -> bytes:
         chunks.append(chunk)
     t0 = time.perf_counter()
     try:
-        return await _run(prepare_image, b"".join(chunks), max_side)
+        return await _run(_prepare_shared, b"".join(chunks), max_side)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"cannot decode image: {e}") from e
     finally:
@@ -576,7 +589,9 @@ async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: s
     """강 크롭 1~4장 → /v2/last3 모양의 답과 눕힌 패(자체 모델만, Gemini 없음)."""
     if not 1 <= len(images) <= 4:
         raise HTTPException(status_code=422, detail="images must be 1~4")
-    jpegs = [await _accept(i, x_api_key, max_side=3072) for i in images]
+    # 요청 제한은 요청당 한 번(사진마다 깎으면 버킷이 빈 뒤 앞 사진만 토큰을 먹고 계속 429, metrics 표 1-84).
+    _gate(x_api_key)
+    jpegs = [await _read_image(i, max_side=3072) for i in images]
     return await _run(_get_local_reader().read_rivers_app, jpegs)
 
 

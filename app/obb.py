@@ -22,8 +22,9 @@ def fingerprint(rgb: np.ndarray) -> tuple:
     return rgb.shape, hash(np.ascontiguousarray(rgb[::53, ::47]).tobytes())
 
 
-def decode(out: np.ndarray, r: float, left: int, top: int, W: int, H: int, cls: int = 0) -> list[tuple]:
-    """[(축 상자 (x, y, w, h), 회전 상자 ((cx, cy), (w, h), 각도°))] — 종류 cls(0 앞면, 1 뒷면) 점수로, 감싸는 축 상자로 NMS."""
+def decode(out: np.ndarray, r: float, left: int, top: int, W: int, H: int, cls: int = 0, scores: dict | None = None) -> list[tuple]:
+    """[(축 상자 (x, y, w, h), 회전 상자 ((cx, cy), (w, h), 각도°))] — 종류 cls(0 앞면, 1 뒷면) 점수로, 감싸는 축 상자로 NMS.
+    scores 를 주면 {축 상자: 검출 점수} 를 채운다(개선 계획 5단계 S2, 답은 그대로)."""
     keep = out[4 + cls] >= CONF
     cx, cy = ((out[0] - left) / r)[keep], ((out[1] - top) / r)[keep]
     w, h, c, ang = (out[2] / r)[keep], (out[3] / r)[keep], out[4 + cls][keep], out[-1][keep]
@@ -52,6 +53,8 @@ def decode(out: np.ndarray, r: float, left: int, top: int, W: int, H: int, cls: 
         x0, y0, x1, y1 = boxes[i]
         if x1 - x0 >= 2 and y1 - y0 >= 2:
             res.append(((int(x0), int(y0), int(x1 - x0), int(y1 - y0)), rects[i]))
+            if scores is not None:
+                scores[res[-1][0]] = round(float(c[i]), 3)
     return res
 
 
@@ -118,6 +121,7 @@ class SeatDet:
         self.kan_read: dict = {}
         self.kan_backs: set = set()
         self.backs: dict = {}  # {그림 지문: [(축 상자, 회전 상자)]} 뒷면 검출(역할 모델 입력용, 2026-11-05)
+        self.scores: dict = {}  # {(그림 지문, 축 상자): 앞면 검출 점수} (불확실성 신호 S2, 개선 계획 5단계)
 
 
 _CUR: contextvars.ContextVar[SeatDet | None] = contextvars.ContextVar("seat_det", default=None)
@@ -137,8 +141,9 @@ def current() -> SeatDet | None:
     return _CUR.get()
 
 
-def record(rgb: np.ndarray, res: list, kan_pairs: list, backs: list | None = None) -> list:
-    """검출 결과를 지금 기록에 남기고 축 상자 목록을 돌려준다(안깡 뒷면 상자 포함). backs = 뒷면 검출 [(축 상자, 회전 상자)] 는 기록만(역할 모델용)."""
+def record(rgb: np.ndarray, res: list, kan_pairs: list, backs: list | None = None, scores: dict | None = None) -> list:
+    """검출 결과를 지금 기록에 남기고 축 상자 목록을 돌려준다(안깡 뒷면 상자 포함). backs = 뒷면 검출 [(축 상자, 회전 상자)] 는 기록만(역할 모델용),
+    scores = [decode] 가 채운 {축 상자: 점수} 도 기록만."""
     d = _CUR.get()
     boxes = [b for b, _ in res]
     fp = fingerprint(rgb)
@@ -152,7 +157,15 @@ def record(rgb: np.ndarray, res: list, kan_pairs: list, backs: list | None = Non
         d.rects.update({(fp, b): rc for b, rc in res})
         if backs is not None:
             d.backs[fp] = list(backs)
+        if scores:
+            d.scores.update({(fp, b): v for b, v in scores.items()})
     return boxes
+
+
+def score_of(rgb: np.ndarray, b) -> float | None:
+    """지금 요청에서 이 그림의 이 상자를 검출한 앞면 점수. 기록 없으면(축 상자 검출기·안깡 뒷면·白 채우기) None."""
+    d = _CUR.get()
+    return None if d is None else d.scores.get((fingerprint(rgb), tuple(int(v) for v in b)))
 
 
 def backs_of(rgb: np.ndarray) -> list:

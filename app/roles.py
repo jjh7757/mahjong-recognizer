@@ -24,6 +24,7 @@ from PIL import Image
 from . import local_read as lr
 from . import obb
 from . import seat as st
+from . import signals as sig
 
 # 역할 모델: 11칸(회전 상자 크기·기울기 + 뒷면 토큰, 라벨 수정 뒤 재학습, mahjong_calc metrics 표 1-78·1-79, 2026-11-05 사용자 "11칸 서버 코드 변경").
 # 예전 9칸 tile-roles.onnx(124654·125839 손패 끝 3장을 울기로 배운 라벨)는 되돌리기용으로 남김 — LOCAL_ROLE_MODEL 로 끼우면 tokens 가 입력 모양으로 9칸을 만든다.
@@ -163,10 +164,16 @@ class RoleNet:
         return int(shape[-1]) if isinstance(shape[-1], int) else FEAT
 
     def predict(self, x: np.ndarray) -> tuple[list[str], list[float]]:
+        return self.predict_full(x)[:2]
+
+    def predict_full(self, x: np.ndarray) -> tuple[list[str], list[float], list[list[str]] | None]:
+        """[predict] + 씨드별 역할(ONNX 둘째 출력 seeds[S, 1, N, 6] 이 있을 때, 불확실성 신호 S4). 답(평균 확률 argmax)은 그대로."""
         if len(x) == 0:
-            return [], []
-        p = self._session().run(None, {"x": x[None]})[0][0]
-        return [ROLES[int(i)] for i in p.argmax(1)], [round(float(v), 3) for v in p.max(1)]
+            return [], [], None
+        outs = self._session().run(None, {"x": x[None]})
+        p = outs[0][0]
+        seeds = [[ROLES[int(i)] for i in s[0].argmax(1)] for s in outs[1]] if len(outs) > 1 else None
+        return [ROLES[int(i)] for i in p.argmax(1)], [round(float(v), 3) for v in p.max(1)], seeds
 
 
 _role_net: RoleNet | None = None
@@ -237,6 +244,13 @@ def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode:
     with obb.session():
         out = _read_roles(reader, jpeg, side, grid, mode, net)
         _loose_outside(reader, jpeg, out)
+        items, seeds = out.pop("_sig_items", None), out.pop("_role_seeds", None)
+        if sig.ON and items is not None:  # 불확실성 신호(개선 계획 5단계): 답은 그대로, 값만 더한다
+            if (s := out.get("separate_tile")) and s.get("from") == "loose_outside":
+                items.append(("sep", lr.decode_rgb(jpeg), tuple(s["box"]), "any", s["tile"], 0, 0))
+            out["signals"] = sig.collect(reader, items, seeds)
+            out["ms"]["signals"] = out["signals"]["ms"]
+            out["ms"]["total"] += out["signals"]["ms"]
         return out
 
 
@@ -288,8 +302,11 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
             x, y, w, h = unrotate(b, rot, cw, ch)
             backs.append(((x + x0, y + y0, w, h), unrotate_pts(obb.corners(rc), rot, cw, ch, x0, y0)))
         backs += [(b, obb.corners(rc)) for b, rc in obb.backs_of(full) if all(iou(b, f) < 0.3 for f, _ in backs) and all(iou(b, f) < 0.3 for f in allb)]
-    roles, confs = net.predict(tokens(allb, W, H, grid, side, net.feat, pts, backs))
+    full_pred = getattr(net, "predict_full", None)
+    x_tok = tokens(allb, W, H, grid, side, net.feat, pts, backs)
+    roles, confs, seeds = full_pred(x_tok) if full_pred else (*net.predict(x_tok), None)
     roles, confs = roles[: len(allb)], confs[: len(allb)]  # 뒷면 토큰의 역할은 버린다
+    seeds = [s[: len(allb)] for s in seeds] if seeds else None
     seat_roles = roles[: len(faces)]
     t_role = time.perf_counter()
     split = int(rgb.shape[1] * hand_frac(grid, side))
@@ -307,7 +324,7 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         hand = [blank_or(b, lambda x: reader.read2([lr.cut(rgb, x)])[0]) for b in fr.hand]
         sep = blank_or(fr.separate, lambda x: reader.read2([lr.cut(rgb, x)])[0]) if fr.separate else None
         melds = [[blank_or(b, lambda x: reader.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
-        block = False
+        block, got = False, []
         if fr.count == 13 and not fr.separate and not added:
             got = lr.strays(fr, faces, rgb)
             if len(got) == 1:
@@ -319,6 +336,13 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         out["melds"] = [{"tiles": [t[0] for t in m], "sideways": [], "face_down": [], "conf": min(t[1] for t in m),
                          "alts": [t[2] for t in m], "conf2s": [t[3] for t in m]} for m in melds]
         out["block"] = block
+        # 신호용(read_roles 가 꺼내 signals.collect 에): 답과 같은 크롭·방향. 白 채우기 패는 답 None
+        is_fill = lambda b, t: t[2] is None and t[1] == lr.FILLED_CONF
+        out["_sig_items"] = ([("hand", rgb, b, "hand", None if is_fill(b, t) else t[0], 0, 0) for b, t in zip(fr.hand, hand)]
+                             + ([("sep", rgb, fr.separate, "hand", None if is_fill(fr.separate, sep) else sep[0], 0, 0)] if fr.separate and sep else [])
+                             + ([("sep", rgb, got[0], "turned", sep[0], fr.tw, fr.th)] if not fr.separate and sep and len(got) == 1 else [])
+                             + [(f"meld{i}", rgb, b, "meld", None if is_fill(b, t) else t[0], 0, 0) for i, m in enumerate(fr.melds) for b, t in zip(m, melds[i])])
+        out["_role_seeds"] = seeds
     out["counts"] = dict(Counter(seat_roles))
     out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "roles": round((t_role - t_det) * 1000), "read": lr._ms(t_role), "total": lr._ms(t0)}
     out["rss_mb"] = lr.rss_mb()

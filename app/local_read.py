@@ -38,6 +38,8 @@ OTHER_DET = os.environ.get("LOCAL_OTHER_DET", "")
 SEAT_MODEL = Path(os.environ.get("LOCAL_SEAT_MODEL") or Path(__file__).parent / "assets" / "tile-obb-r8.onnx")
 ROT_WHITE = os.environ.get("LOCAL_ROT_WHITE", "1") == "1"  # 자리 판독 흰 비율을 회전 상자 안에서(metrics 표 1-73, 2026-11-05 켬)
 CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
+# 두 번째 분류기(불확실성 신호 S3, 개선 계획 5단계): 같은 학습 묶음·다른 씨드. 답에는 안 쓴다. 파일이 없으면 S3 를 안 낸다.
+ALT_CLS_MODEL = Path(os.environ.get("LOCAL_ALT_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-alt.onnx")
 CLASSES = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + ["0m", "0p", "0s"] + [f"{n}z" for n in range(1, 8)]
 IMG = 1280
 CONF, IOU = 0.25, 0.7
@@ -521,8 +523,10 @@ def _letterbox(rgb: np.ndarray) -> tuple[np.ndarray, float, int, int]:
 class LocalReader:
     """처음 쓸 때 모델을 올린다. [gate] 를 주면 검출·분류를 낮은 우선순위로(자리·강 틀 잡기가 진행 중이면 기다린다)."""
 
-    def __init__(self, gate=None, threads: int = 2, det_model: Path = DET_MODEL, cls_model: Path = CLS_MODEL, seat_model: Path | None = SEAT_MODEL):
+    def __init__(self, gate=None, threads: int = 2, det_model: Path = DET_MODEL, cls_model: Path = CLS_MODEL, seat_model: Path | None = SEAT_MODEL,
+                 alt_cls_model: Path | None = ALT_CLS_MODEL):
         self.gate, self.threads, self.det_model, self.cls_model = gate, threads, det_model, cls_model
+        self.alt_cls_model = alt_cls_model if alt_cls_model is not None and Path(alt_cls_model).exists() else None
         self.seat_model = seat_model if seat_model is not None and Path(seat_model).exists() else None
         self._lock = threading.Lock()
         self._det = self._cls = self._seat = None
@@ -582,10 +586,11 @@ class LocalReader:
         sess = self._seat
         out = self._run(lambda: sess.run(None, {sess.get_inputs()[0].name: x})[0][0])
         H, W = rgb.shape[:2]
-        res = obb.slivers(obb.decode(out, r, left, top, W, H), W, H)
+        scores: dict = {}
+        res = obb.slivers(obb.decode(out, r, left, top, W, H, scores=scores), W, H)
         backs = obb.decode(out, r, left, top, W, H, cls=1) if out.shape[0] >= 7 else []
         pairs = obb.kans(res, backs) if backs else []
-        return obb.record(rgb, res, pairs, backs)
+        return obb.record(rgb, res, pairs, backs, scores)
 
     def detect_other(self, rgb: np.ndarray) -> list:
         """강·표시패 검출. [OTHER_DET] 가 켜져 있고 자리 판독 검출기가 있으면 그 모델의 앞면(감싸는 축 상자), 아니면 [detect].

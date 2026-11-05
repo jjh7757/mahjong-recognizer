@@ -173,6 +173,20 @@ def _axis(rgb: np.ndarray, b, pad: float) -> Image.Image:
     return Image.fromarray(rgb[max(0, y - py):min(H, y + h + py), max(0, x - px):min(W, x + w + px)])
 
 
+def rect_of(rgb: np.ndarray, b):
+    """지금 요청에서 이 그림의 이 상자를 검출한 회전 상자. 없으면 None."""
+    d = _CUR.get()
+    return None if d is None else d.rects.get((fingerprint(rgb), tuple(int(v) for v in b)))
+
+
+def white_inside(white: np.ndarray, rect) -> float:
+    """흰 면 마스크에서 회전 상자 안쪽만의 흰 비율(감싸는 축 상자는 기운 패면 귀퉁이 펠트가 들어가 낮게 나온다)."""
+    m = np.zeros(white.shape, np.uint8)
+    cv2.fillPoly(m, [np.round(cv2.boxPoints(rect)).astype(np.int32)], 1)
+    inside = m > 0
+    return float(white[inside].mean()) if inside.any() else 0.0
+
+
 def is_kan_back(b) -> bool:
     d = _CUR.get()
     return d is not None and tuple(int(v) for v in b) in d.kan_backs

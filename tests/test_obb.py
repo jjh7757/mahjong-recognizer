@@ -92,3 +92,35 @@ def test_corner_pair_turns_two_blank_boxes_into_pon():
     assert lr.corner_pair(rgb, fr, fr.hand + two[:1]) is None, "한 장이면 퐁으로 보지 않는다"
     far = [(600, 110, 38, 52), (800, 110, 38, 52)]
     assert lr.corner_pair(rgb, fr, fr.hand + far) is None, "떨어진 두 장은 묶지 않는다"
+
+
+def test_white_inside_ignores_felt_corners_of_tilted_tile():
+    white = np.zeros((300, 300), bool)
+    rect = ((150.0, 150.0), (100.0, 120.0), 36.0)
+    import cv2
+
+    m = np.zeros(white.shape, np.uint8)
+    cv2.fillPoly(m, [np.round(cv2.boxPoints(rect)).astype(np.int32)], 1)
+    white[m > 0] = True  # 기운 패 면만 흰색
+    p = cv2.boxPoints(rect)
+    x0, y0, x1, y1 = int(p[:, 0].min()), int(p[:, 1].min()), int(p[:, 0].max()), int(p[:, 1].max())
+    assert white[y0:y1, x0:x1].mean() < 0.65, "감싸는 축 상자는 귀퉁이 펠트 때문에 낮다"
+    assert obb.white_inside(white, rect) > 0.95
+
+
+def test_keep_seat_keeps_tilted_tile_by_rotated_box():
+    import cv2
+
+    rgb = np.zeros((300, 300, 3), np.uint8)
+    rgb[...] = (30, 110, 60)  # 펠트
+    rect = ((150.0, 150.0), (56.0, 90.0), 45.0)  # 패 면 5040 / 감싸는 축 상자 약 10370 → 0.49
+    cv2.fillPoly(rgb, [np.round(cv2.boxPoints(rect)).astype(np.int32)], (235, 235, 235))
+    p = cv2.boxPoints(rect)
+    box = (int(p[:, 0].min()), int(p[:, 1].min()), int(p[:, 0].max() - p[:, 0].min()), int(p[:, 1].max() - p[:, 1].min()))
+    with obb.session():
+        obb.record(rgb, [(box, rect)], [])
+        assert lr.ROT_WHITE, "기본 켬(표 1-73)"
+        assert lr.LocalReader.keep_seat(rgb, [box]) == [box]
+    from app import river as rv
+
+    assert rv.keep_faces([box], rv.white_mask(rgb)) == [], "축 상자로 재면 버려지는 기운 패"

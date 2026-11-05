@@ -31,6 +31,7 @@ DET_MODEL = Path(os.environ.get("LOCAL_DET_MODEL") or Path(__file__).parent / "a
 # 자리 판독(/v2/localseat·/v2/localroles) 검출기: 회전 상자 8회차(app/obb.py). 파일이 없으면 위 DET_MODEL 로 읽는다.
 # 강·표시패(/v2/locallast3·/v2/localdora)는 8회차로 재지 않아 DET_MODEL 그대로.
 SEAT_MODEL = Path(os.environ.get("LOCAL_SEAT_MODEL") or Path(__file__).parent / "assets" / "tile-obb-r8.onnx")
+ROT_WHITE = os.environ.get("LOCAL_ROT_WHITE", "1") == "1"  # 자리 판독 흰 비율을 회전 상자 안에서(metrics 표 1-73, 2026-11-05 켬)
 CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
 CLASSES = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + ["0m", "0p", "0s"] + [f"{n}z" for n in range(1, 8)]
 IMG = 1280
@@ -553,9 +554,20 @@ class LocalReader:
 
     @staticmethod
     def keep_seat(rgb: np.ndarray, boxes: list) -> list:
-        """앞면 거르기(흰 비율) + 겹침 정리. 안깡 뒷면 상자는 흰 비율 거르기를 건너뛴다."""
+        """앞면 거르기(흰 비율) + 겹침 정리. 안깡 뒷면 상자는 흰 비율 거르기를 건너뛴다.
+        [ROT_WHITE] 면 회전 상자를 아는 상자는 흰 비율을 회전 상자 안에서 잰다(기운 떼어 둔 패, metrics 표 1-73)."""
         backs = [b for b in boxes if obb.is_kan_back(b)]
-        return rv.dedupe(rv.keep_faces([b for b in boxes if b not in backs], rv.white_mask(rgb)) + backs)
+        white = rv.white_mask(rgb)
+        faces = []
+        for b in boxes:
+            if b in backs:
+                continue
+            rect = obb.rect_of(rgb, b) if ROT_WHITE else None
+            if rect is None:
+                faces += rv.keep_faces([b], white)
+            elif obb.white_inside(white, rect) >= 0.5:
+                faces.append(b)
+        return rv.dedupe(faces + backs)
 
     def _tensor(self, im: Image.Image) -> np.ndarray:
         im = im.copy()

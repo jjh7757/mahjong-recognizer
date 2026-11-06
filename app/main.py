@@ -583,7 +583,7 @@ async def observe_local_dora(image: UploadFile = File(...), x_api_key: str | Non
     jpeg = await _accept(image, x_api_key, max_side=4080)
     src = _grid_src(grid_src)
     out = await _run(_get_local_reader().read_wall, jpeg, fr, grid, src)
-    log.info("localdora %s -> %s", image.filename, str(out)[:300])
+    log.info("localdora %s wall_frame=%s -> %s", image.filename, out.get("wall_frame"), str(out)[:300])
     return out
 
 
@@ -620,7 +620,7 @@ async def observe_local_roles(image: UploadFile = File(...), x_api_key: str | No
             raise HTTPException(status_code=422, detail="sticks=ymin,xmin,ymax,xmax") from None
     jpeg = await _accept(image, x_api_key, max_side=4080)
     out = await _run(roles.read_roles, _get_local_reader(), jpeg, side, grid, mode, None, fr, src)
-    log.info("localroles %s %s %s -> %s", image.filename, side, mode, str({k: v for k, v in out.items() if k != "roles"})[:300])
+    log.info("localroles %s %s %s wall_frame=%s -> %s", image.filename, side, mode, out.get("wall_frame"), str({k: v for k, v in out.items() if k != "roles"})[:300])
     return out
 
 

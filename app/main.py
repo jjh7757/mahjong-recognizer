@@ -651,9 +651,13 @@ async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: s
     _gate(x_api_key)
     if sides is not None:
         jpeg = await _read_image(images[0], max_side=4080)
-        return await _run(_get_local_reader().read_rivers_full, jpeg, side_list, grid, fr, src)
+        out = await _run(_get_local_reader().read_rivers_full, jpeg, side_list, grid, fr, src)
+        log.info("locallast3 %s sides=%s grid_src=%s wall_frame=%s cut=%s", images[0].filename, sides, src, out.get("wall_frame"), out.get("cut"))
+        return out
     jpegs = [await _read_image(i, max_side=3072) for i in images]
-    return await _run(_get_local_reader().read_rivers_app, jpegs)
+    out = await _run(_get_local_reader().read_rivers_app, jpegs)
+    log.info("locallast3 crops=%d grid_src=%s", len(jpegs), src)  # 8b-4a: 크롭 경로(지금 그대로) 수 세기
+    return out
 
 
 @app.post("/v2/handonly")

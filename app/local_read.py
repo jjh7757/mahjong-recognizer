@@ -745,11 +745,11 @@ class LocalReader:
 
     # ------------------------------------------------------------ 판독
 
-    def read_wall(self, jpeg: bytes, frame=None) -> dict:
+    def read_wall(self, jpeg: bytes, frame=None, grid: dict | None = None, grid_src: str | None = None) -> dict:
         with obb.session():
-            return self._read_wall(jpeg, frame)
+            return self._read_wall(jpeg, frame, grid, grid_src)
 
-    def _read_wall(self, jpeg: bytes, frame=None) -> dict:
+    def _read_wall(self, jpeg: bytes, frame=None, grid: dict | None = None, grid_src: str | None = None) -> dict:
         """테이블 전체 사진 → 패산에 뒤집어 둔 표시패 한 장. 옆에 패 뒷면이 가장 많이 붙은 앞면 패를 고른다.
         못 찾거나 확신이 낮으면 indicators 가 빈다(白 은 검출기가 자주 놓친다). 리치 화료의 표시패 짝은 다루지 않는다.
         측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진).
@@ -760,15 +760,17 @@ class LocalReader:
         rot2(8b-3b 후보 3): 세워 자르지 않고 지금 경로와 같은 사진 전체 검출([detect_other])에서, 패산 표시패 후보만 dora_search ∪ dead_wall 로
         거르고 탁자 위 짝은 지금처럼 사진 전체 앞면에서 묶는다(짝마다 zone) — 크롭 끝에 잘린 납작한 조각의 헛 짝(표 1-105 165614)과 13u 밖
         진짜 짝(B·C·D k15·k26, 가운데에서 약 14u)을 둘 다 피한다. 자리 판독 검출(full_raw)을 나눠 쓰면 검출기가 바뀌어 짝 후보가 달라지므로
-        (개발 단위 확인에서 132239·134815 에 5z 낀 새 짝) 쓰지 않는다."""
+        (개발 단위 확인에서 132239·134815 에 5z 낀 새 짝) 쓰지 않는다.
+        hybrid(8b-3c): 격자 출처 grid_src(없으면 WALL_FRAME_GRID_SRC, 그것도 없으면 [grid] 가 있으면 saved·없으면 none)가 saved|manual|felt
+        면 지금 경로, none|default 면 rot2(table_locate.route)."""
         from . import table_locate as tl
 
         t0 = time.perf_counter()
         rgb = decode_rgb(jpeg)
         t_dec = time.perf_counter()
-        wf, tz, fmeta, zc = tl.mode(), None, {}, None
+        wf_on, zc = tl.mode() is not None, None
+        wf, tz, fmeta = tl.route(self, jpeg, rgb, frame, grid, grid_src)
         if wf:
-            tz, fmeta = tl.frame_for(self, jpeg, rgb, frame)
             if tz is not None and wf == "rot":  # rot2 는 세워 자르지 않음(아래 whole)
                 s = tl.dora_reach(tz)
                 zc = tl.warp_zone(rgb, tz, "bottom", (-s, s), (-s, s))
@@ -811,7 +813,7 @@ class LocalReader:
                 out["pairs"].append(pair)
         out["size"] = [rgb.shape[1], rgb.shape[0]]
         out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_frame) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
-        if wf:
+        if wf_on:
             out["ms"]["frame"] = round((t_frame - t_dec) * 1000)
             fmeta.pop("frame_ms", None)
             out.update(fmeta)
@@ -897,22 +899,21 @@ class LocalReader:
             rivers.append({"last_tile": {"tile": tile, "conf": conf}, "tile_count": fr.count, "sideways": [i for i, s in enumerate(fr.sideways) if s]})
         return {"rivers": rivers, "method": "frame", "ms": {"total": _ms(t0)}, "rss_mb": rss_mb()}
 
-    def read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None = None, frame=None) -> dict:
+    def read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None = None, frame=None, grid_src: str | None = None) -> dict:
         """사진 전체 + 자리들 → [read_rivers_app] 과 같은 모양(개선 계획 8b, 앱이 강 끝 크롭을 안 보내는 길). 강 끝 크롭은
         WALL_FRAME=rot 이면 구역표 강 칸(river)을 세워 자르고, axis 면 기준점에서 만든 격자로, 꺼져 있거나 기준점을 못 잡으면 [grid] 로
         앱 GridZones.lastZone 과 같게 자른다. 격자도 없으면 강이 다 빈다(frame_error)."""
         with obb.session():
-            return self._read_rivers_full(jpeg, sides, grid, frame)
+            return self._read_rivers_full(jpeg, sides, grid, frame, grid_src)
 
-    def _read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None, frame) -> dict:
+    def _read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None, frame, grid_src: str | None = None) -> dict:
         from . import table_locate as tl
 
         t0 = time.perf_counter()
         rgb = decode_rgb(jpeg)
-        wf, tz, fmeta = tl.mode(), None, {}
-        if wf:
-            tz, fmeta = tl.frame_for(self, jpeg, rgb, frame)
-            fmeta.pop("frame_ms", None)
+        wf_on = tl.mode() is not None
+        wf, tz, fmeta = tl.route(self, jpeg, rgb, frame, grid, grid_src)  # hybrid: 격자를 가졌으면 지금 경로, 아니면(격자 없으면) rot2
+        fmeta.pop("frame_ms", None)
         t_frame = time.perf_counter()
         crops: list = []
         if tz is not None and wf in tl.ROT:
@@ -935,7 +936,7 @@ class LocalReader:
             tile, conf = self.read_any(c, fr.last)
             rivers.append({"last_tile": {"tile": tile, "conf": conf}, "tile_count": fr.count, "sideways": [i for i, s in enumerate(fr.sideways) if s]})
         out = {"rivers": rivers, "method": "frame", "sides": list(sides), "ms": {"total": _ms(t0)}, "rss_mb": rss_mb()}
-        if wf:
+        if wf_on:
             out["ms"]["frame"] = round((t_frame - t0) * 1000)
             out.update(fmeta)
             out["cut"] = "rot" if tz is not None and wf in tl.ROT else "axis" if tz is not None else "grid"

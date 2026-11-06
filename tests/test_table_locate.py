@@ -162,7 +162,7 @@ def test_in_dora_zone_and_reach():
 
 
 def test_mode_reads_env(monkeypatch):
-    for v, want in (("", None), ("0", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot"), ("rot2", "rot2"), ("rot3", None)):
+    for v, want in (("", None), ("0", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot"), ("rot2", "rot2"), ("Hybrid", "hybrid"), ("rot3", None)):
         monkeypatch.setenv("WALL_FRAME", v)
         assert tl.mode() == want
 
@@ -317,6 +317,114 @@ def test_routes_accept_frame_and_full_photo_last3(monkeypatch):
     monkeypatch.setenv("WALL_FRAME", "")
     j = client.post("/v2/locallast3", files=[many[0]], params={"sides": "left", "x1": 280, "x2": 745, "y1": 173, "y2": 713}).json()
     assert len(j["rivers"]) == 1 and "cut" not in j
+
+
+# ---------------------------------------------------------------- WALL_FRAME=hybrid(8b-3c): 앱이 격자를 가졌는지(grid_src)로 경로
+
+def _tz1000(theta_deg=0.0, u=10.0):
+    return tf.TableZones(tl.table(), tf.TableFrame(500.0, 500.0, math.radians(theta_deg), u, 3.2, (1000.0, 1000.0)), 1000, 1000)
+
+
+def test_grid_check_is_diagnostic_distance_and_theta():
+    """grid_check 는 진단만(경로를 안 정함): 격자 가운데 칸 중심 ↔ 기준점 거리(기준점 u)·dx·dy·θ(90° 주기)."""
+    c = tl.grid_check(_tz1000(), {"x1": 400, "x2": 622, "y1": 400, "y2": 600})
+    assert c == {"dist_u": pytest.approx(1.1), "dx_u": pytest.approx(1.1), "dy_u": pytest.approx(0), "theta_deg": pytest.approx(0)}
+    assert tl.grid_check(_tz1000(u=20.0), {"x1": 400, "x2": 622, "y1": 400, "y2": 600})["dist_u"] == pytest.approx(0.55)
+    for th, want in ((2.9, 2.9), (-3.1, 3.1), (87.1, 2.9), (92.9, 2.9)):
+        assert tl.grid_check(_tz1000(th), {"x1": 400, "x2": 600, "y1": 400, "y2": 600})["theta_deg"] == pytest.approx(want)
+    assert "match" not in c
+
+
+GOOD = {"x1": 280, "x2": 720, "y1": 173, "y2": 827}
+
+
+@pytest.mark.parametrize("query, env, grid, want, src", [
+    ("saved", "", GOOD, "saved", ["saved", "query"]),
+    ("manual", "", GOOD, "saved", ["manual", "query"]),
+    ("felt", "", GOOD, "saved", ["felt", "query"]),
+    ("none", "", GOOD, "rot2", ["none", "query"]),
+    ("default", "", GOOD, "rot2", ["default", "query"]),
+    (None, "saved", GOOD, "saved", ["saved", "env"]),
+    (None, "none", GOOD, "rot2", ["none", "env"]),
+    ("none", "saved", GOOD, "rot2", ["none", "query"]),  # 요청이 env 보다 먼저
+    (None, "", GOOD, "saved", ["saved", "grid"]),  # grid_src 없이 격자만(지금 앱) → 지금 경로
+    (None, "", None, "rot2", ["none", "no_grid"]),  # 격자 질의 자체가 없음 → rot2
+    (None, "bogus", None, "rot2", ["none", "no_grid"]),  # 모르는 env 는 무시
+])
+def test_route_hybrid_by_grid_src(monkeypatch, query, env, grid, want, src):
+    W, H = 2000, 1600
+    faces, backs = _scene()
+    r, _ = _fake_reader(monkeypatch, faces, backs, W, H)
+    jpeg = _jpeg(_photo(faces, (W, H)))
+    monkeypatch.setenv("WALL_FRAME", "hybrid")
+    monkeypatch.setenv("WALL_FRAME_GRID_SRC", env)
+    lr._decoded.clear()
+    m, tz, meta = tl.route(r, jpeg, lr.decode_rgb(jpeg), None, grid, query)
+    assert meta["wall_frame"] == want and meta["wall_frame_src"] == src and meta["wall_frame_mode"] == "hybrid"
+    assert meta["frame"]["source"] == "device", "기준점은 지금 경로에서도 잡아 응답에 넣는다"
+    assert (m, tz is None) == ((None, True) if want == "saved" else ("rot2", False))
+    assert ("wall_frame_check" in meta) is (grid is not None)
+
+
+def test_read_roles_hybrid_saved_equals_off_and_rot2_otherwise(monkeypatch):
+    """hybrid saved = WALL_FRAME 없음과 같은 답(cut grid, 응답에 기준점), none → rot2(cut rot). localdora 도 같은 판정(격자 없으면 rot2 = whole)."""
+    W, H = 2000, 1600
+    strip = lambda o: {k: v for k, v in o.items() if k in ("tiles", "melds", "separate_tile", "framed", "face_up", "roles", "counts", "filled")}
+    faces, backs = _scene()
+    r, _ = _fake_reader(monkeypatch, faces, backs, W, H)
+    jpeg = _jpeg(_photo(faces, (W, H)))
+    monkeypatch.setenv("WALL_FRAME", "")
+    lr._decoded.clear()
+    base = roles.read_roles(r, jpeg, "bottom", GOOD, "model", net=_Net())
+    base_d = r.read_wall(jpeg)
+    monkeypatch.setenv("WALL_FRAME", "hybrid")
+    lr._decoded.clear()
+    out = roles.read_roles(r, jpeg, "bottom", GOOD, "model", net=_Net(), grid_src="saved")
+    assert out["wall_frame"] == "saved" and out["cut"] == "grid" and strip(out) == strip(base) and out["frame"]["source"] == "device"
+    assert out["wall_frame_check"]["theta_deg"] == pytest.approx(12, abs=0.5)
+    out = roles.read_roles(r, jpeg, "bottom", GOOD, "model", net=_Net(), grid_src="none")
+    assert out["wall_frame"] == "rot2" and out["cut"] == "rot"
+    d = r.read_wall(jpeg)  # 지금 앱은 localdora 에 격자를 안 보낸다 → rot2
+    assert d["wall_frame"] == "rot2" and d["cut"] == "whole" and d["wall_frame_src"] == ["none", "no_grid"]
+    monkeypatch.setenv("WALL_FRAME_GRID_SRC", "saved")  # 측정용 강제
+    d = r.read_wall(jpeg)
+    assert d["wall_frame"] == "saved" and d["cut"] == "grid" and d["indicators"] == base_d["indicators"] and d["pairs"] == base_d["pairs"]
+
+
+def test_hybrid_falls_back_to_grid_when_no_frame_and_last3_without_grid_is_rot2(monkeypatch):
+    W, H = 2000, 1600
+    r, _ = _fake_reader(monkeypatch, [], [], W, H)  # 기준점 못 잡음
+    jpeg = _jpeg(_photo([], (W, H)))
+    monkeypatch.setenv("WALL_FRAME", "hybrid")
+    out = roles.read_roles(r, jpeg, "bottom", GOOD, "model", net=_Net(), grid_src="none")
+    assert out["wall_frame"] == "none" and out["cut"] == "grid" and out["frame_error"]
+    faces, backs = _scene()
+    r, _ = _fake_reader(monkeypatch, faces, backs, W, H)
+    jpeg = _jpeg(_photo(faces, (W, H)))
+    j = r.read_rivers_full(jpeg, ["right"])
+    assert j["wall_frame"] == "rot2" and j["cut"] == "rot"
+    j = r.read_rivers_full(jpeg, ["right"], GOOD, grid_src="felt")
+    assert j["wall_frame"] == "saved" and j["cut"] == "grid"
+
+
+def test_routes_accept_grid_src(monkeypatch):
+    monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.setattr(server, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(server, "recognizer", object())
+    monkeypatch.setattr(roles, "_role_net", _Net())
+    r = lr.LocalReader(seat_model=None)
+    monkeypatch.setattr(r, "detect", lambda rgb, low=True: [])
+    monkeypatch.setattr(server, "_local_reader", r)
+    client = TestClient(server.app)
+    files = {"image": ("t.jpg", _jpeg(Image.new("RGB", (800, 600), (30, 120, 60))), "image/jpeg")}
+    base = {"side": "bottom", **GOOD}
+    monkeypatch.setenv("WALL_FRAME", "hybrid")
+    assert client.post("/v2/localroles", files=files, params={**base, "grid_src": "maybe"}).status_code == 422
+    assert client.post("/v2/localdora", files=files, params={"grid_src": "maybe"}).status_code == 422
+    j = client.post("/v2/localroles", files=files, params={**base, "grid_src": "Manual"}).json()
+    assert j["wall_frame"] == "saved" and j["wall_frame_src"] == ["manual", "query"]
+    j = client.post("/v2/localdora", files=files, params={**GOOD, "grid_src": "default"}).json()
+    assert j["wall_frame_src"] == ["default", "query"] and j["wall_frame"] == "none"  # 빈 사진 = 기준점 못 잡음 → 지금 경로
 
 
 def test_last_zone_matches_app_grid_zones():

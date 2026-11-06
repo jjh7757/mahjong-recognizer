@@ -553,14 +553,36 @@ def _frame_param(frame: str | None):
         raise HTTPException(status_code=422, detail=f"frame: {e}") from None
 
 
+def _grid_src(v: str | None) -> str | None:
+    """요청 grid_src=(WALL_FRAME=hybrid 의 격자 출처, 8b-3c): saved|manual|felt|none|default. 없으면 None, 틀리면 422."""
+    from . import table_locate as tl
+
+    if v is None or v == "":
+        return None
+    v = v.strip().lower()
+    if v not in tl.GRID_SRCS:
+        raise HTTPException(status_code=422, detail="grid_src=" + "|".join(tl.GRID_SRCS))
+    return v
+
+
 @app.post("/v2/localdora")
 async def observe_local_dora(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
-                             frame: str | None = Query(None)) -> dict:
+                             frame: str | None = Query(None),
+                             x1: int | None = Query(None, ge=1, le=999), x2: int | None = Query(None, ge=1, le=999),
+                             y1: int | None = Query(None, ge=1, le=999), y2: int | None = Query(None, ge=1, le=999),
+                             grid_src: str | None = Query(None)) -> dict:
     """테이블 전체 사진 → 패산에 뒤집어 둔 표시패(자체 모델, Gemini 없음). 찾지 못하면 indicators 가 빈다.
-    WALL_FRAME(실험, 개선 계획 8b)이면 탁자 기준점(frame= 또는 사진에서)으로 후보를 표시패 칸에 든 것만, 짝에 zone."""
+    WALL_FRAME(실험, 개선 계획 8b)이면 탁자 기준점(frame= 또는 사진에서)으로 후보를 표시패 칸에 든 것만, 짝에 zone.
+    WALL_FRAME=hybrid(8b-3c)는 격자 출처 grid_src(saved|manual|felt → 지금 경로, none|default → rot2, 없으면 격자 x1·x2·y1·y2 가 있는지)로 고른다."""
+    grid = None
+    if None not in (x1, x2, y1, y2):
+        if not (x1 < x2 and y1 < y2):
+            raise HTTPException(status_code=422, detail="grid")
+        grid = {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
     fr = _frame_param(frame)
     jpeg = await _accept(image, x_api_key, max_side=4080)
-    out = await _run(_get_local_reader().read_wall, jpeg, fr)
+    src = _grid_src(grid_src)
+    out = await _run(_get_local_reader().read_wall, jpeg, fr, grid, src)
     log.info("localdora %s -> %s", image.filename, str(out)[:300])
     return out
 
@@ -577,16 +599,18 @@ async def observe_local_seat(image: UploadFile = File(...), x_api_key: str | Non
 async def observe_local_roles(image: UploadFile = File(...), x_api_key: str | None = Header(default=None),
                               side: str = Query(...), x1: int = Query(..., ge=1, le=999), x2: int = Query(..., ge=1, le=999),
                               y1: int = Query(..., ge=1, le=999), y2: int = Query(..., ge=1, le=999),
-                              sticks: str | None = Query(None), mode: str = Query("hybrid"), frame: str | None = Query(None)) -> dict:
+                              sticks: str | None = Query(None), mode: str = Query("hybrid"), frame: str | None = Query(None),
+                              grid_src: str | None = Query(None)) -> dict:
     """사진 전체 + 격자(1000 분율 x1·x2·y1·y2, 리치봉 상자 sticks=ymin,xmin,ymax,xmax) + 화료자 자리 → 상자 배치 역할 모델로 그 자리의
     손패·울기(/v2/seat 모양, 자체 모델만, Gemini 없음) + 상자별 역할. mode=hybrid(모델이 고른 상자만 규칙 틀에) | model(역할로 바로 묶기).
     WALL_FRAME=axis|rot(실험, 개선 계획 8b)이면 탁자 기준점(frame= JSON 이 오면 그것, 없으면 사진에서)으로 자르고 응답에 frame
-    (못 잡으면 frame_error 와 함께 격자로)."""
+    (못 잡으면 frame_error 와 함께 격자로). hybrid(8b-3c)는 grid_src(격자 출처)로 지금 경로·rot2 를 고른다."""
     from . import roles
 
     if side not in roles.SIDES or mode not in ("hybrid", "model") or not (x1 < x2 and y1 < y2):
         raise HTTPException(status_code=422, detail="side/mode/grid")
     fr = _frame_param(frame)
+    src = _grid_src(grid_src)
     grid: dict = {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
     if sticks:
         try:
@@ -595,7 +619,7 @@ async def observe_local_roles(image: UploadFile = File(...), x_api_key: str | No
         except (ValueError, AssertionError):
             raise HTTPException(status_code=422, detail="sticks=ymin,xmin,ymax,xmax") from None
     jpeg = await _accept(image, x_api_key, max_side=4080)
-    out = await _run(roles.read_roles, _get_local_reader(), jpeg, side, grid, mode, None, fr)
+    out = await _run(roles.read_roles, _get_local_reader(), jpeg, side, grid, mode, None, fr, src)
     log.info("localroles %s %s %s -> %s", image.filename, side, mode, str({k: v for k, v in out.items() if k != "roles"})[:300])
     return out
 
@@ -604,7 +628,8 @@ async def observe_local_roles(image: UploadFile = File(...), x_api_key: str | No
 async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: str | None = Header(default=None),
                               sides: str | None = Query(None), frame: str | None = Query(None),
                               x1: int | None = Query(None, ge=1, le=999), x2: int | None = Query(None, ge=1, le=999),
-                              y1: int | None = Query(None, ge=1, le=999), y2: int | None = Query(None, ge=1, le=999)) -> dict:
+                              y1: int | None = Query(None, ge=1, le=999), y2: int | None = Query(None, ge=1, le=999),
+                              grid_src: str | None = Query(None)) -> dict:
     """강 크롭 1~4장 → /v2/last3 모양의 답과 눕힌 패(자체 모델만, Gemini 없음).
     sides=right,top,left(실험, 개선 계획 8b)를 주면 images 는 사진 전체 한 장이고 서버가 그 자리들의 강 끝을 자른다 — WALL_FRAME 이면
     탁자 기준점(frame= 또는 사진에서)으로, 아니면(또는 못 잡으면) 격자 x1·x2·y1·y2 로 앱 lastZone 과 같게."""
@@ -621,11 +646,12 @@ async def observe_local_last3(images: list[UploadFile] = File(...), x_api_key: s
             raise HTTPException(status_code=422, detail="grid")
         grid = {"x1": x1, "x2": x2, "y1": y1, "y2": y2}
     fr = _frame_param(frame)
+    src = _grid_src(grid_src)
     # 요청 제한은 요청당 한 번(사진마다 깎으면 버킷이 빈 뒤 앞 사진만 토큰을 먹고 계속 429, metrics 표 1-84).
     _gate(x_api_key)
     if sides is not None:
         jpeg = await _read_image(images[0], max_side=4080)
-        return await _run(_get_local_reader().read_rivers_full, jpeg, side_list, grid, fr)
+        return await _run(_get_local_reader().read_rivers_full, jpeg, side_list, grid, fr, src)
     jpegs = [await _read_image(i, max_side=3072) for i in images]
     return await _run(_get_local_reader().read_rivers_app, jpegs)
 

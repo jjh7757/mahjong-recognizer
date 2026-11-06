@@ -273,12 +273,13 @@ def frame_from_roles(rgb: np.ndarray, faces: list, roles: list[str], split: int,
 
 
 def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str = "hybrid", net: RoleNet | None = None,
-               frame: tf.TableFrame | None = None) -> dict:
+               frame: tf.TableFrame | None = None, grid_src: str | None = None) -> dict:
     """사진 전체 → 화료자 자리의 손패·울기(/v2/seat 모양) + 상자별 역할(roles: 원본 좌표 box, role, conf, in_seat).
     WALL_FRAME(axis|rot|rot2, 개선 계획 8b·8b-3b)이 켜져 있으면 기준점(frame = 앱이 준 것, 없으면 사진에서 잡음)으로 자른다 — 응답에 wall_frame·frame
-    (또는 frame_error, 그때는 [grid] 로 지금처럼). 꺼져 있으면 frame 을 무시하고 지금과 같다."""
+    (또는 frame_error, 그때는 [grid] 로 지금처럼). hybrid(8b-3c)면 격자 출처 grid_src 가 saved|manual|felt 일 때 지금 경로(wall_frame saved),
+    none|default 면 rot2(table_locate.route). 꺼져 있으면 frame 을 무시하고 지금과 같다."""
     with obb.session():
-        out = _read_roles(reader, jpeg, side, grid, mode, net, frame)
+        out = _read_roles(reader, jpeg, side, grid, mode, net, frame, grid_src)
         ok = out.pop("_inside_ok", None)
         _loose_outside(reader, jpeg, out, inside=ok if out.get("wall_frame") == "rot2" and out.get("cut") == "rot" else None)
         items, seeds = out.pop("_sig_items", None), out.pop("_role_seeds", None)
@@ -320,7 +321,7 @@ def seat_grow_u(tz: tf.TableZones, side: str) -> float:
 
 
 def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str, net: RoleNet | None,
-                frame: tf.TableFrame | None = None) -> dict:
+                frame: tf.TableFrame | None = None, grid_src: str | None = None) -> dict:
     t0 = time.perf_counter()
     net = net or role_net()
     full = lr.decode_rgb(jpeg)  # 같은 사진을 받은 /v2/localdora 와 디코딩을 나눈다(app/shared.py)
@@ -329,15 +330,15 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
     t_dec = time.perf_counter()
     ctx = reader.detect_full(jpeg, full)  # 맥락용(작게 보이는 다른 자리 패) — 같은 사진이면 localdora·기준점 잡기와 한 번만(8단계 P1)
     # 탁자 기준점(WALL_FRAME, 개선 계획 8b): axis = 기준점에서 만든 같은 뜻의 격자로 지금 경로, rot = 구역표 회전 사각형을 세워 자름
-    wf, tz, fmeta = tl.mode(), None, {}
-    if wf:
-        tz, fmeta = tl.frame_for(reader, jpeg, full, frame)
-        if tz is not None and wf == "axis":
-            g = tl.grid_from_frame(tz)
-            if g is None:
-                tz, fmeta["frame_error"] = None, "격자 선이 사진 밖"
-            else:
-                grid, fmeta["grid"] = g, g
+    # hybrid(8b-3c) = 앱이 격자를 가졌으면(grid_src saved|manual|felt) 지금 경로(wf None), 아니면 rot2 — tl.route 가 고르고 응답에 wall_frame
+    wf_on = tl.mode() is not None
+    wf, tz, fmeta = tl.route(reader, jpeg, full, frame, grid, grid_src)
+    if tz is not None and wf == "axis":
+        g = tl.grid_from_frame(tz)
+        if g is None:
+            tz, fmeta["frame_error"] = None, "격자 선이 사진 밖"
+        else:
+            grid, fmeta["grid"] = g, g
     zc = None
     if wf in tl.ROT and tz is not None:  # rot2(8b-3b 후보 1): 읽기 크롭은 이웃 자리와 3u 겹친 seat_read, 구역(채점·역할)은 seat 그대로
         zc = tl.warp_rect(full, tz, "seat_read" if wf == "rot2" else "seat", side, grow_r0=seat_grow_u(tz, side))
@@ -424,7 +425,7 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         out["_inside_ok"] = {i for i, b in enumerate(faces) if tuple(b) in alone and tuple(b) not in used}
     out["counts"] = dict(Counter(seat_roles))
     out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "roles": round((t_role - t_det) * 1000), "read": lr._ms(t_role), "total": lr._ms(t0)}
-    if wf:  # 기준점(축·회전 어느 쪽으로 잘랐는지는 wall_frame, 못 잡아 격자로 떨어졌으면 frame_error)
+    if wf_on:  # 기준점(축·회전 어느 쪽으로 잘랐는지는 wall_frame, 못 잡아 격자로 떨어졌으면 frame_error, hybrid 는 saved|rot2|none)
         out["ms"]["frame"] = fmeta.pop("frame_ms", 0)
         out.update(fmeta)
         out["cut"] = "rot" if zc is not None else "axis" if tz is not None else "grid"

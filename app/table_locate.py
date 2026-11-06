@@ -13,6 +13,9 @@
   rot2 = rot 의 크롭 정의 손실 세 가지를 고친 후보(8b-3b, mahjong_calc metrics 표 1-105 '다음 후보'): ① 자리 읽기 크롭은 구역표 `seat_read`
          (seat 를 이웃 자리 쪽으로 3u 겹침, 채점·역할 구역은 seat 그대로) ② 크롭 안 `loose` 역할도 떼어 둔 화료패 후보(roles._loose_near)
          ③ 표시패는 세워 자르지 않고 사진 전체 검출(full_raw 공유) — 패산 표시패 후보만 dora_search ∪ dead_wall 로 거르고 짝은 지금처럼 전체에서.
+  hybrid = 요청마다 고른다(8b-3c, mahjong_calc metrics 표 1-108): 앱이 이 탁자 격자를 가졌으면(grid_src=saved|manual|felt) 지금 경로
+         (격자 그대로, WALL_FRAME 없음과 같은 답 = wall_frame "saved", 기준점은 잡아 응답에만), 기본값 격자·자동 맞추기 실패(none|default)
+         이거나 격자 질의가 없으면 rot2("rot2"). 기준점을 못 잡으면 지금 경로("none"). 문턱·색 없음. 측정용 강제값 WALL_FRAME_GRID_SRC.
 """
 from __future__ import annotations
 
@@ -24,12 +27,12 @@ import numpy as np
 
 from . import table_frame as tf
 
-MODES = ("axis", "rot", "rot2")
+MODES = ("axis", "rot", "rot2", "hybrid")
 ROT = ("rot", "rot2")  # 세워 자르는 모드(강 끝·자리 크롭)
 
 
 def mode() -> str | None:
-    """WALL_FRAME 환경 변수: axis | rot | rot2(1 은 axis 로 친다), 없거나 그 밖이면 None(기존 격자 경로)."""
+    """WALL_FRAME 환경 변수: axis | rot | rot2 | hybrid(1 은 axis 로 친다), 없거나 그 밖이면 None(기존 격자 경로)."""
     v = os.environ.get("WALL_FRAME", "").strip().lower()
     return "axis" if v == "1" else v if v in MODES else None
 
@@ -264,6 +267,62 @@ def frame_for(reader, jpeg: bytes, rgb: np.ndarray, given: tf.TableFrame | None 
         meta["frame_info"] = info
     meta["frame_ms"] = round((time.perf_counter() - t0) * 1000)
     return tz, meta
+
+
+GRID_HAVE = ("saved", "manual", "felt")  # 앱이 이 탁자 격자를 가짐(저장·손으로 맞춤·펠트 자동 맞추기 성공) → 지금 경로
+GRID_NONE = ("none", "default")  # 기본값 격자·자동 맞추기 실패 → rot2
+GRID_SRCS = GRID_HAVE + GRID_NONE
+
+
+def grid_src_env() -> str | None:
+    """WALL_FRAME_GRID_SRC 환경 변수(측정용 강제값 — 앱이 아직 grid_src 를 안 보냄, 8b-3c). 요청에 grid_src 가 오면 그쪽이 먼저."""
+    v = os.environ.get("WALL_FRAME_GRID_SRC", "").strip().lower()
+    return v if v in GRID_SRCS else None
+
+
+def grid_check(tz: tf.TableZones, grid: dict) -> dict:
+    """앱 격자와 기준점의 차이(진단만, 경로를 정하지 않음 — 8b-3c 측정 전 확인에서 저장 격자 가운데 칸 중심은 기기 중심에서 거치마다 1~3u
+    떨어져 있었고 사진 한 장 θ 는 0.3~4.2° 흔들렸다, mahjong_calc metrics 표 1-108): 격자 가운데 칸 중심 ↔ 기준점 가운데 거리(u, 기준점의 u)·
+    격자 중심의 기준점 좌표(dx·dy, u)·기준점 θ(90° 주기, 0° 와의 차, 도)."""
+    px = (grid["x1"] + grid["x2"]) / 2 / 1000 * tz.W
+    py = (grid["y1"] + grid["y2"]) / 2 / 1000 * tz.H
+    qx, qy = tz.to_frame(px, py)
+    return {"dist_u": round(math.hypot(qx, qy), 3), "dx_u": round(qx, 3), "dy_u": round(qy, 3),
+            "theta_deg": round(tf.theta_diff_deg(tz.frame.theta, 0.0), 3)}
+
+
+def route(reader, jpeg: bytes, rgb: np.ndarray, given: tf.TableFrame | None = None, grid: dict | None = None,
+          grid_src: str | None = None) -> tuple[str | None, tf.TableZones | None, dict]:
+    """요청 하나가 실제로 탈 경로 (모드, 구역, 응답에 더할 값). 모드 None = 지금 격자 경로(구역도 None).
+    WALL_FRAME 이 axis|rot|rot2 면 그 모드 + [frame_for] 그대로.
+    hybrid(8b-3c, 문턱 없음)는 **앱이 격자를 가졌는지**로 고른다 — 격자 출처 src = 요청 grid_src, 없으면 WALL_FRAME_GRID_SRC, 그것도 없으면
+    격자 질의가 있으면 saved·없으면 none 으로 친다. src 가 saved|manual|felt 면 지금 경로(wall_frame "saved", 기준점은 잡아 응답에만),
+    none|default 면 rot2(wall_frame "rot2"). 기준점을 못 잡으면 어느 쪽이든 지금 경로(rot2 로 가려던 것은 wall_frame "none").
+    응답 wall_frame_src = [출처, 어디서(query|env|grid|no_grid)]·wall_frame_check(격자가 있으면 [grid_check], 진단만)."""
+    m = mode()
+    if m is None:
+        return None, None, {}
+    tz, meta = frame_for(reader, jpeg, rgb, given)
+    if m != "hybrid":
+        return m, tz, meta
+    env = grid_src_env()
+    if grid_src:
+        src, why = grid_src, "query"
+    elif env:
+        src, why = env, "env"
+    else:
+        src, why = ("saved", "grid") if grid else ("none", "no_grid")
+    meta.update(wall_frame_mode="hybrid", wall_frame_src=[src, why])
+    if tz is not None and grid:
+        meta["wall_frame_check"] = grid_check(tz, grid)
+    if src in GRID_HAVE:
+        meta["wall_frame"] = "saved"
+        return None, None, meta
+    if tz is None:
+        meta["wall_frame"] = "none"
+        return None, None, meta
+    meta["wall_frame"] = "rot2"
+    return "rot2", tz, meta
 
 
 def parse_frame(s: str | dict | None) -> tf.TableFrame | None:

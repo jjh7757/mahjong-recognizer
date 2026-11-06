@@ -94,7 +94,7 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `LOCAL_SHADOW` | 기본 `0`(끔). `1` 이면 `/v2/seat`·`/v2/last3` 사진을 자체 모델로도 읽어 응답 `local`·서버 로그에 남김(`app/local_read.py`, 답에는 안 씀). 켜면 운영에서 넓은 판독이 느려지고 메모리가 늘어 평소엔 끈다 |
 | `RIVER_FRAME` | 기본 `1` — 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡아 마지막 패만 잘라 읽음. `0` 이면 강 크롭을 통째로 읽음 |
 | `RIVER_CONF` | 강 틀 검출 기준값, 기본 `0.04`(손패 사진으로 학습한 모델이라 강 패는 확신도가 낮다) |
-| `WALL_FRAME` | **실험, 기본 끔.** `axis`(또는 `1`) / `rot` / `rot2`(8b-3b 후보) / `hybrid`(8b-3c, **기본 켬 후보** — 앱 4번이 `grid_src` 를 보낸 뒤) — 자체 모델 판독(`/v2/localroles`·`/v2/localdora`·`/v2/locallast3`)을 탁자 기준점으로 자른다(아래 절) |
+| `WALL_FRAME` | **기본 `hybrid`(8b-4a, 변수가 없을 때).** 끄기는 `off`(또는 `0`·`none`·`false`·빈 값 — Windows `set WALL_FRAME=` 는 변수를 지워 기본값이 되므로 `off` 로). 실험 값 `axis`(또는 `1`) / `rot` / `rot2`(8b-3b 미채택) / `hybrid`(8b-3c 채택) — 자체 모델 판독(`/v2/localroles`·`/v2/localdora`·`/v2/locallast3`)을 탁자 기준점으로 자른다(아래 절) |
 | `WALL_FRAME_GRID_SRC` | 측정용. `WALL_FRAME=hybrid` 에서 요청에 `grid_src` 가 없을 때 쓸 격자 출처(`saved|manual|felt|none|default`) |
 
 ## 탁자 기준점 실험 옵션 `WALL_FRAME` (개선 계획 8b "할 일 3", 2026-11-06, 브랜치 `feat/table-frame`)
@@ -132,15 +132,16 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
   나눔 역할 모델에서 171245 모서리 白 울기 채우기 실패·171505 오독이 새로 생김. 회귀 prod 장면 553 → 599·unsafe 11 → 2, 시간 +0.065초.
 - **`hybrid`**(8b-3c, mahjong_calc metrics 표 1-108·1-109): 요청마다 **앱이 이 탁자 격자를 가졌는지**로 고른다 — 격자 출처 `grid_src` 가
   `saved|manual|felt`(저장·손으로 맞춤·펠트 자동 맞추기 성공)면 **지금 경로**(격자 그대로, WALL_FRAME 없음과 같은 답, 기준점은 잡아 응답에만,
-  `wall_frame: saved`), `none|default`(기본값 격자·자동 맞추기 실패)거나 격자 질의 자체가 없으면 **rot2**(`wall_frame: rot2`), 기준점을 못 잡으면
+  `wall_frame: saved`), `none|default`(기본값 격자·자동 맞추기 실패·갤러리 사진, 앱이 명시적으로 보냄)면 **rot2**(`wall_frame: rot2`), 기준점을 못 잡으면
   지금 경로(`wall_frame: none`). 문턱·색 없음. `grid_src` 는 `/v2/localroles`·`/v2/localdora`(격자 `x1·x2·y1·y2` 선택 인자도 받음)·`/v2/locallast3`
-  의 질의 인자이고, 없으면 `WALL_FRAME_GRID_SRC`, 그것도 없으면 격자 질의가 있으면 saved 로 친다. 응답 `wall_frame_src` = [출처, query|env|grid|no_grid],
+  의 질의 인자이고, 없으면 `WALL_FRAME_GRID_SRC`, 그것도 없으면 **saved**(8b-4a: 격자 질의가 없어도 — 옛 앱 답 무변경). 응답 `wall_frame_src` = [출처, query|env|grid|no_grid],
   `wall_frame_check` = 격자 가운데 칸 중심 ↔ 기준점 거리·θ(진단만). 서버 로그 `localroles …`·`localdora …` 줄 앞에 `wall_frame=`.
   격자 ↔ 기준점을 1u·3° 로 대조해 고르는 첫 설계는 측정 전에 버렸다(저장 격자 가운데 칸 중심이 기기 중심에서 거치마다 1~3u 어긋나고 사진 한 장
   θ 가 0.3~4.2° 흔들려 개발 saved 6/31).
   **판정(2026-11-06): 채택 — 기본 켬 후보.** 개발 32회 앱 흐름 장면 32/32 답 같음(경로 saved 32/32), 회귀 prod 세 변형 같음, 테스트 펴기 없이
-  158 → 191·색 바꾼 145 → 179(none → rot2)·펴기 189 = 189, 표시패 50장 같음, 시간 +0.020초. **주의:** 지금 앱은 `grid_src` 도 localdora 격자도 안
-  보내므로 이대로 켜면 localroles 는 saved, localdora 는 rot2 로 간다 — 앱 4번(`grid_src` 보내기) 뒤에 켠다. 운영 배포는 사용자 결정.
+  158 → 191·색 바꾼 145 → 179(none → rot2)·펴기 189 = 189, 표시패 50장 같음, 시간 +0.020초. **8b-4a(2026-11-07):** `grid_src` 가 없으면 격자 질의가 없어도 지금 경로로 바꾸고(옛 앱의 localdora 가 rot2 로 가던 위험 제거)
+  **기본값을 hybrid 로** — 개발 서버 단독(`grid_src` 없이) 끔 / 기본: 회귀 prod `orig` 26장 답 같음(패 421 = 421), 표시패 개발 20장 같음(전부 `cut: grid`).
+  앱 4a(`grid_src` 보내기, `none` 이면 강 끝 `sides=` 사진 전체)와의 앱 흐름 판정은 mahjong_calc metrics 표 1-111·1-112. 운영 배포는 사용자 결정.
 - **표시패**(`/v2/localdora`, axis·rot): 기준점이 있으면 앞면 후보·짝을 구역표 표시패 탐색 칸(`dora_search`) ∪ 왕패 칸(`dead_wall`, 네 변)에 가운데가
   드는 것만 남기고(`kept` = [남은 수, 전체]), 짝 패마다 바람개비 칸 `zone`(bottom/right/top/left/center). 손패와 표시패를 크롭으로 가르지는
   않는다(왕패 칸이 손패 띠와 겹친다 — 구분은 지금처럼 패산 옆 검사·짝 규칙·앱 몫).

@@ -32,9 +32,19 @@ MODES = ("axis", "rot", "rot2", "hybrid")
 ROT = ("rot", "rot2")  # 세워 자르는 모드(강 끝·자리 크롭)
 
 
+DEFAULT_MODE = "hybrid"  # 8b-4a: 환경 변수가 없으면 hybrid(grid_src 없음 = 지금 경로라 옛 앱 답 무변경, mahjong_calc metrics 표 1-111·1-112)
+OFF = ("", "0", "off", "none", "false")  # 끄기(기존 격자 경로만). Windows `set WALL_FRAME=` 는 변수를 지우므로 끌 때는 off 로.
+
+
 def mode() -> str | None:
-    """WALL_FRAME 환경 변수: axis | rot | rot2 | hybrid(1 은 axis 로 친다), 없거나 그 밖이면 None(기존 격자 경로)."""
-    v = os.environ.get("WALL_FRAME", "").strip().lower()
+    """WALL_FRAME 환경 변수: axis | rot | rot2 | hybrid(1 은 axis 로 친다). **없으면 hybrid**(8b-4a 기본 켬), off|0|none|false|빈 값이면
+    None(기존 격자 경로), 그 밖의 값도 None."""
+    v = os.environ.get("WALL_FRAME")
+    if v is None:
+        return DEFAULT_MODE
+    v = v.strip().lower()
+    if v in OFF:
+        return None
     return "axis" if v == "1" else v if v in MODES else None
 
 

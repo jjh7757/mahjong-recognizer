@@ -162,9 +162,12 @@ def test_in_dora_zone_and_reach():
 
 
 def test_mode_reads_env(monkeypatch):
-    for v, want in (("", None), ("0", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot"), ("rot2", "rot2"), ("Hybrid", "hybrid"), ("rot3", None)):
+    for v, want in (("", None), ("0", None), ("off", None), ("None", None), ("false", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot"),
+                    ("rot2", "rot2"), ("Hybrid", "hybrid"), ("rot3", None)):
         monkeypatch.setenv("WALL_FRAME", v)
         assert tl.mode() == want
+    monkeypatch.delenv("WALL_FRAME")  # 8b-4a: 없으면 hybrid(기본 켬)
+    assert tl.mode() == "hybrid"
 
 
 def test_parse_frame_round_trip():

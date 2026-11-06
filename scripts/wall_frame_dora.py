@@ -68,7 +68,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sets", default="dev,test,recolor")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--modes", default=",axis,rot", help="WALL_FRAME 값들(쉼표, 빈 값 = 없음) — 8b-3b 는 ',rot2'")
     a = ap.parse_args()
+    global MODES
+    MODES = a.modes.split(",")
     its = items(a.sets.split(","))
     field_names = {f"20261024_{p}" for p in ("122922", "124007", "125053", "130533", "131210", "132647", "133011", "133620", "134323", "135148",
                                               "135912", "140302", "140750", "140918", "143443")}

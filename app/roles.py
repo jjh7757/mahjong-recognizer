@@ -275,14 +275,15 @@ def frame_from_roles(rgb: np.ndarray, faces: list, roles: list[str], split: int,
 def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str = "hybrid", net: RoleNet | None = None,
                frame: tf.TableFrame | None = None) -> dict:
     """사진 전체 → 화료자 자리의 손패·울기(/v2/seat 모양) + 상자별 역할(roles: 원본 좌표 box, role, conf, in_seat).
-    WALL_FRAME(axis|rot, 개선 계획 8b)이 켜져 있으면 기준점(frame = 앱이 준 것, 없으면 사진에서 잡음)으로 자른다 — 응답에 wall_frame·frame
+    WALL_FRAME(axis|rot|rot2, 개선 계획 8b·8b-3b)이 켜져 있으면 기준점(frame = 앱이 준 것, 없으면 사진에서 잡음)으로 자른다 — 응답에 wall_frame·frame
     (또는 frame_error, 그때는 [grid] 로 지금처럼). 꺼져 있으면 frame 을 무시하고 지금과 같다."""
     with obb.session():
         out = _read_roles(reader, jpeg, side, grid, mode, net, frame)
-        _loose_outside(reader, jpeg, out)
+        ok = out.pop("_inside_ok", None)
+        _loose_outside(reader, jpeg, out, inside=ok if out.get("wall_frame") == "rot2" and out.get("cut") == "rot" else None)
         items, seeds = out.pop("_sig_items", None), out.pop("_role_seeds", None)
         if sig.ON and items is not None:  # 불확실성 신호(개선 계획 5단계): 답은 그대로, 값만 더한다
-            if (s := out.get("separate_tile")) and s.get("from") == "loose_outside":
+            if (s := out.get("separate_tile")) and s.get("from") in ("loose_outside", "loose_inside"):
                 items.append(("sep", lr.decode_rgb(jpeg), tuple(s["box"]), "any", s["tile"], 0, 0))
             out["signals"] = sig.collect(reader, items, seeds)
             out["ms"]["signals"] = out["signals"]["ms"]
@@ -290,10 +291,13 @@ def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode:
         return out
 
 
-def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
+def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict, inside: set | None = None) -> None:
     """자리 크롭 밖의 떼어 둔 화료패(2026-11-05, metrics 표 1-70 143104): 크롭 안에서 떼어 둔 패를 못 찾았고 손패 + 울기 × 3 = 13 이면,
     크롭 밖 상자 중 역할이 loose 이고 화료자 손패에서(가장 가까운 손패 중심까지) 패 높이 [LOOSE_REACH] 배 안인 것이 딱 하나면
-    그것을 원본 사진에서 읽어 떼어 둔 화료패로."""
+    그것을 원본 사진에서 읽어 떼어 둔 화료패로.
+    inside(WALL_FRAME=rot2, 8b-3b 후보 2) = 후보가 될 수 있는 크롭 상자 번호(틀에 안 쓰였고 홀로 놓인 것 — _read_roles 의 _inside_ok) — 주어지면
+    크롭 안의 loose 상자 중 그 번호인 것도 같은 조건(손패 가까이, 크롭 밖 것과 합쳐 딱 하나)으로 후보에 넣는다(넓어진 세운 크롭 안으로 들어온
+    떼어 둔 쯔모패, 표 1-105 143104)."""
     if not out.get("framed") or out.get("separate_tile") or len(out["tiles"]) + 3 * len(out["melds"]) != 13:
         return
     hand = [x["box"] for x in out["roles"] if x["in_seat"] and x["role"] == "hand"]
@@ -301,12 +305,13 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
         return
     th = float(np.median([max(b[2], b[3]) for b in hand]))
     cen = lambda b: np.array([b[0] + b[2] / 2, b[1] + b[3] / 2], float)
-    near = [x for x in out["roles"] if not x["in_seat"] and x["role"] == "loose"
+    near = [x for i, x in enumerate(out["roles"]) if (not x["in_seat"] or (inside is not None and i in inside)) and x["role"] == "loose"
             and min(np.linalg.norm(cen(x["box"]) - cen(h)) for h in hand) <= LOOSE_REACH * th]
     if len(near) != 1:
         return
     full = lr.decode_rgb(jpeg)  # _read_roles 가 디코딩한 것을 다시 쓴다
-    out["separate_tile"] = {**lr.tile_json(reader.read_any2(full, tuple(near[0]["box"]))), "box": near[0]["box"], "from": "loose_outside"}
+    out["separate_tile"] = {**lr.tile_json(reader.read_any2(full, tuple(near[0]["box"]))), "box": near[0]["box"],
+                            "from": "loose_inside" if near[0]["in_seat"] else "loose_outside"}
 
 
 def seat_grow_u(tz: tf.TableZones, side: str) -> float:
@@ -334,8 +339,8 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
             else:
                 grid, fmeta["grid"] = g, g
     zc = None
-    if wf == "rot" and tz is not None:
-        zc = tl.warp_rect(full, tz, "seat", side, grow_r0=seat_grow_u(tz, side))
+    if wf in tl.ROT and tz is not None:  # rot2(8b-3b 후보 1): 읽기 크롭은 이웃 자리와 3u 겹친 seat_read, 구역(채점·역할)은 seat 그대로
+        zc = tl.warp_rect(full, tz, "seat_read" if wf == "rot2" else "seat", side, grow_r0=seat_grow_u(tz, side))
         if zc is None:
             tz, fmeta["frame_error"] = None, "자리 구역이 사진 밖"
     if zc is not None:
@@ -412,6 +417,11 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
                              + ([("sep", rgb, got[0], "turned", sep[0], fr.tw, fr.th)] if not fr.separate and sep and len(got) == 1 else [])
                              + [(f"meld{i}", rgb, b, "meld", None if is_fill(b, t) else t[0], 0, 0) for i, m in enumerate(fr.melds) for b, t in zip(m, melds[i])])
         out["_role_seeds"] = seeds
+        # rot2 크롭 안 떼어 둔 패 후보(8b-3b 후보 2): 틀(손패·떼어 둔 패·울기)에 안 쓴 크롭 상자 중 홀로 놓인 것 — 표시패 짝과 같은 간격(tw×0.5,
+        # read_wall)으로 묶어 혼자인 것만(손패 뒤 탁자 위 표시패 짝 한 장이 손패 3배 거리 안에 걸리는 것을 막음, 개발 B·C·D k15·k26)
+        used = {tuple(b) for b in [*fr.hand, *([fr.separate] if fr.separate else []), *(x for m in fr.melds for x in m)]}
+        alone = {tuple(g[0]) for g in st.cluster([tuple(b) for b in faces], fr.tw * 0.5, fr.tw * 0.5) if len(g) == 1}
+        out["_inside_ok"] = {i for i, b in enumerate(faces) if tuple(b) in alone and tuple(b) not in used}
     out["counts"] = dict(Counter(seat_roles))
     out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "roles": round((t_role - t_det) * 1000), "read": lr._ms(t_role), "total": lr._ms(t0)}
     if wf:  # 기준점(축·회전 어느 쪽으로 잘랐는지는 wall_frame, 못 잡아 격자로 떨어졌으면 frame_error)

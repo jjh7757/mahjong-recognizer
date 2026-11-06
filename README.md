@@ -94,7 +94,7 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `LOCAL_SHADOW` | 기본 `0`(끔). `1` 이면 `/v2/seat`·`/v2/last3` 사진을 자체 모델로도 읽어 응답 `local`·서버 로그에 남김(`app/local_read.py`, 답에는 안 씀). 켜면 운영에서 넓은 판독이 느려지고 메모리가 늘어 평소엔 끈다 |
 | `RIVER_FRAME` | 기본 `1` — 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡아 마지막 패만 잘라 읽음. `0` 이면 강 크롭을 통째로 읽음 |
 | `RIVER_CONF` | 강 틀 검출 기준값, 기본 `0.04`(손패 사진으로 학습한 모델이라 강 패는 확신도가 낮다) |
-| `WALL_FRAME` | **실험, 기본 끔.** `axis`(또는 `1`) / `rot` — 자체 모델 판독(`/v2/localroles`·`/v2/localdora`·`/v2/locallast3`)을 탁자 기준점으로 자른다(아래 절) |
+| `WALL_FRAME` | **실험, 기본 끔.** `axis`(또는 `1`) / `rot` / `rot2`(8b-3b 후보) — 자체 모델 판독(`/v2/localroles`·`/v2/localdora`·`/v2/locallast3`)을 탁자 기준점으로 자른다(아래 절) |
 
 ## 탁자 기준점 실험 옵션 `WALL_FRAME` (개선 계획 8b "할 일 3", 2026-11-06, 브랜치 `feat/table-frame`)
 
@@ -121,12 +121,18 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
   표시패 = 가운데에서 max(왕패 칸 13u, 표시패 탐색 칸) 반폭 정사각형을 세운 그림에서 검출·패산 옆 검사·읽기. 크롭 상자는 원본 좌표로 되돌려
   응답한다. 역할 모델 토큰은 상자 네 점을 탁자 좌표(u)로 돌린 뒤 같은 식으로(`roles.tokens_frame` — θ = 0 이면 `tokens` 와 같은 값,
   테스트로 확인). 역할 모델은 거의 축 정렬된 사진으로 배웠으므로 **재학습 없이** 되는지 보는 것이 이 모드의 목적이다.
-- **표시패**(`/v2/localdora`): 기준점이 있으면 앞면 후보·짝을 구역표 표시패 탐색 칸(`dora_search`) ∪ 왕패 칸(`dead_wall`, 네 변)에 가운데가
+- **`rot2`**(8b-3b, rot 의 크롭 정의 손실 세 가지를 고친 후보 — mahjong_calc metrics 표 1-105 '다음 후보'): rot 과 같되
+  ① 자리 읽기 크롭은 구역표 `seat_read`(= `seat` 를 그 사람 왼쪽·이웃 자리 쪽으로 3u 넓힘, a ≥ −R − 3 — 바람개비 경계로 뻗은 손패 끝 장이
+  잘리지 않게, 어느 자리 패인지는 역할 모델이 가름; 채점·`zone_of` 의 구역은 `seat` 그대로), ② 크롭 안 `loose` 역할 상자도 틀에 안 쓰였고
+  홀로 놓였으면(표시패 짝과 같은 간격 tw×0.5 로 묶어 혼자) 크롭 밖 것과 같은 조건(손패에서 패 높이 3배 안, 합쳐 딱 하나)으로 떼어 둔 화료패
+  후보(`separate_tile.from = loose_inside`), ③ 표시패는 세워 자르지 않고 지금과 같은 사진 전체 검출(`detect_other`)에서 **패산 표시패 후보만**
+  구역으로 거르고 짝은 지금처럼 사진 전체에서 묶는다(`cut: whole`, 짝마다 `zone`). 강 끝(`sides=`)은 rot 과 같다.
+- **표시패**(`/v2/localdora`, axis·rot): 기준점이 있으면 앞면 후보·짝을 구역표 표시패 탐색 칸(`dora_search`) ∪ 왕패 칸(`dead_wall`, 네 변)에 가운데가
   드는 것만 남기고(`kept` = [남은 수, 전체]), 짝 패마다 바람개비 칸 `zone`(bottom/right/top/left/center). 손패와 표시패를 크롭으로 가르지는
   않는다(왕패 칸이 손패 띠와 겹친다 — 구분은 지금처럼 패산 옆 검사·짝 규칙·앱 몫).
 - **`/v2/locallast3?sides=right,top,left`**: `images` 에 사진 전체 한 장을 보내면 서버가 그 자리들의 강 끝을 자른다(`rot` = `river` 칸,
   `axis` = 기준점 격자, 끔·못 잡음 = 요청의 `x1·x2·y1·y2` 로 앱 `GridZones.lastZone` 과 같게). `sides` 가 없으면 지금처럼 앱이 자른 크롭들.
-- 확인: `python -X utf8 scripts/wall_frame_check.py [키 ...]` — mahjong_calc 의 사진 몇 장을 서버 코드로(HTTP 없이) 세 모드로 읽어 손패
+- 확인: `python -X utf8 scripts/wall_frame_check.py [--modes ,rot2] [키 ...]` — mahjong_calc 의 사진 몇 장을 서버 코드로(HTTP 없이) 모드마다 읽어 손패
   맞은 수·표시패·기준점(8b-1 결과와의 차이)·시간을 찍는다. 운영 배포는 판정(mahjong_calc docs/improvement_plan_1105.md 8b 합격 기준) 뒤.
 
 ## 로컬 실행

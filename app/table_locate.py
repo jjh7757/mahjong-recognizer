@@ -10,6 +10,9 @@
   axis = 기준점에서 지금 격자와 같은 뜻의 축 평행 x1·x2·y1·y2(가운데 칸 외접 상자, 1000 분율)와 리치봉 상자를 만들어 기존 경로에 그대로 —
          역할 모델·분류기 입력 분포 무변경([grid_from_frame]).
   rot  = 구역표의 회전 사각형을 그 자리 사람이 아래에 오게 세워 자른다([warp_zone], 축 평행 외접 상자 아님). 상자는 [ZoneCrop] 으로 원본 좌표로.
+  rot2 = rot 의 크롭 정의 손실 세 가지를 고친 후보(8b-3b, mahjong_calc metrics 표 1-105 '다음 후보'): ① 자리 읽기 크롭은 구역표 `seat_read`
+         (seat 를 이웃 자리 쪽으로 3u 겹침, 채점·역할 구역은 seat 그대로) ② 크롭 안 `loose` 역할도 떼어 둔 화료패 후보(roles._loose_near)
+         ③ 표시패는 세워 자르지 않고 사진 전체 검출(full_raw 공유) — 패산 표시패 후보만 dora_search ∪ dead_wall 로 거르고 짝은 지금처럼 전체에서.
 """
 from __future__ import annotations
 
@@ -21,11 +24,12 @@ import numpy as np
 
 from . import table_frame as tf
 
-MODES = ("axis", "rot")
+MODES = ("axis", "rot", "rot2")
+ROT = ("rot", "rot2")  # 세워 자르는 모드(강 끝·자리 크롭)
 
 
 def mode() -> str | None:
-    """WALL_FRAME 환경 변수: axis | rot(1 은 axis 로 친다), 없거나 그 밖이면 None(기존 격자 경로)."""
+    """WALL_FRAME 환경 변수: axis | rot | rot2(1 은 axis 로 친다), 없거나 그 밖이면 None(기존 격자 경로)."""
     v = os.environ.get("WALL_FRAME", "").strip().lower()
     return "axis" if v == "1" else v if v in MODES else None
 

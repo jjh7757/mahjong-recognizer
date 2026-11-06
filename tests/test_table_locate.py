@@ -162,7 +162,7 @@ def test_in_dora_zone_and_reach():
 
 
 def test_mode_reads_env(monkeypatch):
-    for v, want in (("", None), ("0", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot")):
+    for v, want in (("", None), ("0", None), ("1", "axis"), ("axis", "axis"), ("ROT", "rot"), ("rot2", "rot2"), ("rot3", None)):
         monkeypatch.setenv("WALL_FRAME", v)
         assert tl.mode() == want
 
@@ -220,7 +220,7 @@ def test_read_roles_wall_frame_shares_full_detection(monkeypatch):
     r, calls = _fake_reader(monkeypatch, faces, backs, W, H)
     jpeg = _jpeg(_photo(faces, (W, H)))
     grid = {"x1": 280, "x2": 745, "y1": 173, "y2": 713}
-    for m in ("", "axis", "rot"):
+    for m in ("", "axis", "rot", "rot2"):
         monkeypatch.setenv("WALL_FRAME", m)
         lr._decoded.clear()
         calls.clear()
@@ -229,7 +229,7 @@ def test_read_roles_wall_frame_shares_full_detection(monkeypatch):
         if not m:
             assert "frame" not in out and "wall_frame" not in out
             continue
-        assert out["wall_frame"] == m and out["cut"] == m and out["frame"]["source"] == "device", out.get("frame_error")
+        assert out["wall_frame"] == m and out["cut"] == ("rot" if m == "rot2" else m) and out["frame"]["source"] == "device", out.get("frame_error")
         assert math.hypot(out["frame"]["cx"] - 1000, out["frame"]["cy"] - 800) < 20 and out["ms"]["frame"] >= 0
         if m == "axis":
             assert out["grid"] != grid and out["grid"]["x1"] < 500 < out["grid"]["x2"]
@@ -237,6 +237,44 @@ def test_read_roles_wall_frame_shares_full_detection(monkeypatch):
         n = len(calls)
         d = r.read_wall(jpeg)
         assert len(calls) == n and d["wall_frame"] == m and d["frame"] == out["frame"]
+        assert d["cut"] == ("whole" if m == "rot2" else m)  # rot2 표시패는 세워 자르지 않고 사진 전체에서 후보만 구역으로
+
+
+def test_seat_read_overlaps_neighbor_by_3u_only_on_the_left():
+    """rot2 자리 읽기 크롭(구역표 seat_read) = seat 를 그 사람 왼쪽으로 3u 넓힌 것, 나머지 끝·바람개비 구역(zone_of)은 그대로(8b-3b 후보 1)."""
+    tz = tf.TableZones(tf.ZoneTable.load(), tf.TableFrame(1000.0, 800.0, 0.0, 40.0, 3.2, (2000.0, 1600.0)), 2000, 1600)
+    for side in tf.SIDES:
+        s, r = tz.bounds("seat", side), tz.bounds("seat_read", side)
+        assert r[0] == pytest.approx(s[0] - 3) and r[1:] == pytest.approx(s[1:])
+    assert tz.zone_of(1000 + 40 * (-tz.R - 1), 800 + 40 * (tz.R + 2)) == "left"  # 겹친 띠는 구역으로는 이웃 자리
+
+
+def test_loose_inside_crop_is_separate_candidate_only_when_given(monkeypatch):
+    """크롭 안 loose 상자: inside(후보가 될 수 있는 상자 번호)가 있으면 크롭 밖 loose 와 같은 조건으로 떼어 둔 패 후보(8b-3b 후보 2), 없으면 지금처럼 무시."""
+    hand = [{"box": [100 + 30 * i, 500, 28, 40], "role": "hand", "conf": 0.9, "in_seat": True} for i in range(13)]
+    loose = {"box": [200, 430, 28, 40], "role": "loose", "conf": 0.9, "in_seat": True}  # 손패 앞(가운데 쪽)에 놓인 쯔모패
+
+    def out():
+        return {"framed": True, "separate_tile": None, "tiles": [{}] * 13, "melds": [], "roles": [*hand, dict(loose)]}
+
+    class R:
+        def read_any2(self, rgb, b):
+            return ("7s", 0.9, "8s", 0.05)
+
+    monkeypatch.setattr(lr, "decode_rgb", lambda jpeg: np.zeros((800, 800, 3), np.uint8))
+    o = out()
+    roles._loose_outside(R(), b"", o)
+    assert o["separate_tile"] is None
+    o = out()
+    roles._loose_outside(R(), b"", o, inside={13})
+    assert o["separate_tile"]["tile"] == "7s" and o["separate_tile"]["from"] == "loose_inside"
+    o = out()
+    roles._loose_outside(R(), b"", o, inside=set())  # 틀에 썼거나 혼자가 아니면(_inside_ok 에 없음) 후보 아님
+    assert o["separate_tile"] is None
+    o = out()
+    o["roles"].append({"box": [500, 470, 28, 40], "role": "loose", "conf": 0.9, "in_seat": False})  # 크롭 밖 것과 합쳐 둘 → 안 고름
+    roles._loose_outside(R(), b"", o, inside={13})
+    assert o["separate_tile"] is None
 
 
 def test_read_roles_wall_frame_uses_given_frame_and_falls_back(monkeypatch):

@@ -756,7 +756,11 @@ class LocalReader:
         WALL_FRAME(개선 계획 8b): 기준점(frame = 앱이 준 것, 없으면 사진에서 — 자리 판독 검출을 localroles 와 나눠 씀)을 잡아 후보·짝을
         구역표 표시패 탐색 칸(dora_search) ∪ 왕패 칸(dead_wall, 네 변)에 드는 것만 남기고 짝마다 바람개비 칸(zone)을 단다. 손패/표시패 구분은
         지금처럼 검출·짝 규칙 몫(크롭으로 가르지 않음). rot 이면 그 둘레 정사각형을 θ 만큼 세워 자른 그림에서 검출·패산 옆 검사·읽기를 하고
-        상자는 원본 좌표로 돌려준다. 못 잡으면 frame_error 를 넣고 지금처럼."""
+        상자는 원본 좌표로 돌려준다. 못 잡으면 frame_error 를 넣고 지금처럼.
+        rot2(8b-3b 후보 3): 세워 자르지 않고 지금 경로와 같은 사진 전체 검출([detect_other])에서, 패산 표시패 후보만 dora_search ∪ dead_wall 로
+        거르고 탁자 위 짝은 지금처럼 사진 전체 앞면에서 묶는다(짝마다 zone) — 크롭 끝에 잘린 납작한 조각의 헛 짝(표 1-105 165614)과 13u 밖
+        진짜 짝(B·C·D k15·k26, 가운데에서 약 14u)을 둘 다 피한다. 자리 판독 검출(full_raw)을 나눠 쓰면 검출기가 바뀌어 짝 후보가 달라지므로
+        (개발 단위 확인에서 132239·134815 에 5z 낀 새 짝) 쓰지 않는다."""
         from . import table_locate as tl
 
         t0 = time.perf_counter()
@@ -765,7 +769,7 @@ class LocalReader:
         wf, tz, fmeta, zc = tl.mode(), None, {}, None
         if wf:
             tz, fmeta = tl.frame_for(self, jpeg, rgb, frame)
-            if tz is not None and wf == "rot":
+            if tz is not None and wf == "rot":  # rot2 는 세워 자르지 않음(아래 whole)
                 s = tl.dora_reach(tz)
                 zc = tl.warp_zone(rgb, tz, "bottom", (-s, s), (-s, s))
                 if zc is None:
@@ -773,16 +777,20 @@ class LocalReader:
         img = zc.rgb if zc is not None else rgb
         to_orig = (lambda b: zc.box_to_orig(b)[0]) if zc is not None else (lambda b: b)
         t_frame = time.perf_counter()
+        whole = wf == "rot2" and tz is not None  # 사진 전체(img = rgb), 후보만 구역으로
         faces = self.detect_other(img)
+        cands = faces
         if tz is not None:
             n_all = len(faces)
-            faces = [b for b in faces if tl.in_dora_zone(tz, to_orig(b))]
-            fmeta["kept"] = [len(faces), n_all]
+            cands = [b for b in faces if tl.in_dora_zone(tz, to_orig(b))]
+            if not whole:
+                faces = cands
+            fmeta["kept"] = [len(cands), n_all]
         t_det = time.perf_counter()
-        scored = sorted(((*wall_score(img, b), b) for b in faces), key=lambda c: -c[1])
+        scored = sorted(((*wall_score(img, b), b) for b in cands), key=lambda c: -c[1])
         top = scored[0] if scored and scored[0][0] else None
         t_rule = time.perf_counter()
-        out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces), "pairs": []}
+        out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(cands), "pairs": []}
         if top:
             tile, conf = self.read_small(img, top[2]) if max(top[2][2], top[2][3]) < SMALL_TILE else self.read_any(img, top[2])
             out.update(box=[round(v) for v in to_orig(top[2])], sides=top[0], conf=conf)
@@ -807,7 +815,7 @@ class LocalReader:
             out["ms"]["frame"] = round((t_frame - t_dec) * 1000)
             fmeta.pop("frame_ms", None)
             out.update(fmeta)
-            out["cut"] = "rot" if zc is not None else "axis" if tz is not None else "grid"
+            out["cut"] = "rot" if zc is not None else "whole" if whole else "axis" if tz is not None else "grid"
         out["rss_mb"] = rss_mb()
         return out
 
@@ -907,7 +915,7 @@ class LocalReader:
             fmeta.pop("frame_ms", None)
         t_frame = time.perf_counter()
         crops: list = []
-        if tz is not None and wf == "rot":
+        if tz is not None and wf in tl.ROT:
             for s in sides:
                 zc = tl.warp_rect(rgb, tz, "river", s)
                 crops.append(None if zc is None else zc.rgb)
@@ -930,7 +938,7 @@ class LocalReader:
         if wf:
             out["ms"]["frame"] = round((t_frame - t0) * 1000)
             out.update(fmeta)
-            out["cut"] = "rot" if tz is not None and wf == "rot" else "axis" if tz is not None else "grid"
+            out["cut"] = "rot" if tz is not None and wf in tl.ROT else "axis" if tz is not None else "grid"
         return out
 
     def read_rivers(self, jpegs: list[bytes]) -> dict:

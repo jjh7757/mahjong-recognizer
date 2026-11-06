@@ -90,7 +90,10 @@ def main() -> None:
     ap.add_argument("keys", nargs="*", default=DEFAULT)
     ap.add_argument("--out", default=str(Path(tempfile.gettempdir()) / "wall_frame_check.json"))
     ap.add_argument("--reps", type=int, default=1, help="시간 잴 때 모드를 번갈아 몇 번(답은 첫 번째, 시간은 중앙값)")
+    ap.add_argument("--modes", default=",axis,rot", help="WALL_FRAME 값들(쉼표, 빈 값 = 없음) — 8b-3b 는 ',rot2'")
     a = ap.parse_args()
+    global MODES
+    MODES = a.modes.split(",")
     ref = {}
     rp = APP / "experiments" / "zone_points" / "results" / "wall_frame.json"
     if rp.exists():

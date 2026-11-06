@@ -25,6 +25,8 @@ from . import local_read as lr
 from . import obb
 from . import seat as st
 from . import signals as sig
+from . import table_frame as tf
+from . import table_locate as tl
 
 # 역할 모델: 11칸(회전 상자 크기·기울기 + 뒷면 토큰, 라벨 수정 뒤 재학습, mahjong_calc metrics 표 1-78·1-79, 2026-11-05 사용자 "11칸 서버 코드 변경").
 # 예전 9칸 tile-roles.onnx(124654·125839 손패 끝 3장을 울기로 배운 라벨)는 되돌리기용으로 남김 — LOCAL_ROLE_MODEL 로 끼우면 tokens 가 입력 모양으로 9칸을 만든다.
@@ -75,6 +77,37 @@ def tokens(boxes: list, W: int, H: int, g: dict, side: str, feat: int = FEAT, pt
         u, v, swap = turn(((x + w / 2) / W - x1) / fw, ((y + h / 2) / H - y1) / fh, side)
         pw, ph, tilt = obb.tile_geom((x, y, w, h), p if rot else None)
         bw, bh = pw / W / fw, ph / H / fh
+        if swap:
+            bw, bh = bh, bw
+        row = [u, v, bw * 10, bh * 10, back, float(bw > bh * 1.15), u - su, v - sv, 1.0]
+        if rot:
+            t = np.radians(2 * tilt)
+            row += [float(np.sin(t)), float(np.cos(t))]
+        rows.append(row)
+    return np.array(rows, np.float32).reshape(-1, feat)
+
+
+def tokens_frame(boxes: list, tz: tf.TableZones, side: str, feat: int = FEAT, pts: list | None = None, backs: list | None = None) -> np.ndarray:
+    """[tokens] 와 같은 칸을 탁자 좌표(기준점, u)로(WALL_FRAME=rot, 개선 계획 8b). 가운데 칸 [−R, R]² 가 지금 격자의 x1~x2·y1~y2 자리,
+    리치봉 상자 가운데 = 기기 가운데(0, 0). 상자는 네 점(회전 상자, 없으면 축 상자 모서리)을 탁자 좌표로 돌린 뒤 같은 식으로 잰다 —
+    크기·기울기는 탁자 축 기준이라 사진이 θ 만큼 돌아가도 학습 때(거의 축 정렬)와 같은 값이 된다."""
+    R = tz.R
+    rot = feat == FEAT_ROT
+    su, sv, _ = turn(0.5, 0.5, side)
+    items = [(b, (pts[i] if pts else None), 0.0) for i, b in enumerate(boxes)]
+    if rot and backs:
+        items += [(b, p, 1.0) for b, p in backs]
+    rows = []
+    for (x, y, w, h), p, back in items:
+        corners = p if p is not None else [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        q = tl.frame_pts(tz, corners)
+        cx, cy = q.mean(0)
+        if rot:
+            pw, ph, tilt = obb.tile_geom(None, q)
+        else:
+            pw, ph, tilt = float(np.ptp(q[:, 0])), float(np.ptp(q[:, 1])), 0.0
+        u, v, swap = turn((cx + R) / (2 * R), (cy + R) / (2 * R), side)
+        bw, bh = pw / (2 * R), ph / (2 * R)
         if swap:
             bw, bh = bh, bw
         row = [u, v, bw * 10, bh * 10, back, float(bw > bh * 1.15), u - su, v - sv, 1.0]
@@ -239,10 +272,13 @@ def frame_from_roles(rgb: np.ndarray, faces: list, roles: list[str], split: int,
     return fr, added
 
 
-def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str = "hybrid", net: RoleNet | None = None) -> dict:
-    """사진 전체 → 화료자 자리의 손패·울기(/v2/seat 모양) + 상자별 역할(roles: 원본 좌표 box, role, conf, in_seat)."""
+def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str = "hybrid", net: RoleNet | None = None,
+               frame: tf.TableFrame | None = None) -> dict:
+    """사진 전체 → 화료자 자리의 손패·울기(/v2/seat 모양) + 상자별 역할(roles: 원본 좌표 box, role, conf, in_seat).
+    WALL_FRAME(axis|rot, 개선 계획 8b)이 켜져 있으면 기준점(frame = 앱이 준 것, 없으면 사진에서 잡음)으로 자른다 — 응답에 wall_frame·frame
+    (또는 frame_error, 그때는 [grid] 로 지금처럼). 꺼져 있으면 frame 을 무시하고 지금과 같다."""
     with obb.session():
-        out = _read_roles(reader, jpeg, side, grid, mode, net)
+        out = _read_roles(reader, jpeg, side, grid, mode, net, frame)
         _loose_outside(reader, jpeg, out)
         items, seeds = out.pop("_sig_items", None), out.pop("_role_seeds", None)
         if sig.ON and items is not None:  # 불확실성 신호(개선 계획 5단계): 답은 그대로, 값만 더한다
@@ -273,24 +309,53 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict) -> None:
     out["separate_tile"] = {**lr.tile_json(reader.read_any2(full, tuple(near[0]["box"]))), "box": near[0]["box"], "from": "loose_outside"}
 
 
-def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str, net: RoleNet | None) -> dict:
+def seat_grow_u(tz: tf.TableZones, side: str) -> float:
+    """[GROW](앱 seatReadGrow, 1000 분율)를 u 로: 아래·위 자리는 사진 높이, 오른쪽·왼쪽은 폭의 GROW/1000 — 지금 크롭과 같은 픽셀 폭."""
+    return GROW / 1000 * (tz.H if side in ("bottom", "top") else tz.W) / tz.frame.u
+
+
+def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode: str, net: RoleNet | None,
+                frame: tf.TableFrame | None = None) -> dict:
     t0 = time.perf_counter()
     net = net or role_net()
     full = lr.decode_rgb(jpeg)  # 같은 사진을 받은 /v2/localdora 와 디코딩을 나눈다(app/shared.py)
     im = Image.fromarray(full)
     W, H = im.size
     t_dec = time.perf_counter()
-    ctx = reader.detect_seat(full)  # 맥락용(작게 보이는 다른 자리 패)
-    crop_im, (x0, y0, cw, ch) = crop_seat(im, grid, side)
-    rgb = np.asarray(crop_im)
+    ctx = reader.detect_full(jpeg, full)  # 맥락용(작게 보이는 다른 자리 패) — 같은 사진이면 localdora·기준점 잡기와 한 번만(8단계 P1)
+    # 탁자 기준점(WALL_FRAME, 개선 계획 8b): axis = 기준점에서 만든 같은 뜻의 격자로 지금 경로, rot = 구역표 회전 사각형을 세워 자름
+    wf, tz, fmeta = tl.mode(), None, {}
+    if wf:
+        tz, fmeta = tl.frame_for(reader, jpeg, full, frame)
+        if tz is not None and wf == "axis":
+            g = tl.grid_from_frame(tz)
+            if g is None:
+                tz, fmeta["frame_error"] = None, "격자 선이 사진 밖"
+            else:
+                grid, fmeta["grid"] = g, g
+    zc = None
+    if wf == "rot" and tz is not None:
+        zc = tl.warp_rect(full, tz, "seat", side, grow_r0=seat_grow_u(tz, side))
+        if zc is None:
+            tz, fmeta["frame_error"] = None, "자리 구역이 사진 밖"
+    if zc is not None:
+        rgb = zc.rgb
+    else:
+        crop_im, (x0, y0, cw, ch) = crop_seat(im, grid, side)
+        rgb = np.asarray(crop_im)
     faces = reader.keep_seat(rgb, reader.detect_seat(rgb))
     t_det = time.perf_counter()
     rot = ROT_CW[side]
     faces_full, pts = [], []
     for b in faces:
+        p = _pts_of(rgb, b)
+        if zc is not None:
+            bb, q = zc.box_to_orig(b, p)
+            faces_full.append(bb)
+            pts.append(None if p is None else q)
+            continue
         x, y, w, h = unrotate(b, rot, cw, ch)
         faces_full.append((x + x0, y + y0, w, h))
-        p = _pts_of(rgb, b)
         pts.append(None if p is None else unrotate_pts(p, rot, cw, ch, x0, y0))
     # 크롭 상자 우선, 크롭과 겹치지 않는 전체 사진 상자를 맥락으로 더한다
     extra = [b for b in ctx if all(iou(b, f) < 0.3 for f in faces_full)]
@@ -299,17 +364,21 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
     backs: list = []
     if net.feat == FEAT_ROT:  # 뒷면 상자(패산·다른 자리 손패·안깡 양끝): 크롭 것 우선, 겹치지 않는 전체 사진 것
         for b, rc in obb.backs_of(rgb):
+            if zc is not None:
+                backs.append(zc.box_to_orig(b, obb.corners(rc)))
+                continue
             x, y, w, h = unrotate(b, rot, cw, ch)
             backs.append(((x + x0, y + y0, w, h), unrotate_pts(obb.corners(rc), rot, cw, ch, x0, y0)))
         backs += [(b, obb.corners(rc)) for b, rc in obb.backs_of(full) if all(iou(b, f) < 0.3 for f, _ in backs) and all(iou(b, f) < 0.3 for f in allb)]
     full_pred = getattr(net, "predict_full", None)
-    x_tok = tokens(allb, W, H, grid, side, net.feat, pts, backs)
+    x_tok = tokens_frame(allb, tz, side, net.feat, pts, backs) if zc is not None else tokens(allb, W, H, grid, side, net.feat, pts, backs)
     roles, confs, seeds = full_pred(x_tok) if full_pred else (*net.predict(x_tok), None)
     roles, confs = roles[: len(allb)], confs[: len(allb)]  # 뒷면 토큰의 역할은 버린다
     seeds = [s[: len(allb)] for s in seeds] if seeds else None
     seat_roles = roles[: len(faces)]
     t_role = time.perf_counter()
-    split = int(rgb.shape[1] * hand_frac(grid, side))
+    # 손패 칸 폭: 지금 격자는 선 사이 변(x1~x2), 탁자 좌표는 같은 뜻의 a = −R ~ R(자리 크롭은 a = −R 부터)
+    split = int(rgb.shape[1] * (min(1.0, zc.frac_a(tz.R)) if zc is not None else hand_frac(grid, side)))
     fr, added = frame_from_roles(rgb, faces, seat_roles, split, mode) if faces else (None, [])
     out = {"face_up": fr is not None or len(faces) >= lr.FACE_UP_MIN, "tiles": [], "separate_tile": None, "melds": [], "loose": [], "framed": fr is not None,
            "filled": len(added), "mode": mode, "roles": [{"box": [round(v) for v in b], "role": r, "conf": c, "in_seat": i < len(faces)} for i, (b, r, c) in enumerate(zip(allb, roles, confs))],
@@ -345,5 +414,9 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         out["_role_seeds"] = seeds
     out["counts"] = dict(Counter(seat_roles))
     out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "roles": round((t_role - t_det) * 1000), "read": lr._ms(t_role), "total": lr._ms(t0)}
+    if wf:  # 기준점(축·회전 어느 쪽으로 잘랐는지는 wall_frame, 못 잡아 격자로 떨어졌으면 frame_error)
+        out["ms"]["frame"] = fmeta.pop("frame_ms", 0)
+        out.update(fmeta)
+        out["cut"] = "rot" if zc is not None else "axis" if tz is not None else "grid"
     out["rss_mb"] = lr.rss_mb()
     return out

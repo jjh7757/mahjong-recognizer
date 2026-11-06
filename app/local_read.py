@@ -124,6 +124,31 @@ def river_frame(rgb: np.ndarray, boxes: list, height: tuple = LOCAL_SIDEWAYS_HEI
     return rv.RiverFrame(rows, len(boxes), [rv.sideways(b, th, own, height) and not _split_piece(b, faces, th) for b in own])
 
 
+LAST_ZONE_BAND = 0.6  # 앱 lastZoneBand
+ROT_CW = {"bottom": 0, "right": 90, "top": 180, "left": 270}
+
+
+def _round_half_up(v: float) -> int:
+    return int(np.floor(v + 0.5)) if v >= 0 else -int(np.floor(-v + 0.5))  # Dart round(0.5 은 0 에서 먼 쪽)
+
+
+def last_zone(g: dict, side: str, band: float = LAST_ZONE_BAND) -> tuple[int, int, int, int]:
+    """앱 GridZones.lastZone 과 같은 강 끝 상자 (ymin, xmin, ymax, xmax) 1000 분율: 가운데 칸 한가운데부터 그 자리 쪽 끝까지, 옆으로 band."""
+    x1, x2, y1, y2 = g["x1"], g["x2"], g["y1"], g["y2"]
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    hw, hh = _round_half_up((x2 - x1) * band / 2), _round_half_up((y2 - y1) * band / 2)
+    return {"bottom": (cy, cx - hw, y2, cx + hw), "top": (y1, cx - hw, cy, cx + hw),
+            "left": (cy - hh, x1, cy + hh, cx), "right": (cy - hh, cx, cy + hh, x2)}[side]
+
+
+def last_zone_crop(im: Image.Image, g: dict, side: str) -> Image.Image:
+    """[last_zone] 을 잘라 그 자리 방향으로 세운 것(roles.crop_seat 과 같은 돌리기)."""
+    W, H = im.size
+    ymin, xmin, ymax, xmax = last_zone(g, side)
+    out = im.crop((round(xmin * W / 1000), round(ymin * H / 1000), round(xmax * W / 1000), round(ymax * H / 1000)))
+    return out.rotate(-ROT_CW[side], expand=True) if ROT_CW[side] else out
+
+
 def _ms(t0: float) -> int:
     return round((time.perf_counter() - t0) * 1000)
 
@@ -530,6 +555,9 @@ class LocalReader:
         self.seat_model = seat_model if seat_model is not None and Path(seat_model).exists() else None
         self._lock = threading.Lock()
         self._det = self._cls = self._seat = None
+        # 사진 전체 자리 판독 검출(회전 상자 앞면·뒷면)을 같은 바이트면 한 번만(개선 계획 8단계 P1·8b): localroles 의 맥락 검출,
+        # WALL_FRAME 기준점 잡기(localroles·localdora·locallast3)가 나눠 쓴다. 판독기마다 따로(테스트의 가짜 검출기끼리 안 섞이게).
+        self._full = Shared(size=1, ttl=10.0)
 
     def _sessions(self):
         with self._lock:
@@ -582,6 +610,11 @@ class LocalReader:
         self._sessions()
         if self._seat is None:
             return self.detect(rgb)
+        res, backs, pairs, scores = self._seat_raw(rgb)
+        return obb.record(rgb, res, pairs, backs, scores)
+
+    def _seat_raw(self, rgb: np.ndarray) -> tuple[list, list, list, dict]:
+        """자리 판독 검출기 출력 해석: (앞면 [(축 상자, 회전 상자)], 뒷면 [(축 상자, 회전 상자)], 안깡 짝, 앞면 점수). 기록은 안 남김."""
         x, r, left, top = _letterbox(rgb)
         sess = self._seat
         out = self._run(lambda: sess.run(None, {sess.get_inputs()[0].name: x})[0][0])
@@ -590,6 +623,21 @@ class LocalReader:
         res = obb.slivers(obb.decode(out, r, left, top, W, H, scores=scores), W, H)
         backs = obb.decode(out, r, left, top, W, H, cls=1) if out.shape[0] >= 7 else []
         pairs = obb.kans(res, backs) if backs else []
+        return res, backs, pairs, scores
+
+    def full_raw(self, jpeg: bytes, rgb: np.ndarray) -> tuple[list, list, list, dict]:
+        """사진 전체(jpeg 를 decode_rgb 한 rgb)의 자리 판독 검출 — 같은 바이트면 한 번만(8단계 P1). 기록은 안 남김([detect_full] 이 남김).
+        자리 판독 검출기가 없으면 [detect] 의 축 상자를 (상자, None) 으로(뒷면·점수 없음)."""
+        self._sessions()
+        if self._seat is None:
+            return self._full.get(digest(jpeg), lambda: ([(b, None) for b in self.detect(rgb)], [], [], {}))
+        return self._full.get(digest(jpeg), lambda: self._seat_raw(rgb))
+
+    def detect_full(self, jpeg: bytes, rgb: np.ndarray) -> list:
+        """[detect_seat] 과 같은 답(사진 전체), 검출은 [full_raw] 로 나눠 쓴다. 회전 상자·뒷면 기록은 지금 obb.session 에 남긴다."""
+        res, backs, pairs, scores = self.full_raw(jpeg, rgb)
+        if self._seat is None:
+            return [b for b, _ in res]
         return obb.record(rgb, res, pairs, backs, scores)
 
     def detect_other(self, rgb: np.ndarray) -> list:
@@ -696,26 +744,47 @@ class LocalReader:
 
     # ------------------------------------------------------------ 판독
 
-    def read_wall(self, jpeg: bytes) -> dict:
+    def read_wall(self, jpeg: bytes, frame=None) -> dict:
         with obb.session():
-            return self._read_wall(jpeg)
+            return self._read_wall(jpeg, frame)
 
-    def _read_wall(self, jpeg: bytes) -> dict:
+    def _read_wall(self, jpeg: bytes, frame=None) -> dict:
         """테이블 전체 사진 → 패산에 뒤집어 둔 표시패 한 장. 옆에 패 뒷면이 가장 많이 붙은 앞면 패를 고른다.
         못 찾거나 확신이 낮으면 indicators 가 빈다(白 은 검출기가 자주 놓친다). 리치 화료의 표시패 짝은 다루지 않는다.
-        측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진)."""
+        측정: mahjong_calc metrics 표 1-34·1-35(리치 아닌 화료 9/9, 같은 매장 사진).
+        WALL_FRAME(개선 계획 8b): 기준점(frame = 앱이 준 것, 없으면 사진에서 — 자리 판독 검출을 localroles 와 나눠 씀)을 잡아 후보·짝을
+        구역표 표시패 탐색 칸(dora_search) ∪ 왕패 칸(dead_wall, 네 변)에 드는 것만 남기고 짝마다 바람개비 칸(zone)을 단다. 손패/표시패 구분은
+        지금처럼 검출·짝 규칙 몫(크롭으로 가르지 않음). rot 이면 그 둘레 정사각형을 θ 만큼 세워 자른 그림에서 검출·패산 옆 검사·읽기를 하고
+        상자는 원본 좌표로 돌려준다. 못 잡으면 frame_error 를 넣고 지금처럼."""
+        from . import table_locate as tl
+
         t0 = time.perf_counter()
         rgb = decode_rgb(jpeg)
         t_dec = time.perf_counter()
-        faces = self.detect_other(rgb)
+        wf, tz, fmeta, zc = tl.mode(), None, {}, None
+        if wf:
+            tz, fmeta = tl.frame_for(self, jpeg, rgb, frame)
+            if tz is not None and wf == "rot":
+                s = tl.dora_reach(tz)
+                zc = tl.warp_zone(rgb, tz, "bottom", (-s, s), (-s, s))
+                if zc is None:
+                    tz, fmeta["frame_error"] = None, "표시패 구역이 사진 밖"
+        img = zc.rgb if zc is not None else rgb
+        to_orig = (lambda b: zc.box_to_orig(b)[0]) if zc is not None else (lambda b: b)
+        t_frame = time.perf_counter()
+        faces = self.detect_other(img)
+        if tz is not None:
+            n_all = len(faces)
+            faces = [b for b in faces if tl.in_dora_zone(tz, to_orig(b))]
+            fmeta["kept"] = [len(faces), n_all]
         t_det = time.perf_counter()
-        scored = sorted(((*wall_score(rgb, b), b) for b in faces), key=lambda c: -c[1])
+        scored = sorted(((*wall_score(img, b), b) for b in faces), key=lambda c: -c[1])
         top = scored[0] if scored and scored[0][0] else None
         t_rule = time.perf_counter()
         out = {"indicators": [], "box": None, "sides": 0, "conf": 0.0, "faces": len(faces), "pairs": []}
         if top:
-            tile, conf = self.read_small(rgb, top[2]) if max(top[2][2], top[2][3]) < SMALL_TILE else self.read_any(rgb, top[2])
-            out.update(box=list(top[2]), sides=top[0], conf=conf)
+            tile, conf = self.read_small(img, top[2]) if max(top[2][2], top[2][3]) < SMALL_TILE else self.read_any(img, top[2])
+            out.update(box=[round(v) for v in to_orig(top[2])], sides=top[0], conf=conf)
             if conf >= WALL_CONF:
                 out["indicators"] = [{"tile": tile, "conf": conf}]
         tw = statistics.median(min(f[2], f[3]) for f in faces) if faces else 1
@@ -724,10 +793,20 @@ class LocalReader:
             if len(group) == 2:
                 # 비스듬히 내놓은 짝은 0·90° 로는 틀리게 읽힌다(170105: 3p·6z 0.58·0.33 → 돌려 읽으면 5p·5s 0.98). 15° 단위로 돌려 읽는다.
                 # 상자(픽셀)도 같이 돌려줘 앱이 격자 구역(자리 띠·강·리치봉)으로 짝의 자리를 가린다(mahjong_calc metrics 표 1-54).
-                read = [self.read_turned(rgb, b, tw, th) for b in group]
-                out["pairs"].append([{"tile": t, "conf": c, "box": [round(v) for v in b]} for (t, c), b in zip(read, group)])
+                read = [self.read_turned(img, b, tw, th) for b in group]
+                pair = [{"tile": t, "conf": c, "box": [round(v) for v in to_orig(b)]} for (t, c), b in zip(read, group)]
+                if tz is not None:  # 기준점이 있으면 짝마다 바람개비 칸(앱이 격자 대신 쓸 수 있게)
+                    for p in pair:
+                        x, y, w, h = p["box"]
+                        p["zone"] = tz.zone_of(x + w / 2, y + h / 2)
+                out["pairs"].append(pair)
         out["size"] = [rgb.shape[1], rgb.shape[0]]
-        out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_dec) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
+        out["ms"] = {"decode": round((t_dec - t0) * 1000), "detect": round((t_det - t_frame) * 1000), "rules": round((t_rule - t_det) * 1000), "read": _ms(t_rule), "total": _ms(t0)}
+        if wf:
+            out["ms"]["frame"] = round((t_frame - t_dec) * 1000)
+            fmeta.pop("frame_ms", None)
+            out.update(fmeta)
+            out["cut"] = "rot" if zc is not None else "axis" if tz is not None else "grid"
         out["rss_mb"] = rss_mb()
         return out
 
@@ -808,6 +887,50 @@ class LocalReader:
             tile, conf = self.read_any(rgb, fr.last)
             rivers.append({"last_tile": {"tile": tile, "conf": conf}, "tile_count": fr.count, "sideways": [i for i, s in enumerate(fr.sideways) if s]})
         return {"rivers": rivers, "method": "frame", "ms": {"total": _ms(t0)}, "rss_mb": rss_mb()}
+
+    def read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None = None, frame=None) -> dict:
+        """사진 전체 + 자리들 → [read_rivers_app] 과 같은 모양(개선 계획 8b, 앱이 강 끝 크롭을 안 보내는 길). 강 끝 크롭은
+        WALL_FRAME=rot 이면 구역표 강 칸(river)을 세워 자르고, axis 면 기준점에서 만든 격자로, 꺼져 있거나 기준점을 못 잡으면 [grid] 로
+        앱 GridZones.lastZone 과 같게 자른다. 격자도 없으면 강이 다 빈다(frame_error)."""
+        with obb.session():
+            return self._read_rivers_full(jpeg, sides, grid, frame)
+
+    def _read_rivers_full(self, jpeg: bytes, sides: list[str], grid: dict | None, frame) -> dict:
+        from . import table_locate as tl
+
+        t0 = time.perf_counter()
+        rgb = decode_rgb(jpeg)
+        wf, tz, fmeta = tl.mode(), None, {}
+        if wf:
+            tz, fmeta = tl.frame_for(self, jpeg, rgb, frame)
+            fmeta.pop("frame_ms", None)
+        t_frame = time.perf_counter()
+        crops: list = []
+        if tz is not None and wf == "rot":
+            for s in sides:
+                zc = tl.warp_rect(rgb, tz, "river", s)
+                crops.append(None if zc is None else zc.rgb)
+        else:
+            g = tl.grid_from_frame(tz) if tz is not None else None
+            if tz is not None and g is None:
+                fmeta["frame_error"], tz = "격자 선이 사진 밖", None
+            g = g or grid
+            im = Image.fromarray(rgb)
+            crops = [None if g is None else np.asarray(last_zone_crop(im, g, s)) for s in sides]
+        rivers = []
+        for c in crops:
+            fr = river_frame(c, self.detect_other(c)) if c is not None and c.size else None
+            if fr is None:
+                rivers.append({"last_tile": None, "tile_count": 0, "sideways": []})
+                continue
+            tile, conf = self.read_any(c, fr.last)
+            rivers.append({"last_tile": {"tile": tile, "conf": conf}, "tile_count": fr.count, "sideways": [i for i, s in enumerate(fr.sideways) if s]})
+        out = {"rivers": rivers, "method": "frame", "sides": list(sides), "ms": {"total": _ms(t0)}, "rss_mb": rss_mb()}
+        if wf:
+            out["ms"]["frame"] = round((t_frame - t0) * 1000)
+            out.update(fmeta)
+            out["cut"] = "rot" if tz is not None and wf == "rot" else "axis" if tz is not None else "grid"
+        return out
 
     def read_rivers(self, jpegs: list[bytes]) -> dict:
         """강 크롭들(각 자리 쪽으로 세운 것, 보낸 순서) → rivers[{tile, conf, count}|None], 시간."""

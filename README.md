@@ -94,6 +94,40 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | `LOCAL_SHADOW` | 기본 `0`(끔). `1` 이면 `/v2/seat`·`/v2/last3` 사진을 자체 모델로도 읽어 응답 `local`·서버 로그에 남김(`app/local_read.py`, 답에는 안 씀). 켜면 운영에서 넓은 판독이 느려지고 메모리가 늘어 평소엔 끈다 |
 | `RIVER_FRAME` | 기본 `1` — 강 끝(/v2/last3)의 강 틀을 YOLO11 검출로 잡아 마지막 패만 잘라 읽음. `0` 이면 강 크롭을 통째로 읽음 |
 | `RIVER_CONF` | 강 틀 검출 기준값, 기본 `0.04`(손패 사진으로 학습한 모델이라 강 패는 확신도가 낮다) |
+| `WALL_FRAME` | **실험, 기본 끔.** `axis`(또는 `1`) / `rot` — 자체 모델 판독(`/v2/localroles`·`/v2/localdora`·`/v2/locallast3`)을 탁자 기준점으로 자른다(아래 절) |
+
+## 탁자 기준점 실험 옵션 `WALL_FRAME` (개선 계획 8b "할 일 3", 2026-11-06, 브랜치 `feat/table-frame`)
+
+앱 격자(사진 좌표 선 4개 x1·x2·y1·y2)는 펠트 색·기기 크기·카메라 각도에 기대 탁자가 바뀌면 깨진다. 8b 는 기준점을 마작에 둔다:
+**가운데 기기 가운데·방향 θ·패 한 장 짧은 변 u·기기 반폭 D**(`app/table_frame.TableFrame`)와 **패 단위 구역표**(`app/assets/table_frame_zones.json`).
+꺼져 있으면(기본) 응답·답이 지금과 같고, 요청의 `frame=` 도 무시한다.
+
+- **구역표·로더** `app/table_frame.py` = mahjong_calc `experiments/zone_points/table_frame.py`(8b-2)를 로직 그대로 옮긴 것(표준 라이브러리만).
+  구역표는 앱 `assets/table_frame/zones.json` 복사본이고 앱 `lib/table/table_frame.dart` 와 같은 예제(`tests/fixtures/table_frame.json`)로 같은
+  상자를 낸다 — `tests/test_table_frame.py` 가 예제 통과 + (앱 저장소가 있으면, `MAHJONG_CALC_REPO`) 두 파일이 앱 것과 같은지 본다.
+  **구역표를 고치면 앱 저장소에서 고치고 여기로 복사한다.**
+- **기준점 잡기** `app/table_locate.py` = mahjong_calc `experiments/zone_points/wall_frame.py`(8b-1, metrics 표 1-101)의 기기·패산 찾기를 그대로.
+  화료 사진 = 가운데 기기(앞면 패 무리 안 빈 정사각형), 못 찾으면 패산(눕힌 뒷면 사각형, 배패 때 첫 프레임용). 색은 안 쓴다.
+  입력은 사진 전체를 자리 판독 검출기(회전 상자 8회차)로 **한 번** 검출한 앞면·뒷면 — `LocalReader.full_raw` 가 같은 사진 바이트면 한 요청에서
+  계산한 것을 10초 동안 다른 요청(localroles 맥락 검출·localdora·locallast3 기준점)에 나눠 준다(8단계 P1, 판독기마다 따로).
+  요청에 `frame=`(`TableFrame.to_json` JSON, 다른 크기 사진에서 잰 것이면 가로 비로 옮겨 씀)이 오면 잡지 않고 그대로 쓴다(앱이 배패 때 잡은
+  패산 기준점을 보내는 길). 응답에 `wall_frame`(모드)·`frame`·`frame_info`(source·기기 점수·패산 줄 수)·`cut`(rot | axis | grid)·`ms.frame`.
+  못 잡으면(상자 부족·기기·패산 없음·가운데가 사진 밖·구역이 사진 밖) `frame_error` 를 넣고 **지금 격자 경로로**(`cut: grid`, 답이 비지 않게).
+- **`axis`** — 기준점에서 지금 격자와 같은 뜻의 선을 만든다: x1·x2·y1·y2 = 가운데 칸(반폭 R = D + 6u, θ 로 돈 정사각형)의 축 평행 외접 상자,
+  sticks = 리치봉 상자(기기 + 0.5u)의 외접 상자(응답 `grid`). 그다음은 지금 코드 그대로(`crop_seat`·`hand_frac`·`tokens`) — 역할 모델·분류기
+  입력 분포는 안 바뀐다. localdora 는 후보·짝을 거르기만, locallast3(사진 전체 길)은 그 격자의 `lastZone`.
+- **`rot`** — 구역표의 회전 사각형을 그 자리 사람이 아래에 오게 θ 만큼 세워 자른다(`table_locate.warp_zone`, 픽셀 크기 그대로, 사진이 안 닿는 끝은
+  잘라 냄). 자리 = `seat` 칸(가운데 쪽으로 seatReadGrow 40/1000 과 같은 픽셀만큼 넓힘), 손패 칸 폭 = a ∈ [−R, R], 강 끝 = `river` 칸,
+  표시패 = 가운데에서 max(왕패 칸 13u, 표시패 탐색 칸) 반폭 정사각형을 세운 그림에서 검출·패산 옆 검사·읽기. 크롭 상자는 원본 좌표로 되돌려
+  응답한다. 역할 모델 토큰은 상자 네 점을 탁자 좌표(u)로 돌린 뒤 같은 식으로(`roles.tokens_frame` — θ = 0 이면 `tokens` 와 같은 값,
+  테스트로 확인). 역할 모델은 거의 축 정렬된 사진으로 배웠으므로 **재학습 없이** 되는지 보는 것이 이 모드의 목적이다.
+- **표시패**(`/v2/localdora`): 기준점이 있으면 앞면 후보·짝을 구역표 표시패 탐색 칸(`dora_search`) ∪ 왕패 칸(`dead_wall`, 네 변)에 가운데가
+  드는 것만 남기고(`kept` = [남은 수, 전체]), 짝 패마다 바람개비 칸 `zone`(bottom/right/top/left/center). 손패와 표시패를 크롭으로 가르지는
+  않는다(왕패 칸이 손패 띠와 겹친다 — 구분은 지금처럼 패산 옆 검사·짝 규칙·앱 몫).
+- **`/v2/locallast3?sides=right,top,left`**: `images` 에 사진 전체 한 장을 보내면 서버가 그 자리들의 강 끝을 자른다(`rot` = `river` 칸,
+  `axis` = 기준점 격자, 끔·못 잡음 = 요청의 `x1·x2·y1·y2` 로 앱 `GridZones.lastZone` 과 같게). `sides` 가 없으면 지금처럼 앱이 자른 크롭들.
+- 확인: `python -X utf8 scripts/wall_frame_check.py [키 ...]` — mahjong_calc 의 사진 몇 장을 서버 코드로(HTTP 없이) 세 모드로 읽어 손패
+  맞은 수·표시패·기준점(8b-1 결과와의 차이)·시간을 찍는다. 운영 배포는 판정(mahjong_calc docs/improvement_plan_1105.md 8b 합격 기준) 뒤.
 
 ## 로컬 실행
 

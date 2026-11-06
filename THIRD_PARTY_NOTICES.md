@@ -3,7 +3,7 @@
 This server (mahjong-recognizer) is licensed under the GNU Affero General Public License v3.0 (see `LICENSE`).
 It is a non-commercial project. The components below are included or used as described.
 
-## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-obb-r8.onnx`, `app/assets/tile-cls-mnv3s.onnx`, `app/assets/tile-roles.onnx`
+## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-obb-r8.onnx`, `app/assets/tile-cls-mnv3s.onnx`, `app/assets/tile-cls-mnv3s-v2.onnx`, `app/assets/tile-cls-alt-v2.onnx`, `app/assets/tile-roles.onnx`
 
 Used by the local (Gemini-free) reads in `app/local_read.py`, `app/obb.py` and `app/roles.py`. Run with onnxruntime.
 
@@ -14,6 +14,8 @@ Used by the local (Gemini-free) reads in `app/local_read.py`, `app/obb.py` and `
 - `tile-roles.onnx`: a small set Transformer trained by this project (synthetic layouts + its own table photos) that labels
   each detected tile box with a role (hand, meld, river, wall, pair, loose).
 - `tile-cls-mnv3s.onnx`: torchvision MobileNetV3 Small (ImageNet weights, BSD-3-Clause code) fine-tuned by this project.
+- `tile-cls-mnv3s-v2.onnx`, `tile-cls-alt-v2.onnx`: the same architecture, first trained on synthetic table-scene crops made
+  from this project's own tile photos, then fine-tuned as above (two seeds; the second one feeds an uncertainty signal).
 
 ## Tile detection model — `app/assets/mahjong-yolo11s.onnx`
 

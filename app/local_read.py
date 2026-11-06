@@ -37,9 +37,10 @@ DET_MODEL = Path(os.environ.get("LOCAL_DET_MODEL") or Path(__file__).parent / "a
 OTHER_DET = os.environ.get("LOCAL_OTHER_DET", "")
 SEAT_MODEL = Path(os.environ.get("LOCAL_SEAT_MODEL") or Path(__file__).parent / "assets" / "tile-obb-r8.onnx")
 ROT_WHITE = os.environ.get("LOCAL_ROT_WHITE", "1") == "1"  # 자리 판독 흰 비율을 회전 상자 안에서(metrics 표 1-73, 2026-11-05 켬)
-CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s.onnx")
+# 7-2a(2026-11-06, mahjong_calc metrics 표 1-99·1-100): v2 = 합성 장면 크롭 사전학습 + 같은 미세 조정(씨드 10). 옛 tile-cls-mnv3s.onnx 는 env 로 되돌릴 때 쓰려고 남김.
+CLS_MODEL = Path(os.environ.get("LOCAL_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-mnv3s-v2.onnx")
 # 두 번째 분류기(불확실성 신호 S3, 개선 계획 5단계): 같은 학습 묶음·다른 씨드. 답에는 안 쓴다. 파일이 없으면 S3 를 안 낸다.
-ALT_CLS_MODEL = Path(os.environ.get("LOCAL_ALT_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-alt.onnx")
+ALT_CLS_MODEL = Path(os.environ.get("LOCAL_ALT_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-alt-v2.onnx")  # v2 = 같은 설정 씨드 11
 CLASSES = [f"{n}{s}" for s in "mps" for n in range(1, 10)] + ["0m", "0p", "0s"] + [f"{n}z" for n in range(1, 8)]
 IMG = 1280
 CONF, IOU = 0.25, 0.7

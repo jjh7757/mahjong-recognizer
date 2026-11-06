@@ -14,8 +14,9 @@
          (seat 를 이웃 자리 쪽으로 3u 겹침, 채점·역할 구역은 seat 그대로) ② 크롭 안 `loose` 역할도 떼어 둔 화료패 후보(roles._loose_near)
          ③ 표시패는 세워 자르지 않고 사진 전체 검출(full_raw 공유) — 패산 표시패 후보만 dora_search ∪ dead_wall 로 거르고 짝은 지금처럼 전체에서.
   hybrid = 요청마다 고른다(8b-3c, mahjong_calc metrics 표 1-108): 앱이 이 탁자 격자를 가졌으면(grid_src=saved|manual|felt) 지금 경로
-         (격자 그대로, WALL_FRAME 없음과 같은 답 = wall_frame "saved", 기준점은 잡아 응답에만), 기본값 격자·자동 맞추기 실패(none|default)
-         이거나 격자 질의가 없으면 rot2("rot2"). 기준점을 못 잡으면 지금 경로("none"). 문턱·색 없음. 측정용 강제값 WALL_FRAME_GRID_SRC.
+         (격자 그대로, WALL_FRAME 없음과 같은 답 = wall_frame "saved", 기준점은 잡아 응답에만), 기본값 격자·자동 맞추기 실패·갤러리 사진
+         (앱이 명시적으로 grid_src=none|default)이면 rot2("rot2"). **grid_src 가 없으면(옛 앱) 격자 질의가 없어도 지금 경로**(8b-4a, 답
+         무변경 보장). 기준점을 못 잡으면 지금 경로("none"). 문턱·색 없음. 측정용 강제값 WALL_FRAME_GRID_SRC.
 """
 from __future__ import annotations
 
@@ -296,7 +297,7 @@ def route(reader, jpeg: bytes, rgb: np.ndarray, given: tf.TableFrame | None = No
     """요청 하나가 실제로 탈 경로 (모드, 구역, 응답에 더할 값). 모드 None = 지금 격자 경로(구역도 None).
     WALL_FRAME 이 axis|rot|rot2 면 그 모드 + [frame_for] 그대로.
     hybrid(8b-3c, 문턱 없음)는 **앱이 격자를 가졌는지**로 고른다 — 격자 출처 src = 요청 grid_src, 없으면 WALL_FRAME_GRID_SRC, 그것도 없으면
-    격자 질의가 있으면 saved·없으면 none 으로 친다. src 가 saved|manual|felt 면 지금 경로(wall_frame "saved", 기준점은 잡아 응답에만),
+    saved 로 친다(8b-4a: 격자 질의가 없어도 — 옛 앱의 localdora 는 격자를 안 보내므로, 명시적 none|default 만 rot2). src 가 saved|manual|felt 면 지금 경로(wall_frame "saved", 기준점은 잡아 응답에만),
     none|default 면 rot2(wall_frame "rot2"). 기준점을 못 잡으면 어느 쪽이든 지금 경로(rot2 로 가려던 것은 wall_frame "none").
     응답 wall_frame_src = [출처, 어디서(query|env|grid|no_grid)]·wall_frame_check(격자가 있으면 [grid_check], 진단만)."""
     m = mode()
@@ -310,8 +311,8 @@ def route(reader, jpeg: bytes, rgb: np.ndarray, given: tf.TableFrame | None = No
         src, why = grid_src, "query"
     elif env:
         src, why = env, "env"
-    else:
-        src, why = ("saved", "grid") if grid else ("none", "no_grid")
+    else:  # 8b-4a: grid_src 없음 = 출처를 모르는 옛 앱 → 격자 유무와 상관없이 지금 경로(답 무변경)
+        src, why = "saved", ("grid" if grid else "no_grid")
     meta.update(wall_frame_mode="hybrid", wall_frame_src=[src, why])
     if tz is not None and grid:
         meta["wall_frame_check"] = grid_check(tz, grid)

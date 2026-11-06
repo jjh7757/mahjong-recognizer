@@ -573,7 +573,7 @@ async def observe_local_dora(image: UploadFile = File(...), x_api_key: str | Non
                              grid_src: str | None = Query(None)) -> dict:
     """테이블 전체 사진 → 패산에 뒤집어 둔 표시패(자체 모델, Gemini 없음). 찾지 못하면 indicators 가 빈다.
     WALL_FRAME(실험, 개선 계획 8b)이면 탁자 기준점(frame= 또는 사진에서)으로 후보를 표시패 칸에 든 것만, 짝에 zone.
-    WALL_FRAME=hybrid(8b-3c)는 격자 출처 grid_src(saved|manual|felt → 지금 경로, none|default → rot2, 없으면 격자 x1·x2·y1·y2 가 있는지)로 고른다."""
+    WALL_FRAME=hybrid(8b-3c)는 격자 출처 grid_src(saved|manual|felt → 지금 경로, none|default → rot2, 없으면 지금 경로 — 8b-4a)로 고른다. 격자 x1·x2·y1·y2 는 진단(wall_frame_check)에만 쓴다."""
     grid = None
     if None not in (x1, x2, y1, y2):
         if not (x1 < x2 and y1 < y2):

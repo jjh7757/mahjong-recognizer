@@ -761,7 +761,7 @@ class LocalReader:
         거르고 탁자 위 짝은 지금처럼 사진 전체 앞면에서 묶는다(짝마다 zone) — 크롭 끝에 잘린 납작한 조각의 헛 짝(표 1-105 165614)과 13u 밖
         진짜 짝(B·C·D k15·k26, 가운데에서 약 14u)을 둘 다 피한다. 자리 판독 검출(full_raw)을 나눠 쓰면 검출기가 바뀌어 짝 후보가 달라지므로
         (개발 단위 확인에서 132239·134815 에 5z 낀 새 짝) 쓰지 않는다.
-        hybrid(8b-3c): 격자 출처 grid_src(없으면 WALL_FRAME_GRID_SRC, 그것도 없으면 [grid] 가 있으면 saved·없으면 none)가 saved|manual|felt
+        hybrid(8b-3c): 격자 출처 grid_src(없으면 WALL_FRAME_GRID_SRC, 그것도 없으면 saved — 8b-4a)가 saved|manual|felt
         면 지금 경로, none|default 면 rot2(table_locate.route)."""
         from . import table_locate as tl
 
@@ -912,7 +912,7 @@ class LocalReader:
         t0 = time.perf_counter()
         rgb = decode_rgb(jpeg)
         wf_on = tl.mode() is not None
-        wf, tz, fmeta = tl.route(self, jpeg, rgb, frame, grid, grid_src)  # hybrid: 격자를 가졌으면 지금 경로, 아니면(격자 없으면) rot2
+        wf, tz, fmeta = tl.route(self, jpeg, rgb, frame, grid, grid_src)  # hybrid: 격자를 가졌거나 출처 모름이면 지금 경로, 명시적 none 이면 rot2
         fmeta.pop("frame_ms", None)
         t_frame = time.perf_counter()
         crops: list = []

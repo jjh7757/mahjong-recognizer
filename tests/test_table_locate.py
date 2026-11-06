@@ -348,8 +348,11 @@ GOOD = {"x1": 280, "x2": 720, "y1": 173, "y2": 827}
     (None, "none", GOOD, "rot2", ["none", "env"]),
     ("none", "saved", GOOD, "rot2", ["none", "query"]),  # 요청이 env 보다 먼저
     (None, "", GOOD, "saved", ["saved", "grid"]),  # grid_src 없이 격자만(지금 앱) → 지금 경로
-    (None, "", None, "rot2", ["none", "no_grid"]),  # 격자 질의 자체가 없음 → rot2
-    (None, "bogus", None, "rot2", ["none", "no_grid"]),  # 모르는 env 는 무시
+    (None, "", None, "saved", ["saved", "no_grid"]),  # 8b-4a: 격자 질의도 grid_src 도 없음(옛 앱 localdora) → 지금 경로
+    (None, "bogus", None, "saved", ["saved", "no_grid"]),  # 모르는 env 는 무시
+    ("none", "", None, "rot2", ["none", "query"]),  # 격자 없이 명시적 none(갤러리 사진) → rot2
+    ("default", "saved", None, "rot2", ["default", "query"]),  # 명시적 default 가 env saved 보다 먼저
+    ("felt", "none", None, "saved", ["felt", "query"]),  # 명시적 felt 가 env none 보다 먼저
 ])
 def test_route_hybrid_by_grid_src(monkeypatch, query, env, grid, want, src):
     W, H = 2000, 1600
@@ -384,8 +387,11 @@ def test_read_roles_hybrid_saved_equals_off_and_rot2_otherwise(monkeypatch):
     assert out["wall_frame_check"]["theta_deg"] == pytest.approx(12, abs=0.5)
     out = roles.read_roles(r, jpeg, "bottom", GOOD, "model", net=_Net(), grid_src="none")
     assert out["wall_frame"] == "rot2" and out["cut"] == "rot"
-    d = r.read_wall(jpeg)  # 지금 앱은 localdora 에 격자를 안 보낸다 → rot2
-    assert d["wall_frame"] == "rot2" and d["cut"] == "whole" and d["wall_frame_src"] == ["none", "no_grid"]
+    d = r.read_wall(jpeg)  # 옛 앱은 localdora 에 격자도 grid_src 도 안 보낸다 → 8b-4a 부터 지금 경로(답 = WALL_FRAME 없음)
+    assert d["wall_frame"] == "saved" and d["cut"] == "grid" and d["wall_frame_src"] == ["saved", "no_grid"]
+    assert d["indicators"] == base_d["indicators"] and d["pairs"] == base_d["pairs"]
+    d = r.read_wall(jpeg, grid=GOOD, grid_src="none")  # 새 앱이 격자 없음을 알림 → rot2
+    assert d["wall_frame"] == "rot2" and d["cut"] == "whole" and d["wall_frame_src"] == ["none", "query"]
     monkeypatch.setenv("WALL_FRAME_GRID_SRC", "saved")  # 측정용 강제
     d = r.read_wall(jpeg)
     assert d["wall_frame"] == "saved" and d["cut"] == "grid" and d["indicators"] == base_d["indicators"] and d["pairs"] == base_d["pairs"]
@@ -401,7 +407,11 @@ def test_hybrid_falls_back_to_grid_when_no_frame_and_last3_without_grid_is_rot2(
     faces, backs = _scene()
     r, _ = _fake_reader(monkeypatch, faces, backs, W, H)
     jpeg = _jpeg(_photo(faces, (W, H)))
-    j = r.read_rivers_full(jpeg, ["right"])
+    j = r.read_rivers_full(jpeg, ["right"])  # 8b-4a: 출처 모름 → 지금 경로(격자도 없으면 강이 빔 = WALL_FRAME 없음과 같음)
+    assert j["wall_frame"] == "saved" and j["cut"] == "grid" and j["rivers"] == [{"last_tile": None, "tile_count": 0, "sideways": []}]
+    j = r.read_rivers_full(jpeg, ["right"], grid_src="none")
+    assert j["wall_frame"] == "rot2" and j["cut"] == "rot"
+    j = r.read_rivers_full(jpeg, ["right"], GOOD, grid_src="none")  # 격자를 같이 보내도 none 이면 rot2
     assert j["wall_frame"] == "rot2" and j["cut"] == "rot"
     j = r.read_rivers_full(jpeg, ["right"], GOOD, grid_src="felt")
     assert j["wall_frame"] == "saved" and j["cut"] == "grid"

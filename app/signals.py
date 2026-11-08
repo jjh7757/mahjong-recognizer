@@ -3,7 +3,7 @@
 패마다(손패 줄·떼어 둔 패·울기 패, 白 채우기 패는 None):
   S1 margin  보정 확률(온도 [TEMP])의 1·2순위 차, pconf = 보정 1순위 확률
   S2 det     자리 크롭 검출기(회전 상자 8회차) 앞면 점수
-  S3 cls2    두 번째 분류기(같은 학습 묶음·다른 씨드, assets/tile-cls-alt-v2.onnx)가 같은 크롭을 읽은 답
+  S3 cls2    두 번째 분류기(같은 학습 묶음·다른 씨드, assets/tile-cls-alt-v3.onnx)가 같은 크롭을 읽은 답
   S5 jitter  같은 크롭을 ×0.9 축소 + JPEG q75 로 다시 저장해 운영 분류기로 다시 읽은 답(검출은 다시 안 한다)
   S6 red     분류가 5m·5p·5s·0m·0p·0s 인 크롭의 붉은 잉크 비율(빨강 픽셀 / 잉크 픽셀, 패 가운데만)
 자리 요약(signals): margin_min·det_min(손패 줄 + 떼어 둔 패)·cls2_diff·jitter_diff(답과 다른 패 수)·role_diff(S4 역할 모델
@@ -30,7 +30,7 @@ TOP = int(os.environ.get("LOCAL_SIGNALS_TOP", "0"))  # 측정용: 패마다 보�
 # 5,261장(그 사진을 안 배운 모델, 오답 50) 1순위 맞음 NLL 최소(mahjong_calc experiments/speed/select_thresholds.py temp, ECE 0.067 → 0.003,
 # results/temperature_tiles.json). 나눔 크롭 홀드아웃(prep_alt_cls.py)은 오답 0 이라 T 를 못 정했다. argmax 는 안 바뀐다.
 TEMP = float(os.environ.get("LOCAL_CLS_TEMP", "0.5"))
-ALT_CLS_MODEL = Path(os.environ.get("LOCAL_ALT_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-alt-v2.onnx")
+ALT_CLS_MODEL = Path(os.environ.get("LOCAL_ALT_CLS_MODEL") or Path(__file__).parent / "assets" / "tile-cls-alt-v3.onnx")
 FIVES = {"5m", "5p", "5s", "0m", "0p", "0s"}
 JITTER_SCALE, JITTER_Q = 0.9, 75
 RED_TRIM = 0.16  # 크롭 여유(PAD 0.12) + 패 가장자리·옆면을 빼고 가운데만

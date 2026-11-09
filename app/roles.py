@@ -30,12 +30,17 @@ from . import table_locate as tl
 
 # 역할 모델: 11칸(회전 상자 크기·기울기 + 뒷면 토큰, 라벨 수정 뒤 재학습, mahjong_calc metrics 표 1-78·1-79, 2026-11-05 사용자 "11칸 서버 코드 변경").
 # 예전 9칸 tile-roles.onnx(124654·125839 손패 끝 3장을 울기로 배운 라벨)는 되돌리기용으로 남김 — LOCAL_ROLE_MODEL 로 끼우면 tokens 가 입력 모양으로 9칸을 만든다.
-ROLE_MODEL = Path(os.environ.get("LOCAL_ROLE_MODEL") or Path(__file__).parent / "assets" / "tile-roles-rot.onnx")
+# 2026-11-09 v3r15d(생성기 v3 사전학습 + 실제 라벨 v2 33장, 외톨이 앞면 = 울기 아님 — mahjong_calc metrics 표 1-138~1-141).
+# 예전 tile-roles-rot.onnx 는 되돌리기용으로 남김(LOCAL_ROLE_MODEL 로 끼움).
+ROLE_MODEL = Path(os.environ.get("LOCAL_ROLE_MODEL") or Path(__file__).parent / "assets" / "tile-roles-v3r15d.onnx")
 ROLES = ["hand", "meld", "river", "wall", "pair", "loose"]
 SIDES = ("bottom", "right", "top", "left")
 ROT_CW = {"bottom": 0, "right": 90, "top": 180, "left": 270}
 GROW = 40  # 앱 seatReadGrow
 LOOSE_REACH = 3.0  # 크롭 밖 떼어 둔 화료패: 손패 패 높이의 몇 배 안
+# 짝은 늘 2장(2026-11-09, mahjong_calc metrics 표 1-145): 크롭 밖 떼어 둔 패 후보(loose)가 없을 때, 이웃 짝 없이 혼자인 pair 상자도
+# 떼어 둔 화료패 후보로 본다(143104: 손패 앞 7s 를 역할 모델이 pair 로 봄). LONE_PAIR_LOOSE=0 이면 끔.
+LONE_PAIR = os.environ.get("LONE_PAIR_LOOSE", "1") == "1"
 FEAT = 9  # 예전 특징(축 상자, 뒷면 없음)
 FEAT_ROT = 11  # 회전 상자 특징(+ sin·cos 2×기울기, 뒷면 상자 넣음)
 
@@ -284,7 +289,7 @@ def read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode:
         _loose_outside(reader, jpeg, out, inside=ok if out.get("wall_frame") == "rot2" and out.get("cut") == "rot" else None)
         items, seeds = out.pop("_sig_items", None), out.pop("_role_seeds", None)
         if sig.ON and items is not None:  # 불확실성 신호(개선 계획 5단계): 답은 그대로, 값만 더한다
-            if (s := out.get("separate_tile")) and s.get("from") in ("loose_outside", "loose_inside"):
+            if (s := out.get("separate_tile")) and s.get("from") in ("loose_outside", "loose_inside", "lone_pair"):
                 items.append(("sep", lr.decode_rgb(jpeg), tuple(s["box"]), "any", s["tile"], 0, 0))
             out["signals"] = sig.collect(reader, items, seeds)
             out["ms"]["signals"] = out["signals"]["ms"]
@@ -306,13 +311,25 @@ def _loose_outside(reader: lr.LocalReader, jpeg: bytes, out: dict, inside: set |
         return
     th = float(np.median([max(b[2], b[3]) for b in hand]))
     cen = lambda b: np.array([b[0] + b[2] / 2, b[1] + b[3] / 2], float)
-    near = [x for i, x in enumerate(out["roles"]) if (not x["in_seat"] or (inside is not None and i in inside)) and x["role"] == "loose"
-            and min(np.linalg.norm(cen(x["box"]) - cen(h)) for h in hand) <= LOOSE_REACH * th]
+    near = _sep_near(out["roles"], hand, th, inside, "loose")
+    src = "loose"
+    if not near and LONE_PAIR:
+        pairs = [x["box"] for x in out["roles"] if x["role"] == "pair"]
+        near = [x for x in _sep_near(out["roles"], hand, th, inside, "pair")
+                if not any(p is not x["box"] and np.linalg.norm(cen(p) - cen(x["box"])) < 1.6 * th for p in pairs)]
+        src = "lone_pair"
     if len(near) != 1:
         return
     full = lr.decode_rgb(jpeg)  # _read_roles 가 디코딩한 것을 다시 쓴다
     out["separate_tile"] = {**lr.tile_json(reader.read_any2(full, tuple(near[0]["box"]))), "box": near[0]["box"],
-                            "from": "loose_inside" if near[0]["in_seat"] else "loose_outside"}
+                            "from": ("loose_inside" if near[0]["in_seat"] else "loose_outside") if src == "loose" else "lone_pair"}
+
+
+def _sep_near(roles_: list[dict], hand: list, th: float, inside: set | None, role: str) -> list[dict]:
+    """[_loose_outside] 후보: 크롭 밖(또는 inside 번호) 상자 중 역할이 role 이고 손패 중심에서 패 높이 [LOOSE_REACH] 배 안인 것."""
+    cen = lambda b: np.array([b[0] + b[2] / 2, b[1] + b[3] / 2], float)
+    return [x for i, x in enumerate(roles_) if (not x["in_seat"] or (inside is not None and i in inside)) and x["role"] == role
+            and min(np.linalg.norm(cen(x["box"]) - cen(h)) for h in hand) <= LOOSE_REACH * th]
 
 
 def seat_grow_u(tz: tf.TableZones, side: str) -> float:

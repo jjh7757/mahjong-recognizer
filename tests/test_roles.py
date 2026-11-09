@@ -210,3 +210,31 @@ def test_read_roles_adds_classifier_second_choice(monkeypatch):
     out = roles.read_roles(r, _jpeg(im), "bottom", GRID, "model", net=_Net())
     assert out["framed"] and len(out["tiles"]) == 13
     assert all(t == {"tile": "3p", "conf": 0.7, "alt": "0p", "conf2": 0.2} for t in out["tiles"])
+
+
+def test_sep_near_and_lone_pair_rule(monkeypatch):
+    """짝은 늘 2장: 크롭 밖 loose 후보가 없으면 혼자인 pair 를 떼어 둔 화료패 후보로(143104), 둘 붙은 pair(리치 짝)는 아님."""
+    hand = [[100 + 50 * i, 500, 48, 64] for i in range(13)]
+    roles_ = [{"box": b, "role": "hand", "in_seat": True} for b in hand]
+    lone = {"box": [120, 380, 48, 64], "role": "pair", "in_seat": False}
+    two = [{"box": [500, 360, 48, 64], "role": "pair", "in_seat": False}, {"box": [550, 360, 48, 64], "role": "pair", "in_seat": False}]
+    near = roles._sep_near(roles_ + [lone] + two, hand, 64.0, None, "pair")
+    assert lone in near and all(t in near for t in two)  # 거리 조건만 — 혼자인지는 _loose_outside 에서 거른다
+    assert roles._sep_near(roles_ + [lone], hand, 64.0, None, "loose") == []
+
+    calls = []
+
+    class R:
+        def read_any2(self, rgb, box):
+            calls.append(box)
+            return {"tile": "7s", "conf": 0.9}
+    monkeypatch.setattr(roles.lr, "decode_rgb", lambda jpeg: None)
+    monkeypatch.setattr(roles.lr, "tile_json", lambda d: d)
+    for extra, want in (([lone] + two, "lone_pair"), (two, None)):
+        out = {"framed": True, "separate_tile": None, "tiles": [{}] * 13, "melds": [], "roles": roles_ + extra}
+        roles._loose_outside(R(), b"", out)
+        assert (out["separate_tile"] or {}).get("from") == want
+    monkeypatch.setattr(roles, "LONE_PAIR", False)
+    out = {"framed": True, "separate_tile": None, "tiles": [{}] * 13, "melds": [], "roles": roles_ + [lone] + two}
+    roles._loose_outside(R(), b"", out)
+    assert out["separate_tile"] is None

@@ -3,7 +3,7 @@
 This server (mahjong-recognizer) is licensed under the GNU Affero General Public License v3.0 (see `LICENSE`).
 It is a non-commercial project. The components below are included or used as described.
 
-## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-obb-r8.onnx`, `app/assets/tile-cls-mnv3s.onnx`, `app/assets/tile-cls-mnv3s-v2.onnx`, `app/assets/tile-cls-alt-v2.onnx`, `app/assets/tile-roles.onnx`
+## Own models — `app/assets/tile-yolo26n.onnx`, `app/assets/tile-obb-r8.onnx`, `app/assets/tile-cls-mnv3s.onnx`, `app/assets/tile-cls-mnv3s-v2.onnx`, `app/assets/tile-cls-alt-v2.onnx`, `app/assets/tile-roles.onnx`, `app/assets/tile-roles-rot.onnx`, `app/assets/tile-roles-v3r15d.onnx`
 
 Used by the local (Gemini-free) reads in `app/local_read.py`, `app/obb.py` and `app/roles.py`. Run with onnxruntime.
 
@@ -11,7 +11,7 @@ Used by the local (Gemini-free) reads in `app/local_read.py`, `app/obb.py` and `
   trained with Ultralytics YOLO are licensed under AGPL-3.0 by default (https://www.ultralytics.com/license).
 - `tile-obb-r8.onnx`: Ultralytics YOLO26n-obb (rotated boxes, tile face and back) trained by this project on its own table
   photos; same AGPL-3.0 note as above. Used for seat reads.
-- `tile-roles.onnx`: a small set Transformer trained by this project (synthetic layouts + its own table photos) that labels
+- `tile-roles.onnx`, `tile-roles-rot.onnx`, `tile-roles-v3r15d.onnx` (current default): a small set Transformer trained by this project (synthetic layouts + its own table photos) that labels
   each detected tile box with a role (hand, meld, river, wall, pair, loose).
 - `tile-cls-mnv3s.onnx`: torchvision MobileNetV3 Small (ImageNet weights, BSD-3-Clause code) fine-tuned by this project.
 - `tile-cls-mnv3s-v2.onnx`, `tile-cls-alt-v2.onnx`: the same architecture, first trained on synthetic table-scene crops made

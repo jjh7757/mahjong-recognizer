@@ -41,6 +41,9 @@ LOOSE_REACH = 3.0  # 크롭 밖 떼어 둔 화료패: 손패 패 높이의 몇 �
 # 짝은 늘 2장(2026-11-09, mahjong_calc metrics 표 1-145): 크롭 밖 떼어 둔 패 후보(loose)가 없을 때, 이웃 짝 없이 혼자인 pair 상자도
 # 떼어 둔 화료패 후보로 본다(143104: 손패 앞 7s 를 역할 모델이 pair 로 봄). LONE_PAIR_LOOSE=0 이면 끔.
 LONE_PAIR = os.environ.get("LONE_PAIR_LOOSE", "1") == "1"
+# 눕힌 손패·떼어 둔 패(2026-11-10, mahjong_calc problem_log 49번 153311): 가로 상자(w > 1.15h)를 그대로 넣으면 분류기가 눕힌 4p 를 2p(0.78~0.93)로
+# 읽는다. 울기(read_meld_tile2)처럼 90°·270° 중 확신 높은 쪽으로 읽는다. 세운 상자는 예전과 같다(read2). TURNED_HAND=0 이면 끔.
+TURNED_HAND = os.environ.get("TURNED_HAND", "1") == "1"
 FEAT = 9  # 예전 특징(축 상자, 뒷면 없음)
 FEAT_ROT = 11  # 회전 상자 특징(+ sin·cos 2×기울기, 뒷면 상자 넣음)
 
@@ -413,8 +416,10 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
             return ("5z", lr.FILLED_CONF, None, None) if filled and (tuple(b) in filled or st.ink(rgb, b) < lr.BLANK) else read(b)
 
         # 패마다 (종류, 확신도, 분류기 2순위, 그 확신도) — 2순위는 답을 안 바꾸는 부가 정보(개선 계획 4단계 V3 후보용, 2026-11-05)
-        hand = [blank_or(b, lambda x: reader.read2([lr.cut(rgb, x)])[0]) for b in fr.hand]
-        sep = blank_or(fr.separate, lambda x: reader.read2([lr.cut(rgb, x)])[0]) if fr.separate else None
+        read_h = (lambda x: reader.read_meld_tile2(rgb, x)) if TURNED_HAND else (lambda x: reader.read2([lr.cut(rgb, x)])[0])
+        kind_h = lambda b: "meld" if TURNED_HAND and b[2] > 1.15 * b[3] else "hand"  # 신호도 답과 같은 방향(signals._orient)
+        hand = [blank_or(b, read_h) for b in fr.hand]
+        sep = blank_or(fr.separate, read_h) if fr.separate else None
         melds = [[blank_or(b, lambda x: reader.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
         block, got = False, []
         if fr.count == 13 and not fr.separate and not added:
@@ -430,8 +435,8 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         out["block"] = block
         # 신호용(read_roles 가 꺼내 signals.collect 에): 답과 같은 크롭·방향. 白 채우기 패는 답 None
         is_fill = lambda b, t: t[2] is None and t[1] == lr.FILLED_CONF
-        out["_sig_items"] = ([("hand", rgb, b, "hand", None if is_fill(b, t) else t[0], 0, 0) for b, t in zip(fr.hand, hand)]
-                             + ([("sep", rgb, fr.separate, "hand", None if is_fill(fr.separate, sep) else sep[0], 0, 0)] if fr.separate and sep else [])
+        out["_sig_items"] = ([("hand", rgb, b, kind_h(b), None if is_fill(b, t) else t[0], 0, 0) for b, t in zip(fr.hand, hand)]
+                             + ([("sep", rgb, fr.separate, kind_h(fr.separate), None if is_fill(fr.separate, sep) else sep[0], 0, 0)] if fr.separate and sep else [])
                              + ([("sep", rgb, got[0], "turned", sep[0], fr.tw, fr.th)] if not fr.separate and sep and len(got) == 1 else [])
                              + [(f"meld{i}", rgb, b, "meld", None if is_fill(b, t) else t[0], 0, 0) for i, m in enumerate(fr.melds) for b, t in zip(m, melds[i])])
         out["_role_seeds"] = seeds

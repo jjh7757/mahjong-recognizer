@@ -317,6 +317,173 @@ def frame(rgb: np.ndarray, det: rv.TileDetector, extra_melds: int = 0, hand_frac
 
 SPLIT_MARGIN = 0.03  # 경계 양쪽으로 자리 폭의 3% 겹쳐 검출(선을 넘은 패)
 SPLIT_MELD = {6: (3, 3), 8: (4, 4)}  # 붙어 놓인 울기 둘
+ROW_GAP = 0.4  # 위아래 줄 경계: 가운데 y 차 > 패 높이 0.4
+STACK_MAX = 4  # 위아래로 쌓인 울기 최대 줄 수(울기는 최대 4개)
+LINE_CHUNK = {6: 3, 8: 4, 9: 3}  # 한 줄로 붙은 덩어리는 왼쪽부터 이만큼씩(7·12장 등은 3·4 조합을 못 가려 버림)
+
+
+def _row_splits(n: int) -> list[tuple[int, ...]]:
+    """n장을 위에서부터 3·4장 줄로 나누는 모든 방법(2줄 이상, STACK_MAX 줄 이하)."""
+    out = []
+
+    def go(left: int, acc: tuple[int, ...]) -> None:
+        if left == 0:
+            if 2 <= len(acc) <= STACK_MAX:
+                out.append(acc)
+            return
+        for k in (3, 4):
+            if k <= left and len(acc) < STACK_MAX:
+                go(left - k, acc + (k,))
+    go(n, ())
+    return out
+
+
+def split_meld_group(g: list[Box], th: float) -> list[list[Box]] | None:
+    """붙어 있어 한 덩어리로 묶인 울기 상자 → 울기 묶음들(각각 왼쪽부터), 못 나누면 None.
+    3·4장 = 하나. 그 밖은 가운데 y 순으로 3·4장 줄로 자르는 방법 중 경계마다 y 차가 패 높이 0.4 를 넘는 것
+    (여럿이면 가장 좁은 경계가 가장 넓은 것) — 눕힌 패는 줄 안에서 처져 있어 틈으로 끊지 않고 정렬 순서로 자른다
+    (6·8장 예전 규칙과 같은 결과, 9장 3×3 = 11-07 135420, 7장 깡 + 퐁 = 11-07 115802). 위아래로 안 갈리면 한 줄로 보고
+    왼쪽부터 [LINE_CHUNK]장씩."""
+    g = sorted(g, key=lambda b: b[0])
+    if len(g) in (3, 4):
+        return [g]
+    cy = lambda b: b[1] + b[3] / 2  # noqa: E731
+    by_y = sorted(g, key=cy)
+    best, best_gap = None, ROW_GAP * th
+    for sizes in _row_splits(len(g)):
+        cuts = [sum(sizes[:i]) for i in range(1, len(sizes))]
+        gap = min(cy(by_y[i]) - cy(by_y[i - 1]) for i in cuts)
+        if gap > best_gap:
+            best, best_gap = cuts, gap
+    if best is not None:
+        edges = [0, *best, len(g)]
+        return [sorted(by_y[a:b], key=lambda b_: b_[0]) for a, b in zip(edges, edges[1:])]
+    k = LINE_CHUNK.get(len(g))
+    return [g[i:i + k] for i in range(0, len(g), k)] if k else None
+
+
+# ---------------------------------------------------------------- 울기 덩어리: 패를 읽고 나서 나누기(가드레일 포함)
+# 실험 mahjong_calc experiments/visit_20261107/meld_partition.py(metrics 표 1-163): 모양으로만 나누면 한 줄로 붙은 깡 + 퐁(3+4)·울기
+# 넷(12장 이상)을 못 나눈다. 덩어리 패를 모두 읽은 뒤 울기 모양(퐁·치·깡)이 되는 나눔을 고르고, 안 되면 모양 규칙 + 경고.
+MELD_FLAG_CONF = 0.5  # 가드레일에 걸린 울기의 확신 상한 — 앱 merge 의 울기 확인 경고(uncertainBelow 0.7)가 붙어 자동 반영을 막는다
+
+
+def meld_sizes(n: int) -> list[tuple[int, ...]]:
+    """n장을 3·4장 묶음으로 나누는 모든 순서(울기 STACK_MAX 개 이하)."""
+    out = []
+
+    def go(left: int, acc: tuple[int, ...]) -> None:
+        if left == 0:
+            if acc:
+                out.append(acc)
+            return
+        for k in (3, 4):
+            if k <= left and len(acc) < STACK_MAX:
+                go(left - k, acc + (k,))
+    go(n, ())
+    return out
+
+
+def meld_parts(g: list[Box], th: float) -> list[list[Box]] | None:
+    """틀 잡기용 나눔: 모양 규칙([split_meld_group]), 못 나누면 왼쪽부터 3·4장 임시 나눔(3장 먼저) — 패를 읽은 뒤
+    [choose_melds] 가 다시 고른다(장수 검사가 울기 수만 쓰므로 3+4·4+3 은 같은 값)."""
+    parts = split_meld_group(g, th)
+    if parts is not None:
+        return parts
+    sizes = meld_sizes(len(g))
+    if not sizes:
+        return None
+    g = sorted(g, key=lambda b: b[0])
+    edges = [0, *[sum(sizes[0][:i]) for i in range(1, len(sizes[0]) + 1)]]
+    return [g[a:b] for a, b in zip(edges, edges[1:])]
+
+
+def _norm_tile(t: str) -> str:
+    return "5" + t[1] if t and t[0] == "0" else t
+
+
+def meld_shape_ok(tiles: list[str]) -> bool:
+    """울기 모양: 깡 = 같은 패 4, 퐁 = 같은 패 3, 치 = 수패 같은 수트 연속 3(적5 = 5)."""
+    ts = [_norm_tile(t) for t in tiles]
+    if len(ts) == 4:
+        return len(set(ts)) == 1
+    if len(ts) != 3:
+        return False
+    if len(set(ts)) == 1:
+        return True
+    if len({t[1] for t in ts}) != 1 or ts[0][1] == "z" or not all(t[0].isdigit() for t in ts):
+        return False
+    n = sorted(int(t[0]) for t in ts)
+    return n[1] == n[0] + 1 and n[2] == n[1] + 1
+
+
+def meld_candidates(g: list[Box], tw: float, th: float) -> list[tuple[list[list[int]], float]]:
+    """나눔 후보 (묶음별 상자 번호, 모양 점수) — 가로 순서(한 줄) 또는 가운데 y 순서(위아래, 줄 경계 > 패 높이 [ROW_GAP])로
+    3·4장씩 이어 자르기. 점수 = 경계 틈 중 가장 좁은 것(패 크기 단위), 한 묶음이면 +inf. 같은 나눔은 점수 높은 쪽 하나."""
+    n = len(g)
+    cy = lambda i: g[i][1] + g[i][3] / 2  # noqa: E731
+    best: dict[frozenset, tuple[list[list[int]], float]] = {}
+    for axis, order in (("x", sorted(range(n), key=lambda i: g[i][0])), ("y", sorted(range(n), key=cy))):
+        for sizes in meld_sizes(n):
+            cuts = [sum(sizes[:i]) for i in range(1, len(sizes))]
+            if axis == "x":
+                gaps = [(g[order[c]][0] - (g[order[c - 1]][0] + g[order[c - 1]][2])) / tw for c in cuts]
+            else:
+                gaps = [(cy(order[c]) - cy(order[c - 1])) / th for c in cuts]
+                if gaps and min(gaps) <= ROW_GAP:  # 줄 한가운데를 자르는 위아래 나눔은 안 받음(오독 한 장으로 통과하던 것, 표 1-163)
+                    continue
+            score = min(gaps) if gaps else float("inf")
+            edges = [0, *cuts, n]
+            parts = [sorted(order[a:b], key=lambda i: g[i][0]) for a, b in zip(edges, edges[1:])]
+            key = frozenset(frozenset(p) for p in parts)
+            if key not in best or score > best[key][1]:
+                best[key] = (parts, score)
+    return list(best.values())
+
+
+def choose_melds(g: list[Box], reads: list[tuple], tw: float, th: float, n_melds: int | None = None
+                 ) -> tuple[list[list[int]], list[tuple], str]:
+    """울기 덩어리 [g] 와 패마다 읽은 값 reads[i] = (1순위, 확신, 2순위, 2순위 확신) → (묶음별 상자 번호, 쓴 읽기, 표시).
+    n_melds 가 있으면 그 울기 수의 나눔만(틀의 장수 검사를 바꾸지 않게).
+    표시: ok = 1순위로 울기 모양이 되는 나눔(여럿이면 모양 점수 높은 것) · disagree = 모양 규칙의 나눔도 울기 모양인데 고른 것과 다름 ·
+    alt = 1순위로는 안 되고, 확신 낮은 패부터 한 장을 2순위로 바꿔서 됨(그 패는 2순위 값·확신으로) · fallback = 그래도 안 돼서 모양 규칙
+    (못 하면 임시 나눔) 그대로. ok 가 아니면 호출하는 쪽이 확신을 [MELD_FLAG_CONF] 아래로 낮춰 앱이 확인을 받게 한다."""
+    g = [tuple(b) for b in g]
+    cands = [c for c in meld_candidates(g, tw, th) if n_melds is None or len(c[0]) == n_melds]
+    idx = {b: i for i, b in enumerate(g)}
+    geo = meld_parts(g, th)
+    geo_parts = [sorted(idx[tuple(b)] for b in m) for m in geo] if geo else None
+    if geo_parts is not None and n_melds is not None and len(geo_parts) != n_melds:
+        geo_parts = None
+    top = [r[0] for r in reads]
+
+    def ok_with(tiles):
+        return sorted((c for c in cands if all(meld_shape_ok([tiles[i] for i in p]) for p in c[0])), key=lambda c: -c[1])
+
+    def same(a, b):
+        return {frozenset(p) for p in a} == {frozenset(p) for p in b}
+
+    good = ok_with(top)
+    if good:
+        parts = good[0][0]
+        geo_good = geo_parts is not None and all(meld_shape_ok([top[i] for i in p]) for p in geo_parts)
+        return parts, list(reads), "disagree" if geo_good and not same(parts, geo_parts) else "ok"
+    for i in sorted(range(len(reads)), key=lambda i: reads[i][1]):
+        alt = reads[i][2]
+        if not alt or _norm_tile(alt) == _norm_tile(top[i]):
+            continue
+        tiles = list(top)
+        tiles[i] = alt
+        good = ok_with(tiles)
+        if good:
+            used = list(reads)
+            used[i] = (reads[i][2], reads[i][3], reads[i][0], reads[i][1])
+            return good[0][0], used, "alt"
+    if geo_parts is None:
+        geo_parts = [list(range(len(g)))] if not cands else cands[0][0]
+    return [sorted(p, key=lambda i: g[i][0]) for p in geo_parts], list(reads), "fallback"
+
+
 RUN_GAP = 0.45  # 손패 줄 안 이웃 틈 < 패 0.45개
 TABLE_REACH = 1.3  # 상자 가운데에서 패 1.3개 안에 펠트가 없으면 테이블 밖(울기는 흰 테두리 위에도 놓인다)
 CORNER_K = 2  # 모서리만 잘라 검출할 때 토막 수

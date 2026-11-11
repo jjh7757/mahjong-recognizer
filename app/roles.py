@@ -248,16 +248,7 @@ def frame_from_roles(rgb: np.ndarray, faces: list, roles: list[str], split: int,
         sep = near[0] if len(near) == 1 else None
         melds = []
         for grp in st.cluster([f for f, r in zip(faces, roles) if r == "meld"], tw * st.GAP, th * 0.5):
-            grp = sorted(grp, key=lambda b: b[0])
-            if len(grp) in (3, 4):
-                melds.append(grp)
-            elif len(grp) in st.SPLIT_MELD:
-                k = st.SPLIT_MELD[len(grp)][0]
-                by_y = sorted(grp, key=lambda b: b[1] + b[3] / 2)
-                if by_y[k][1] + by_y[k][3] / 2 - (by_y[k - 1][1] + by_y[k - 1][3] / 2) > 0.4 * th:
-                    melds += [sorted(by_y[:k], key=lambda b: b[0]), sorted(by_y[k:], key=lambda b: b[0])]
-                else:
-                    melds += [grp[:k], grp[k:]]
+            melds += st.meld_parts(grp, th) or []
         melds.sort(key=lambda m: m[0][0])
         fr = st.SeatFrame(hand, sep, melds, [f for f in loose if f is not sep], tw, th, len(faces), split=True)
     added: list = []
@@ -420,7 +411,8 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
         kind_h = lambda b: "meld" if TURNED_HAND and b[2] > 1.15 * b[3] else "hand"  # 신호도 답과 같은 방향(signals._orient)
         hand = [blank_or(b, read_h) for b in fr.hand]
         sep = blank_or(fr.separate, read_h) if fr.separate else None
-        melds = [[blank_or(b, lambda x: reader.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
+        # 울기: 덩어리 패를 모두 읽고 나눔을 다시 고름(가드레일에 걸리면 확신을 낮춰 앱이 확인을 받게, seat.choose_melds)
+        fr.melds, melds, split_flags = lr.resplit_melds(fr, lambda b: blank_or(b, lambda x: reader.read_meld_tile2(rgb, x)))
         block, got = False, []
         if fr.count == 13 and not fr.separate and not added:
             got = lr.strays(fr, faces, rgb)
@@ -430,8 +422,8 @@ def _read_roles(reader: lr.LocalReader, jpeg: bytes, side: str, grid: dict, mode
                 block = True
         out["tiles"] = [lr.tile_json(t) for t in hand]
         out["separate_tile"] = lr.tile_json(sep) if sep else None
-        out["melds"] = [{"tiles": [t[0] for t in m], "sideways": [], "face_down": [], "conf": min(t[1] for t in m),
-                         "alts": [t[2] for t in m], "conf2s": [t[3] for t in m]} for m in melds]
+        out["melds"] = [{"tiles": [t[0] for t in m], "sideways": [], "face_down": [], "conf": lr.meld_conf(m, f),
+                         "alts": [t[2] for t in m], "conf2s": [t[3] for t in m], "split": f} for m, f in zip(melds, split_flags)]
         out["block"] = block
         # 신호용(read_roles 가 꺼내 signals.collect 에): 답과 같은 크롭·방향. 白 채우기 패는 답 None
         is_fill = lambda b, t: t[2] is None and t[1] == lr.FILLED_CONF

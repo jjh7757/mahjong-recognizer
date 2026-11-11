@@ -222,20 +222,37 @@ def split_frame(rgb: np.ndarray, faces: list, split: int) -> st.SeatFrame | None
     rest = [f for f in rest if f not in far]
     melds = []
     for g in st.cluster(rest, tw * st.GAP, th * 0.5):
-        g = sorted(g, key=lambda x: x[0])
-        if len(g) in (3, 4):
-            melds.append(g)
-        elif len(g) in st.SPLIT_MELD:
-            k = st.SPLIT_MELD[len(g)][0]
-            by_y = sorted(g, key=lambda x: x[1] + x[3] / 2)
-            if by_y[k][1] + by_y[k][3] / 2 - (by_y[k - 1][1] + by_y[k - 1][3] / 2) > 0.4 * th:  # 위아래 두 줄
-                melds += [sorted(by_y[:k], key=lambda x: x[0]), sorted(by_y[k:], key=lambda x: x[0])]
-            else:
-                melds += [g[:k], g[k:]]
+        # 모양으로만(임시 나눔 없음): 이 경로의 덩어리엔 울기 아닌 패도 섞여 임시 나눔이 틀을 바꾼다(robust ev_p1 124654 손패 22장).
+        # 못 나눈 한 줄 깡 + 퐁은 틀이 안 맞아 hybrid 가 model 경로(역할 meld 만, meld_parts)로 넘어간다.
+        parts = st.split_meld_group(g, th)
+        if parts:
+            melds += parts
         else:
             loose.extend(g)
     melds.sort(key=lambda m: m[0][0])
     return st.SeatFrame(hand, sep, melds, loose, tw, th, len(faces), split=True)
+
+
+def resplit_melds(fr: st.SeatFrame, read) -> tuple[list[list], list[list[tuple]], list[str]]:
+    """틀의 울기를 붙은 덩어리로 다시 모아(틀 잡을 때와 같은 틈) 패를 모두 읽은 뒤 [st.choose_melds] 로 다시 나눈다.
+    덩어리마다 틀이 준 울기 수는 그대로(장수 검사 유지). 반환 (울기 상자들, 울기 읽기들, 울기별 표시 ok|disagree|alt|fallback), 왼쪽부터."""
+    owner = {tuple(b): i for i, m in enumerate(fr.melds) for b in m}
+    boxes = list(owner)
+    out = []
+    for g in st.cluster(boxes, fr.tw * st.GAP, fr.th * 0.5):
+        g = sorted(g, key=lambda b: b[0])
+        reads = [read(b) for b in g]
+        n = len({owner[b] for b in g})
+        parts, used, flag = st.choose_melds(g, reads, fr.tw, fr.th, n)
+        out += [([g[i] for i in p], [used[i] for i in p], flag) for p in parts]
+    out.sort(key=lambda m: m[0][0][0])
+    return [m[0] for m in out], [m[1] for m in out], [m[2] for m in out]
+
+
+def meld_conf(ts: list[tuple], flag: str) -> float:
+    """울기 확신 = 패 확신 최솟값, 가드레일에 걸리면([st.choose_melds] 표시가 ok 아님) [st.MELD_FLAG_CONF] 이하."""
+    c = min(t[1] for t in ts)
+    return c if flag == "ok" else min(c, st.MELD_FLAG_CONF)
 
 
 def frame_ok(fr: st.SeatFrame | None, rgb: np.ndarray) -> bool:
@@ -853,7 +870,7 @@ class LocalReader:
                 return ("5z", FILLED_CONF, None, None) if filled and (b in filled or st.ink(rgb, b) < BLANK) else read(b)
 
             hand = [blank_or(b, lambda x: self.read2([cut(rgb, x)])[0]) for b in fr.hand + ([fr.separate] if fr.separate else [])]
-            melds = [[blank_or(b, lambda x: self.read_meld_tile2(rgb, x)) for b in m] for m in fr.melds]
+            fr.melds, melds, flags = resplit_melds(fr, lambda b: blank_or(b, lambda x: self.read_meld_tile2(rgb, x)))
             if fr.count == 13 and not fr.separate and not added:
                 got = strays(fr, faces, rgb)
                 if len(got) == 1:
@@ -861,7 +878,8 @@ class LocalReader:
                 elif got:
                     out["block"] = True
             out["hand"], out["hand_conf"] = [t[0] for t in hand], [t[1] for t in hand]
-            out["melds"], out["meld_conf"] = [" ".join(t[0] for t in m) for m in melds], [min(t[1] for t in m) for m in melds]
+            out["melds"], out["meld_conf"] = [" ".join(t[0] for t in m) for m in melds], [meld_conf(m, f) for m, f in zip(melds, flags)]
+            out["meld_split"] = flags
             # 분류기 2순위(답은 위 그대로, 개선 계획 4단계 V3 후보용)
             out["hand_alt"], out["hand_conf2"] = [t[2] for t in hand], [t[3] for t in hand]
             out["meld_alts"], out["meld_conf2s"] = [[t[2] for t in m] for m in melds], [[t[3] for t in m] for m in melds]

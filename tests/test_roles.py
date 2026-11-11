@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 from app import local_read as lr
 from app import main as server
 from app import roles
+from app import seat as st
 
 
 def _jpeg(im: Image.Image) -> bytes:
@@ -82,6 +83,66 @@ def test_frame_from_roles_model_mode_groups_hand_sep_and_two_row_melds():
     assert fr is not None and [b[0] for b in fr.hand] == sorted(b[0] for b in hand) and fr.separate == sep
     assert len(fr.melds) == 2 and fr.melds[0][0][1] == 400 and fr.melds[1][0][1] == 490, "위아래 두 줄은 y 로 나눈다"
     assert fr.count == 14 and added == []
+
+
+def test_split_meld_group_stacked_rows_with_sagging_sideways_tiles():
+    """11-07 135420 왼쪽 자리 크롭 상자 그대로: 울기 셋을 3×3 으로 붙여 쌓음, 눕힌 패가 줄마다 아래로 처짐 → 줄별 3장씩."""
+    rows = [[(1814, 391, 122, 89), (1933, 331, 93, 113), (2023, 333, 88, 109)],
+            [(1824, 482, 119, 86), (1940, 449, 87, 110), (2025, 447, 88, 110)],
+            [(1822, 590, 118, 84), (1936, 564, 89, 109), (2024, 559, 87, 110)]]
+    assert st.split_meld_group([b for r in rows for b in r], 110.0) == rows
+    line9 = [(100 + 66 * i, 400, 60, 80) for i in range(9)]
+    assert st.split_meld_group(line9, 80.0) == [line9[0:3], line9[3:6], line9[6:9]], "한 줄 9장은 왼쪽부터 3장씩"
+    stack12 = [(1500 + 66 * i, 400 + 90 * j, 60, 80) for j in range(4) for i in range(3)]
+    assert len(st.split_meld_group(stack12, 80.0)) == 4, "3장 네 줄"
+    assert st.split_meld_group([(100 + 66 * i, 400, 60, 80) for i in range(12)], 80.0) is None, "한 줄 12장은 못 가림"
+    assert st.split_meld_group([(100 + 66 * i, 400, 60, 80) for i in range(7)], 80.0) is None, "한 줄 7장은 3+4·4+3 을 못 가림"
+    # 11-07 115802 오른쪽 자리 크롭 상자 그대로: 3m 퐁(위 줄 3장) + 1m 명깡(아래 줄 4장)을 붙여 둠
+    pon = [(1987, 621, 124, 87), (2109, 586, 96, 117), (2198, 589, 92, 118)]
+    kan = [(1890, 708, 97, 111), (1983, 710, 96, 113), (2073, 714, 95, 113), (2165, 742, 129, 90)]
+    assert st.split_meld_group(pon + kan, 113.0) == [pon, kan], "퐁 + 깡 위아래 → 3장·4장"
+
+
+def _rd(tiles, conf=0.95, alts=None):
+    alts = alts or [None] * len(tiles)
+    return [(t, conf, a, 0.03 if a else None) for t, a in zip(tiles, alts)]
+
+
+def test_choose_melds_line_kan_and_pon_by_tiles():
+    """한 줄로 붙은 7장(모양 규칙으로는 못 나눔): 읽은 패로 퐁 + 깡을 가림 — 순서가 어느 쪽이든."""
+    line7 = [(100 + 66 * i, 400, 60, 80) for i in range(7)]
+    parts, _, flag = st.choose_melds(line7, _rd(["3m"] * 3 + ["1m"] * 4), 60, 80, 2)
+    assert flag == "ok" and parts == [[0, 1, 2], [3, 4, 5, 6]]
+    parts, _, flag = st.choose_melds(line7, _rd(["1m"] * 4 + ["2s", "3s", "4s"]), 60, 80, 2)
+    assert flag == "ok" and parts == [[0, 1, 2, 3], [4, 5, 6]]
+    assert st.meld_parts(line7, 80) is not None, "틀 잡기에서는 임시 나눔으로 남긴다"
+
+
+def test_choose_melds_guardrails():
+    line6 = [(100 + 66 * i, 400, 60, 80) for i in range(6)]
+    # 1순위로는 울기 모양이 안 되고(4m 자리에 9p), 2순위(4m)로 바꾸면 됨 → alt, 그 패는 2순위 값·확신
+    rd = _rd(["2m", "3m", "9p", "5s", "5s", "5s"], alts=[None, None, "4m", None, None, None])
+    rd[2] = ("9p", 0.4, "4m", 0.3)
+    parts, used, flag = st.choose_melds(line6, rd, 60, 80, 2)
+    assert flag == "alt" and used[2][:2] == ("4m", 0.3)
+    # 2순위로도 안 됨 → 모양 규칙(3장씩) 그대로 + fallback
+    parts, _, flag = st.choose_melds(line6, _rd(["2m", "9p", "7s", "5s", "1z", "5s"]), 60, 80, 2)
+    assert flag == "fallback" and parts == [[0, 1, 2], [3, 4, 5]]
+    # 퐁 + 깡 위아래, 깡 한 장을 퐁 패로 잘못 읽음: 줄 한가운데를 자르는 나눔(3z×4 + 6z×3)은 받지 않는다
+    pon = [(1500 + 66 * i, 400, 60, 80) for i in range(3)]
+    kan = [(1480 + 66 * i, 490, 60, 80) for i in range(4)]
+    _, _, flag = st.choose_melds(pon + kan, _rd(["3z"] * 3 + ["3z", "6z", "6z", "6z"]), 60, 80, 2)
+    assert flag != "ok"
+
+
+def test_resplit_melds_lowers_conf_when_guarded():
+    hand = [(100 + 66 * i, 400, 60, 80) for i in range(7)]
+    line7 = [(1500 + 66 * i, 400, 60, 80) for i in range(7)]
+    fr = st.SeatFrame(hand, None, st.meld_parts(line7, 80), [], 60, 80, 14, split=True)
+    tiles = dict(zip(line7, ["3m"] * 3 + ["1m"] * 4))
+    boxes, reads, flags = lr.resplit_melds(fr, lambda b: (tiles[tuple(b)], 0.95, None, None))
+    assert [len(m) for m in boxes] == [3, 4] and flags == ["ok", "ok"] and fr.count == 13
+    assert lr.meld_conf(reads[0], "ok") == 0.95 and lr.meld_conf(reads[0], "fallback") == st.MELD_FLAG_CONF
 
 
 def test_frame_from_roles_needs_two_hand_tiles():

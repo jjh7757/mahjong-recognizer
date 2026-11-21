@@ -48,6 +48,17 @@ POST /v1/table       테이블 중앙 크롭 (강 4개 + 왕패)
 | 503 | 서버에 GEMINI_API_KEY 없음(`recognizer not configured`), 또는 Gemini 5xx·시간 초과·호출 예산 초과(`upstream unavailable`, `Retry-After`) | 쉬고 다시 |
 | 502 | 그 밖의 Gemini 호출 실패(빈 응답 등) | 다시 찍는다 |
 
+### 패보 리뷰 해설 `POST /v2/review/explain` (JSON 본문, 사진 아님)
+
+앱이 계산한 패보 리뷰 **사실표**(규격 v1.1, 요청 `version` 은 1: [mahjong_calc/docs/paifu_review_llm_design_1118.md](../mahjong_calc/docs/paifu_review_llm_design_1118.md) 부록 A —
+`game` 머리 · hero 버림 전부 `timeline` · 해설할 차례 `turns`(뽑기 전 샹텐 `shanten_prev` · 뽑은 패 모양 `shape.drawn` 포함), 패는 `5m` 꼴, 이름 · 결과는 안 보냄)를 받아 Gemini 가 한국어 해설(판 총평 + 차례마다 제목 · 본문)을 쓰고,
+서버(`app/review.py`)가 그 글을 사실표와 대조해 검증한다(대괄호 패 `[3삭]` · `N장 · N종 · N샹텐 · N순` 숫자 · 모양 말 · "텐파이를 유지" 류 · 영어 · 금지어 · 길이). 걸린 항목만 위반 목록을 붙여 한 번 더 받고,
+또 걸리면 그 항목은 `source: "fallback"`(`title` · `text` null — 앱은 카드 문구만).
+→ `{"version":1,"model":"…","prompt_version":"r2","summary":{"text","source","violations"},"turns":[{"turn","title","text","source","violations"}],"attempts":1|2,"input_tokens","output_tokens","elapsed_ms"}`.
+오류: 401 키 · 503 `GEMINI_API_KEY` 없음 · 413 본문 128KB 초과 · 422 규격 밖(차례 30개 · timeline 40개 넘음 포함) · 429 + `Retry-After`(이 라우트의 제한 또는 Gemini 429) · 502 그 밖의 LLM 실패(시간 초과 · 5xx · 빈 응답).
+환경 변수: `REVIEW_MODEL`(없으면 `GEMINI_MODEL`) · `REVIEW_THINKING`(`default`/`low`/`off`, 기본 `low`) · 사진 판독과 따로 세는 요청 제한 `REVIEW_RATE_PER_MIN` · `REVIEW_RATE_BURST` · `REVIEW_RATE_PER_HOUR` · `REVIEW_RATE_PER_DAY`(기본 6 / 3 / 60 / 200).
+서버 없이 한 번 돌려 보기: `python scripts/review_try.py 사실표.json [--out 응답.json] [--fake]`.
+
 ### 요청 제한 (요청당 1, 사진 수와 무관)
 
 - **토큰 버킷**: 한 번에 `RATE_BURST`(기본 20)개까지 몰아 보낼 수 있고, 분당 `RATE_PER_MIN`(기본 40)개씩 다시 찬다.

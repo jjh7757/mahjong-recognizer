@@ -9,3 +9,6 @@ onnxruntime==1.29.0
 numpy==2.5.2
 # 자리 판독 회전 상자(app/obb.py): 회전 상자 꼭짓점·세워 자르기(화면 없는 판)
 opencv-python-headless==5.0.0.93
+# 패보 복기 에이전트(app/review_agent.py, POST /v2/review/ask)의 그래프 — 도구 호출 고리의 상태 · 분기 · 횟수 제한.
+# 고정(2026-11-21): 범위로 두면 StateGraph API 가 판마다 바뀔 수 있다. langchain-core 등 딸린 패키지는 이 판이 정한 범위로 들어온다.
+langgraph==1.2.11

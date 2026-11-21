@@ -14,6 +14,8 @@ POST /v1/table      테이블 중앙 크롭(강 4개 + 왕패)
      "riichi":{"bottom":true,...}, "riichi_conf":{...},
      "last_discards":{"bottom":"7s","top":null,...}, "last_discards_conf":{...}, ...}
 GET  /              헬스체크(+ 저장소 주소 `source`, AGPL §13).
+POST /v2/review/explain  패보 리뷰 사실표(JSON, 사진 아님) → 검증한 LLM 해설(app/review.py).
+POST /v2/review/ask      복기 에이전트 사실표 + 질문 → 도구로 찾아 검증한 답(app/review_agent.py, LangGraph).
 
 좌표는 0~1000 정규화, side 는 이미지 기준(bottom/right/top/left). 설계: mahjong_calc/docs/table_reading_design.md
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import math
 import os
@@ -35,9 +38,10 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
+from . import review, review_agent
 from .observe import LAST_MULTI_MAX
 from .local_read import rss_mb
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
@@ -96,6 +100,15 @@ SEAT_SPLIT = os.environ.get("SEAT_SPLIT", "1") == "1"
 # 같은 순간 Gemini 비교에서 C·D 가 +0.87초(p=0.006)·D 엇갈림 7/40(기준 1/40)이었다(metrics 표 2-1, 2026-10-28).
 # 탁자 밖은 앱이 처음 사진을 펼 때(rectify.dart) 한 번에 자르는 쪽으로 간다.
 SEAT_TABLE = os.environ.get("SEAT_TABLE", "0") == "1"
+# 패보 리뷰 해설(/v2/review/explain, app/review.py). 글만 오가는 LLM 호출 — 모델 · 생각 수준 · 요청 제한을 사진 판독과 따로 둔다.
+# 한 판에 한 번(재시도 포함 Gemini 호출 2번까지)이라 제한은 작게: 한도에 걸리면 해설 쪽이 먼저 끊긴다(설계서 9절).
+REVIEW_MODEL = os.environ.get("REVIEW_MODEL") or GEMINI_MODEL
+# 생각 수준 기본 low: 첫 실제 호출에서 default 32.1초 · low 4.2초, 검증은 둘 다 통과(mahjong_calc metrics 표 15-1, 규격 A-8).
+REVIEW_THINKING = os.environ.get("REVIEW_THINKING", review.DEFAULT_THINKING)  # default | low | off
+REVIEW_RATE_PER_MIN = int(os.environ.get("REVIEW_RATE_PER_MIN", 6))
+REVIEW_RATE_BURST = int(os.environ.get("REVIEW_RATE_BURST", 3))
+REVIEW_RATE_PER_HOUR = int(os.environ.get("REVIEW_RATE_PER_HOUR", 60))
+REVIEW_RATE_PER_DAY = int(os.environ.get("REVIEW_RATE_PER_DAY", 200))
 
 app = FastAPI(title="mahjong-recognizer", version="0.4.0")
 recognizer: GeminiRecognizer | None = None
@@ -150,6 +163,10 @@ class RateLimiter:
 
 
 _limiter = RateLimiter(RATE_PER_MIN, RATE_BURST, RATE_PER_HOUR, RATE_PER_DAY)
+# 해설 전용 제한기(사진 판독의 _limiter 와 따로 센다).
+_review_limiter = RateLimiter(REVIEW_RATE_PER_MIN, REVIEW_RATE_BURST, REVIEW_RATE_PER_HOUR, REVIEW_RATE_PER_DAY)
+# 해설의 generate(prompt, schema) -> (dict, 입력 토큰, 출력 토큰). GEMINI_API_KEY 가 있으면 startup 에서 만든다.
+review_generator: review.GeminiTextGenerator | None = None
 
 
 class BodyLimit:
@@ -178,7 +195,7 @@ app.add_middleware(BodyLimit)
 
 @app.on_event("startup")
 def startup() -> None:
-    global recognizer
+    global recognizer, review_generator
     if not API_KEY:
         if not ALLOW_NO_AUTH:
             raise RuntimeError("RECOGNIZER_API_KEY 가 비어 있다 — 인증 없이 띄우려면 ALLOW_NO_AUTH=1 (로컬 실험만)")
@@ -202,6 +219,10 @@ def startup() -> None:
                  "river_frame=%s(conf %.2f) seat_frame=%s handonly_frame=%s seat_split=%s seat_table=%s", GEMINI_MODEL,
                  GEMINI_THINKING, LOCATE_THINKING, MAX_CONCURRENT, SEAT_READS, RIVER_FRAME, RIVER_CONF, SEAT_FRAME,
                  HANDONLY_FRAME, SEAT_SPLIT, SEAT_TABLE)
+        review_generator = review.GeminiTextGenerator(GEMINI_API_KEY, model=REVIEW_MODEL, thinking=REVIEW_THINKING)
+        log.info("review generator ready: model=%s thinking=%s prompt=%s rate=%d/min burst=%d hour=%d day=%d",
+                 REVIEW_MODEL, REVIEW_THINKING, review.PROMPT_VERSION, REVIEW_RATE_PER_MIN, REVIEW_RATE_BURST,
+                 REVIEW_RATE_PER_HOUR, REVIEW_RATE_PER_DAY)
     else:
         log.warning("GEMINI_API_KEY 가 없다 — /v1/* 는 503")
     log.info("limits: rate=%d/min burst=%d hour=%d day=%d upload=%d bytes executor=%d threads", RATE_PER_MIN,
@@ -677,3 +698,97 @@ async def observe_seat(image: UploadFile = File(...), x_api_key: str | None = He
     [hand_frac] 은 손패 칸(격자 선 사이 변)이 이 크롭에서 차지하는 폭 비율(왼쪽부터) — 손패 틀을 못 잡으면 손패 칸·모서리 칸으로
     나눠 한 번 더 잡는다(SEAT_SPLIT). 없으면 지금처럼."""
     return await _observe("seat", image, x_api_key, hand_frac=hand_frac)
+
+
+# ---------------------------------------------------------------- 패보 리뷰 해설(app/review.py, 규격: mahjong_calc 설계서 1118 부록 A)
+
+
+async def _read_review_body(request: Request, cap: int = review.MAX_REQUEST_BYTES) -> bytes:
+    """본문을 [cap](해설 review.MAX_REQUEST_BYTES · 에이전트 review_agent.MAX_REQUEST_BYTES)까지만 읽는다(넘으면 413).
+    전역 BodyLimit(사진 4MB 기준)보다 훨씬 작다."""
+    length = request.headers.get("content-length", "")
+    if length.isdigit() and int(length) > cap:
+        raise HTTPException(status_code=413, detail=f"body too large (> {cap} bytes)")
+    chunks, total = [], 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > cap:
+            raise HTTPException(status_code=413, detail=f"body too large (> {cap} bytes)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@app.post("/v2/review/explain")
+async def review_explain(request: Request, x_api_key: str | None = Header(default=None)) -> dict:
+    """패보 리뷰 해설: 앱이 계산한 사실표(JSON, 글뿐) → LLM 해설(총평 + 차례마다 제목 · 본문)을 코드로 검증해서.
+    걸린 항목만 한 번 다시 받고, 또 걸리면 그 항목은 source "fallback"(title · text null). 오류: 401 키 · 503 Gemini 키 없음 ·
+    413 본문 과다 · 422 규격 밖 · 429 이 라우트의 요청 제한 또는 Gemini 429(Retry-After) · 502 그 밖의 LLM 실패."""
+    _check_key(x_api_key)
+    if review_generator is None:
+        raise HTTPException(status_code=503, detail="review generator not configured")
+    body = await _read_review_body(request)
+    try:
+        req = json.loads(body)
+        review.validate_request(req)
+    except ValueError as e:  # JSON 깨짐 · UTF-8 아님 · 규격 밖
+        raise HTTPException(status_code=422, detail=f"bad review request: {e}") from None
+    wait_s = _review_limiter.take()
+    if wait_s:
+        retry = max(1, math.ceil(wait_s))
+        raise HTTPException(status_code=429, detail=f"too many review requests (retry after {retry}s)",
+                            headers={"Retry-After": str(retry)})
+    model = getattr(review_generator, "model", REVIEW_MODEL)
+    async with _sem:
+        try:
+            out = await _run(review.explain, req, review_generator, model)
+        except Exception as e:  # noqa: BLE001
+            if rate_limited(e):
+                log.warning("review: gemini 429 after retry -> 429 to client")
+                raise HTTPException(status_code=429, detail="upstream rate limited (gemini 429)",
+                                    headers={"Retry-After": str(UPSTREAM_429_RETRY_S)}) from e
+            log.warning("review: llm call failed: %s", type(e).__name__)
+            raise HTTPException(status_code=502, detail=f"review failed: {type(e).__name__}") from e
+    # 사실표 · 해설 본문은 찍지 않는다(차례 수 · 시도 수 · 토큰 · 대체 수만).
+    log.info("review/explain turns=%d attempts=%d fallback=%d summary=%s in %d ms (tokens %d+%d) model=%s prompt=%s",
+             len(out["turns"]), out["attempts"], sum(t["source"] == "fallback" for t in out["turns"]),
+             out["summary"]["source"], out["elapsed_ms"], out["input_tokens"], out["output_tokens"], model,
+             out["prompt_version"])
+    return out
+
+
+@app.post("/v2/review/ask")
+async def review_ask(request: Request, x_api_key: str | None = Header(default=None)) -> dict:
+    """패보 복기 에이전트: 앱이 만든 에이전트 사실표(JSON, 글뿐) + 질문 → LangGraph 그래프가 도구로 사실을 찾아 답하고,
+    답 속 패 · 숫자를 도구 결과와 대조해 검증한다(한 번 다시, 그래도 안 되면 코드가 만든 대체 답 — outcome "fallback").
+    인증 · 호출 제한 · LLM 은 해설 라우트와 같은 것(_review_limiter · review_generator)을 쓴다.
+    오류: 401 키 · 503 Gemini 키 없음 · 413 본문 과다(200KB) · 422 규격 밖 · 429 요청 제한 또는 Gemini 429 · 502 그 밖의 LLM 실패."""
+    _check_key(x_api_key)
+    if review_generator is None:
+        raise HTTPException(status_code=503, detail="review generator not configured")
+    body = await _read_review_body(request, review_agent.MAX_REQUEST_BYTES)
+    try:
+        req = json.loads(body)
+        review_agent.validate_request(req)
+    except ValueError as e:  # JSON 깨짐 · UTF-8 아님 · 규격 밖
+        raise HTTPException(status_code=422, detail=f"bad ask request: {e}") from None
+    wait_s = _review_limiter.take()
+    if wait_s:
+        retry = max(1, math.ceil(wait_s))
+        raise HTTPException(status_code=429, detail=f"too many review requests (retry after {retry}s)",
+                            headers={"Retry-After": str(retry)})
+    model = getattr(review_generator, "model", REVIEW_MODEL)
+    async with _sem:
+        try:
+            out = await _run(review_agent.ask, req, review_generator, model)
+        except Exception as e:  # noqa: BLE001
+            if rate_limited(e):
+                log.warning("review/ask: gemini 429 after retry -> 429 to client")
+                raise HTTPException(status_code=429, detail="upstream rate limited (gemini 429)",
+                                    headers={"Retry-After": str(UPSTREAM_429_RETRY_S)}) from e
+            log.warning("review/ask: llm call failed: %s", type(e).__name__)
+            raise HTTPException(status_code=502, detail=f"review ask failed: {type(e).__name__}") from e
+    # 질문 · 사실표 · 답 본문은 찍지 않는다(도구 수 · 결과 · 시간 · 토큰만).
+    log.info("review/ask tools=%d outcome=%s retries=%d llm=%d in %.1f s (tokens %d+%d) model=%s prompt=%s",
+             len(out["tool_calls"]), out["outcome"], out["retries"], out["usage"]["llm_calls"], out["elapsed_s"],
+             out["usage"]["input_tokens"], out["usage"]["output_tokens"], model, out["prompt_version"])
+    return out

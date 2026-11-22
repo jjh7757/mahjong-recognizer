@@ -7,7 +7,10 @@ python scripts/review_ask.py <에이전트 사실표.json> "<질문>" [--history
 
 --fake 는 Gemini 를 부르지 않는 가짜 LLM 이다(키 · 네트워크 없이 그래프만 돈다): 질문에 차례 번호가 있으면 turn_info →
 (숫자 있는 차례면) discard_options 를 부르고, 없으면 game_summary 를 부른 뒤 도구 결과로 답을 쓴다. 첫 답에는 일부러 도구 결과에
-없는 숫자를 넣어 검증 실패 → 재시도까지 보인다.
+없는 숫자를 넣어 검증 실패 → 재시도까지 보인다. 수비 질문(위험 · 안전 · 수비 · 접 · 밀 이 든 질문, 지시문 a3)은 차례가 있으면
+defense_info, 없으면 find_turns(min_level 높음)를 부르고, 첫 답에 일부러 판정 말("접었어야 했다")을 넣어 검증 실패 → 재시도를 보인다.
+"판정하지 않는다" 문장은 옳고 그름을 물은 질문(했어야 · 맞았 · 됐어 · 실수 · 잘한 …)에만 붙인다(지시문 a4).
+--out 의 응답 JSON 에는 재시도를 부른 위반 목록들(retry_violations, 시도 순)도 들어간다.
 --fake 가 없으면 GEMINI_API_KEY(환경 변수에서만 읽고 찍지 않음)로 실제 호출한다 — 돈이 드니 사용자 허락 뒤에만.
 모델은 REVIEW_MODEL(없으면 GEMINI_MODEL), 생각 수준은 REVIEW_THINKING(없으면 low).
 """
@@ -51,7 +54,7 @@ def fake_generate():
         question = _section(prompt, "## 질문")
         done = _tool_results(prompt)
         retried = "- 검사에 걸림" in prompt
-        answer_only = schema["properties"]["action"].get("enum") == ["answer"]
+        answer_only = review_agent.schema_answer_only(schema)  # a4: 기본 스키마는 최상위 anyOf
 
         def found(name: str, turn: int | None = None) -> dict | None:
             for tool, args, result in done:
@@ -63,6 +66,13 @@ def fake_generate():
             return {"action": "tool", "tool": name, "args": args}, len(prompt) // 4, 20
 
         turns = review_agent.question_turns(question)
+        if any(w in question for w in _DEFENSE_WORDS):
+            text = _fake_defense(question, turns, found, answer_only)
+            if isinstance(text, tuple):  # 도구 호출
+                return call(*text)
+            if not retried:
+                text += " 여기서는 접었어야 했다."  # 일부러 넣은 판정 말(fold_spot 없음) → 검증 실패 → 재시도
+            return {"action": "answer", "text": text}, len(prompt) // 4, 60
         if turns:
             n = turns[0]
             info = found("turn_info", n)
@@ -90,6 +100,42 @@ def fake_generate():
         return {"action": "answer", "text": text}, len(prompt) // 4, 60
 
     return generate
+
+
+_DEFENSE_WORDS = ("위험", "안전", "수비", "접", "밀")
+# 옳고 그름을 묻는 질문(지시문 a4: "판정하지 않는다" 는 이런 질문에만 한 번).
+_VERDICT_QUESTION = ("했어야", "맞았", "맞아", "됐어", "실수", "잘한", "괜찮")
+
+
+def _fake_defense(question: str, turns: list[int], found, answer_only: bool):
+    """수비 질문의 가짜 흐름(지시문 a3 · a4): 차례가 있으면 defense_info, 없으면 find_turns(min_level 높음).
+    도구를 부를 때는 (도구, 인자), 답할 때는 글. "판정하지 않는다" 는 옳고 그름을 물은 질문에만 붙인다(a4)."""
+    bracket, with_eun, with_ida = review_agent.bracket, review_agent.with_eun, review_agent.with_ida
+    tail = " 이 도우미는 밀지 접을지를 판정하지 않는다." if any(w in question for w in _VERDICT_QUESTION) else ""
+    if turns:
+        n = turns[0]
+        info = found("defense_info", n)
+        if info is None and not answer_only:
+            return "defense_info", {"turn": n}
+        if info is None or "error" in info:
+            return "질문한 차례는 이 판에서 찾지 못했다. 다른 차례 번호로 물어 주면 도구로 확인한다."
+        d = info.get("defense")
+        if not d:
+            return f"{n}순에는 방총 위험 단계가 없다. 리치한 자리가 없거나 손패를 모르는 차례다."
+        a = d["actual"]
+        safest = " · ".join(bracket(x) for x in d["safest"])
+        return (f"{n}순에 버린 {with_eun(bracket(a['tile']))} 위험 '{a['level']}'으로 손의 {a['of']}종 중 {a['rank']}위였다. "
+                f"가장 안전한 패는 {with_ida(safest)}.{tail}")
+    rows = found("find_turns")
+    if rows is None and not answer_only:
+        return "find_turns", {"min_level": "높음"}
+    rows = (rows or {}).get("turns") or []
+    if not rows:
+        return f"리치한 자리가 있을 때 '높음' 이상 위험한 패를 버린 차례는 없다.{tail}"
+    parts = " · ".join(f"{r['turn']}순 {bracket(r['discard'])}('{r['level']}'{'' if r.get('can_choose', True) else ', 리치 중이라 고를 수 없음'})"
+                       for r in rows[:4])
+    more = " 등" if len(rows) > 4 else ""
+    return f"리치한 자리가 있을 때 '높음' 이상 위험한 패를 버린 차례는 {parts}{more}이다.{tail}"
 
 
 def _short(result: dict, limit: int = 160) -> str:

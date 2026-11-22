@@ -85,6 +85,11 @@ def answer(text: str) -> dict:
     return {"action": "answer", "text": text}
 
 
+def _variant(tool_name: str) -> dict:
+    """a4 도구별 스키마(최상위 anyOf)에서 그 도구의 변형."""
+    return next(v for v in ra.action_schema()["anyOf"] if v["properties"]["tool"]["enum"] == [tool_name])
+
+
 # r19 6번째(설계서 예시 · 앱 시험의 손 계산): [4만] 쯔모기리, 버린 뒤 1샹텐 10장, 최선 [3만] · [3삭] 15장, 손실 5장.
 GOOD_6 = "6순에 [4만]을 버린 뒤 유효패는 10장이었다. 최선 [3만]을 버렸다면 유효패 15장이었다. 패효율 기준 실수다."
 BAD_6 = "6순에 [4만]을 버린 뒤 유효패는 12장이었다. 최선 [3만]을 버렸다면 유효패 15장이었다."
@@ -477,14 +482,15 @@ def test_graph_tool_then_answer(r19):
     assert out["outcome"] == "verified" and out["answer"] == GOOD_6 and out["violations"] == []
     assert out["tool_calls"] == [{"tool": "turn_info", "args": {"turn": 6}}]
     assert out["retries"] == 0 and out["usage"] == {"input_tokens": 200, "output_tokens": 40, "llm_calls": 2}
-    assert out["prompt_version"] == "a2" and out["model"] == "m"
+    assert out["prompt_version"] == "a5" and out["model"] == "m"   # 11-22 a2 → a3(수비 확장) → a4(F1 ~ F5) → a5(G1 ~ G3)
+    assert out["retry_violations"] == []
     # 첫 지시문: 규칙 · 도구 목록 · 질문, 아직 도구 없음. 둘째: 도구 결과가 붙음.
     p1, p2 = gen.prompts
     assert "## 질문\n6순에 왜 4만이 실수야?" in p1 and "도구 0/6회" in p1 and "- 아직 없음" in p1
     for name in ra.TOOL_NAMES:
         assert f"- {name}(" in p1
     assert "도구 1/6회" in p2 and '- 도구 turn_info {"turn": 6}' in p2 and '"best":["3m","3s"]' in p2
-    assert gen.schemas[0]["properties"]["action"]["enum"] == ["tool", "answer"]
+    assert "anyOf" in gen.schemas[0] and not ra.schema_answer_only(gen.schemas[0])   # a4: 도구마다 따로인 스키마
 
 
 def test_graph_verify_fail_then_retry_passes(r19):
@@ -493,6 +499,10 @@ def test_graph_verify_fail_then_retry_passes(r19):
     assert s["outcome"] == "verified" and s["retries"] == 1 and s["llm_calls"] == 3 and s["answer"] == GOOD_6
     assert "- 검사에 걸림" in gen.prompts[2] and "12장" in gen.prompts[2] and BAD_6 in gen.prompts[2]
     assert [m["role"] for m in s["messages"]] == ["tool", "answer", "check", "answer"]
+    # a4 F5: 재시도를 부른 위반이 응답에 남는다(마지막 violations 는 통과라 빈 목록).
+    out = ra.to_response(s, 0.0)
+    assert out["violations"] == [] and len(out["retry_violations"]) == 1
+    assert out["retry_violations"][0] == s["messages"][2]["violations"] and any("12장" in v for v in out["retry_violations"][0])
 
 
 def test_graph_retry_may_call_more_tools(r19):
@@ -507,6 +517,8 @@ def test_graph_fails_twice_then_fallback(r19):
     out = ask(_req(r19, "6순에 왜 4만이 실수야?"), gen)
     assert out["outcome"] == "fallback" and out["retries"] == 1 and out["usage"]["llm_calls"] == 3
     assert any("12장" in v for v in out["violations"])
+    # a4 F5: 첫 시도의 위반은 retry_violations 에, 대체로 끝난 마지막 시도의 위반은 지금처럼 violations 에.
+    assert len(out["retry_violations"]) == 1 and any("12장" in v for v in out["retry_violations"][0])
     # 대체 답: 6번째 turn_info 를 코드 문장으로(앱 3-8 틀과 같은 뜻).
     assert out["answer"] == ("확인한 사실만 적는다. 6순에 [4만]을 버렸고 패효율 기준 실수다. 버린 뒤 1샹텐이고 유효패 10장이다. "
                              "최선은 [3만](또는 [3삭]) 버림으로 1샹텐 · 유효패 15장이다.")
@@ -528,8 +540,9 @@ def test_graph_tool_limit_forces_answer(r19):
     assert out["outcome"] == "verified" and len(out["tool_calls"]) == 6
     # 7번째 호출은 답만 받는 스키마 · 지시문.
     assert gen.schemas[6]["properties"]["action"]["enum"] == ["answer"] and gen.schemas[6]["required"] == ["action", "text"]
+    assert gen.schemas[6]["propertyOrdering"] == ["action", "text"] and ra.schema_answer_only(gen.schemas[6])
     assert "도구는 더 부를 수 없다" in gen.prompts[6] and "도구 6/6회" in gen.prompts[6]
-    assert all(s["properties"]["action"]["enum"] == ["tool", "answer"] for s in gen.schemas[:6])
+    assert all(s == ra.action_schema() and not ra.schema_answer_only(s) for s in gen.schemas[:6])
 
 
 def test_graph_tool_after_limit_goes_to_fallback(r19):
@@ -642,9 +655,10 @@ def test_prompt_rules_a2():
     # a2: "만약" 질문은 차례 상태부터, 여러 차례 질문은 find_turns 조건부터.
     for word in ("can_choose", "고를 수 없던 차례", "차례마다 도구를 부르지 말고", "after_riichi"):
         assert word in p, word
-    assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?)" in p
-    assert "after_riichi" in ra.action_schema()["properties"]["args"]["properties"]
-    assert ra.PROMPT_VERSION == "a2"
+    # 11-22 a3: find_turns 에 stance? · min_level? 이 더해짐(설계서 1122 4절) — 앞 다섯 인자는 그대로.
+    assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?, stance?, min_level?)" in p
+    assert "after_riichi" in _variant("find_turns")["properties"]["args"]["properties"]
+    assert ra.PROMPT_VERSION == "a5"
 
 
 # ---------------------------------------------------------------- 요청 검사
@@ -654,7 +668,7 @@ def test_validate_rejects(r19):
     ok = _req(r19, "6순에 왜?")
     validate_request(ok)
     bad = []
-    r = copy.deepcopy(ok); r["facts"]["version"] = 2; bad.append((r, "version"))
+    r = copy.deepcopy(ok); r["facts"]["version"] = 3; bad.append((r, "version"))  # 11-22: 2 는 이제 받는 판(1 · 2)
     r = copy.deepcopy(ok); r["question"] = ""; bad.append((r, "question"))
     r = copy.deepcopy(ok); r["question"] = "가" * 301; bad.append((r, "question"))
     r = copy.deepcopy(ok); r["history"] = [{"q": "a", "a": "b"}] * 5; bad.append((r, "history"))
@@ -695,8 +709,9 @@ def test_route_200_and_shape(client, caplog, r19):
         r = client.post(PATH, json=_req(r19, "6순에 왜 4만이 실수야?"))
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"answer", "outcome", "tool_calls", "violations", "retries", "prompt_version", "model",
-                         "elapsed_s", "usage"}
+    assert set(body) == {"answer", "outcome", "tool_calls", "violations", "retries", "retry_violations",
+                         "prompt_version", "model", "elapsed_s", "usage"}
+    assert body["retry_violations"] == []
     assert body["outcome"] == "verified" and body["answer"] == GOOD_6 and body["model"] == "fake-model"
     assert body["tool_calls"] == [{"tool": "turn_info", "args": {"turn": 6}}]
     logs = "\n".join(rec.getMessage() for rec in caplog.records)
@@ -770,3 +785,707 @@ def test_script_fake_runs_one_game(tmp_path):
     body = json.loads(out.read_text(encoding="utf-8"))
     assert body["outcome"] == "verified" and body["retries"] == 1 and body["model"] == "fake"
     assert [c["tool"] for c in body["tool_calls"]] == ["turn_info", "discard_options"]
+
+
+# ---------------------------------------------------------------- 수비 확장(설계서 mahjong_calc docs/paifu_review_agent_defense_design_1122.md)
+#
+# 사실표 2 의 defense: 리치한 다른 자리가 있고 손패를 알고 엔진 위험표가 있는 차례만. 예시 11판에서 L16 17 · 18번째(수비),
+# r11 8 · 9번째(수비) · 10~16번째(리치 중), r12 10~14번째(리치 중) = 16차례. 값은 앱 tool/paifu_agent_facts.dart 가 낸 그대로.
+
+
+def _v1(facts: dict) -> dict:
+    """사실표 2 → 1(defense 칸을 뺌)."""
+    f = copy.deepcopy(facts)
+    f["version"] = 1
+    for t in f["turns"]:
+        t.pop("defense", None)
+    return f
+
+
+def _scalars(v):
+    if isinstance(v, dict):
+        for x in v.values():
+            yield from _scalars(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from _scalars(x)
+    else:
+        yield v
+
+
+def test_fixtures_are_v2_with_16_defense_turns():
+    got = {g[:3]: [t["turn"] for t in load(g)["turns"] if t.get("defense")] for g in GAMES}
+    assert {k: v for k, v in got.items() if v} == {"L16": [17, 18], "r11": list(range(8, 17)), "r12": list(range(10, 15))}
+    for g in GAMES:
+        facts = load(g)
+        assert facts["version"] == 2
+        for t in facts["turns"]:
+            assert "defense" in t
+            if t["defense"]:
+                # defense 는 리치한 자리가 있고 손패를 아는 차례에만. 엔진 % 값(실수)은 없다.
+                assert t["riichi_winds"] and t["hand"] is not None
+                assert not any(isinstance(x, float) for x in _scalars(t["defense"]))
+
+
+@pytest.mark.parametrize("name", GAMES)
+def test_defense_info_returns_facts_as_is(name):
+    facts = load(name)
+    for t in facts["turns"]:
+        out = run_tool(facts, "defense_info", {"turn": t["turn"]})
+        assert out["defense"] == t["defense"], (name, t["turn"])
+        assert (out["turn"], out["status"], out["riichi_winds"], out["discard"], out["genbutsu"]) == \
+            (t["turn"], t["status"], t["riichi_winds"], t["discard"], t["genbutsu"])
+        assert out["can_choose"] == (t["status"] != "forced")
+        note = out.get("note", "")
+        if not t["riichi_winds"]:
+            assert "리치한 다른 자리가 없다" in note
+        elif t["defense"] is None:
+            assert "손패를 몰라" in note or "엔진 위험 값이 없다" in note
+        else:
+            # fold_spot 이 늘 null(1단계). a4 F2: note 는 "판정 없음" 까지만 — "판정하지 않는다" 문장을 싣지 않는다.
+            assert "이 차례의 밀기 · 접기 판정은 없다(fold_spot null)" in note
+            assert "판정하지 않는다" not in note and "이 도우미는" not in note
+            assert ("고를 수 없었다" in note) == (t["status"] == "forced")
+            # 리치 중 차례: stance · efficient 는 null, 밀었다 · 접었다를 말하지 않는다는 알림.
+            assert (t["defense"]["stance"] is None) == (t["status"] == "forced")
+            assert ("밀었다 · 접었다를 말하지 않는다" in note) == (t["status"] == "forced")
+            if t["status"] == "forced":
+                assert t["defense"]["efficient"] is None
+
+
+def test_defense_info_r11_turn8_values(r11):
+    # r11 8번째(수비, 서 리치): 손 13종, 버린 [9통]은 '높음' · 6위, 가장 안전한 패는 현물 [6만]('안전').
+    out = run_tool(r11, "defense_info", {"turn": 8})
+    d = out["defense"]
+    assert d["threat_winds"] == ["서"] and d["stance"] == "pushed" and d["fold_spot"] is None
+    assert d["actual"] == {"tile": "9p", "level": "높음", "rank": 6, "of": 13}
+    assert d["safest"] == ["6m"] and d["tiles"][0] == {"tile": "6m", "level": "안전", "genbutsu": True}
+    assert d["efficient"] == {"tile": "1m", "level": "높음"}
+    assert [x["tile"] for x in d["tiles"] if x["genbutsu"]] == _turn(r11, 8)["safe_tiles"]
+    assert out["status"] == "defense" and out["can_choose"]
+
+
+def test_defense_info_notes_v1_missing_unknown(r11, r19):
+    # 리치 없음.
+    out = run_tool(r19, "defense_info", {"turn": 6})
+    assert out["defense"] is None and "리치한 다른 자리가 없다" in out["note"]
+    # 사실표 1: defense 없는 것으로.
+    out = run_tool(_v1(r11), "defense_info", {"turn": 8})
+    assert out["defense"] is None and "판 1" in out["note"]
+    # 사실표 1 에 defense 칸이 남아 있어도 보지 않는다.
+    v1b = copy.deepcopy(r11)
+    v1b["version"] = 1
+    assert run_tool(v1b, "defense_info", {"turn": 8})["defense"] is None
+    # 엔진 값 없음(리치 · 손패는 있는데 defense null).
+    f = copy.deepcopy(r11)
+    _turn(f, 8)["defense"] = None
+    assert "엔진 위험 값이 없다" in run_tool(f, "defense_info", {"turn": 8})["note"]
+    # 손패 모름.
+    _turn(f, 8)["hand"] = None
+    assert "손패를 몰라" in run_tool(f, "defense_info", {"turn": 8})["note"]
+    # 없는 차례 · 인자 오류.
+    assert set(run_tool(r11, "defense_info", {"turn": 99})) == {"error"}
+    assert set(run_tool(r11, "defense_info", {})) == {"error"}
+
+
+@pytest.mark.parametrize("name", GAMES)
+def test_what_if_risk_matches_defense_tiles(name):
+    facts = load(name)
+    for t in facts["turns"]:
+        for o in t["options"]:
+            out = run_tool(facts, "what_if", {"turn": t["turn"], "tile": o["discard"]})
+            if not t["riichi_winds"]:
+                assert "risk" not in out
+                continue
+            d = t["defense"]
+            if d is None:
+                assert out["risk"] is None
+                continue
+            r = out["risk"]
+            row = next(x for x in d["tiles"] if x["tile"] == o["discard"])
+            assert (r["tile"], r["level"], r["genbutsu"], r["of"]) == \
+                (o["discard"], row["level"], row["genbutsu"], len(d["tiles"]))
+            assert r["is_safest"] == (o["discard"] in d["safest"])
+            # a5 G1: 실제 버린 패는 사실표 defense.actual 그대로, 가장 안전한 패는 패마다 tiles 줄의 단계(찾기만).
+            assert r["actual"] == d["actual"]
+            level_of = {x["tile"]: x["level"] for x in d["tiles"]}
+            assert r["safest"] == [{"tile": s, "level": level_of[s]} for s in d["safest"]]
+            if o["discard"] == d["actual"]["tile"]:
+                assert r["rank"] == d["actual"]["rank"]
+            elif r["is_safest"]:
+                assert r["rank"] == 1
+            else:
+                assert r["rank"] == [x["tile"] for x in d["tiles"]].index(o["discard"]) + 1
+
+
+def test_what_if_risk_r11_turn8_by_hand(r11):
+    out = run_tool(r11, "what_if", {"turn": 8, "tile": "6m"})
+    assert out["risk"] == {"tile": "6m", "level": "안전", "rank": 1, "of": 13, "genbutsu": True, "is_safest": True,
+                           "actual": {"tile": "9p", "level": "높음", "rank": 6, "of": 13},
+                           "safest": [{"tile": "6m", "level": "안전"}]}
+    asked = run_tool(r11, "what_if", {"turn": 8, "tile": "9p"})["risk"]
+    assert asked["rank"] == 6       # 버린 패 = actual.rank
+    assert asked["actual"] == {"tile": "9p", "level": "높음", "rank": 6, "of": 13}     # 물어본 패가 버린 패여도 actual 은 둔다
+    last = run_tool(r11, "what_if", {"turn": 8, "tile": "4m"})["risk"]
+    assert (last["level"], last["rank"]) == ("높음", 13)
+    # 사실표 1 이면 risk 는 null(리치한 자리는 있으니 칸은 둔다).
+    assert run_tool(_v1(r11), "what_if", {"turn": 8, "tile": "6m"})["risk"] is None
+    # 기존 칸은 그대로(note · tile_genbutsu).
+    assert out["note"].endswith("[6만]은 현물이다") and out["tile_genbutsu"] is True
+
+
+@pytest.mark.parametrize("name", GAMES)
+def test_find_turns_stance_and_min_level_are_facts(name):
+    facts = load(name)
+    for st in ra.STANCES:
+        rows = run_tool(facts, "find_turns", {"stance": st})["turns"]
+        assert [r["turn"] for r in rows] == [t["turn"] for t in facts["turns"]
+                                             if t["defense"] and t["defense"]["stance"] == st]
+        assert all(r["stance"] == st for r in rows)
+    for i, lv in enumerate(ra.LEVELS):
+        rows = run_tool(facts, "find_turns", {"min_level": lv})["turns"]
+        assert [r["turn"] for r in rows] == [t["turn"] for t in facts["turns"]
+                                             if t["defense"] and ra.LEVELS.index(t["defense"]["actual"]["level"]) >= i]
+    # 줄마다 버린 패의 단계 · stance(defense 없는 차례는 null).
+    for r, t in zip(run_tool(facts, "find_turns", {})["turns"], facts["turns"]):
+        d = t["defense"]
+        assert (r["level"], r["stance"]) == ((d["actual"]["level"], d["stance"]) if d else (None, None))
+
+
+def test_find_turns_defense_conditions_r11(r11):
+    out = run_tool(r11, "find_turns", {"min_level": "높음"})
+    assert [r["turn"] for r in out["turns"]] == [8, 9, 11, 14] and out["conditions"] == {"min_level": "높음"}
+    assert [r["level"] for r in out["turns"]] == ["높음", "높음", "매우 높음", "매우 높음"]
+    for arg in ("'높음'", " 높음 ", "high"):
+        assert run_tool(r11, "find_turns", {"min_level": arg}) == out, arg
+    assert run_tool(r11, "find_turns", {"min_level": "매우높음"})["count"] == 2
+    # min_level 은 리치 중 차례(11 · 14)도 고르되 줄에 고를 수 없던 차례임이 드러난다.
+    assert [(r["status"], r["can_choose"], r["stance"]) for r in out["turns"]] ==         [("defense", True, "pushed"), ("defense", True, "pushed"), ("forced", False, None), ("forced", False, None)]
+    # stance 조건은 stance 가 null 인 리치 중 차례를 고르지 않는다(12번째는 리치 중이라 folded 가 아님).
+    assert [r["turn"] for r in run_tool(r11, "find_turns", {"stance": "pushed"})["turns"]] == [8, 9]
+    folded = run_tool(r11, "find_turns", {"stance": "folded"})
+    assert folded["count"] == 0
+    assert run_tool(r11, "find_turns", {"stance": "접었다"}) == folded
+    for name in GAMES:
+        f = load(name)
+        for st in ra.STANCES:
+            assert all(r["status"] != "forced" for r in run_tool(f, "find_turns", {"stance": st})["turns"])
+    # 다른 조건과 그리고: 서 리치 뒤 수비 차례 중 밀었다.
+    rows = run_tool(r11, "find_turns", {"after_riichi": "서", "status": "defense", "stance": "pushed"})["turns"]
+    assert [r["turn"] for r in rows] == [8, 9]
+    # 줄 글(line)은 a2 그대로 — 단계는 level 칸에만.
+    assert rows[0]["line"] == "8순 [9통] 버림 · 수비 · 서 리치에 현물 아님"
+    for args, word in (({"stance": "x"}, "stance"), ({"min_level": "?"}, "min_level")):
+        bad = run_tool(r11, "find_turns", args)
+        assert set(bad) == {"error"} and word in bad["error"]
+
+
+def test_rule_defense_texts():
+    risk = run_tool({}, "rule", {"name": "방총 위험"})
+    assert risk["name"] == "방총 위험"
+    for word in ("2,499번 중 0번", "'낮음' 1% 미만", "'보통' 약 3%", "'높음' 약 8%", "'매우 높음' 약 15%", "천봉 고단자 판",
+                 "리치한 상대", "리치하지 않은 상대는 보지 않는다", "엔진의 어림"):
+        assert word in risk["text"], word
+    pf = run_tool({}, "rule", {"name": "밀기 접기"})
+    assert pf["name"] == "밀기 접기" and "판정이 아니다" in pf["text"] and "fold_spot" in pf["text"]
+    for alias, key in (("방총위험", "방총 위험"), ("위험 단계", "방총 위험"), ("stance", "밀기 접기"), ("밀기접기", "밀기 접기")):
+        assert run_tool({}, "rule", {"name": alias})["name"] == key
+
+
+# ---- 요청 검사(사실표 1 · 2)
+
+
+def test_validate_accepts_v1_and_v2(r11, r19):
+    validate_request(_req(r11, "8순에 위험했어?"))
+    validate_request(_req(_v1(r11), "8순에 위험했어?"))
+    validate_request(_req(_v1(r19), "6순에 왜?"))
+    v1b = copy.deepcopy(r11)
+    v1b["version"] = 1                       # 판 1 에 남은 defense 칸은 검사하지 않는다(무시)
+    _turn(v1b, 8)["defense"] = "아무거나"
+    validate_request(_req(v1b, "8순?"))
+
+
+def test_validate_rejects_bad_defense(r11):
+    ok = _req(r11, "8순에 위험했어?")
+    bad = []
+
+    def mut(fn, word):
+        r = copy.deepcopy(ok)
+        fn(_turn(r["facts"], 8))
+        bad.append((r, word))
+
+    mut(lambda t: t.pop("defense"), "defense 없음")
+    mut(lambda t: t.update(defense=[]), "객체")
+    mut(lambda t: t["defense"].pop("stance"), "객체")
+    mut(lambda t: t["defense"]["tiles"][0].update(level="조금"), "tiles")
+    mut(lambda t: t["defense"]["tiles"].pop(), "손의 패 종류 전부")
+    mut(lambda t: t["defense"]["tiles"].append(dict(t["defense"]["tiles"][0])), "두 번")
+    mut(lambda t: t["defense"]["actual"].update(tile="6m"), "actual")
+    mut(lambda t: t["defense"]["actual"].update(rank=14), "actual")
+    mut(lambda t: t["defense"]["actual"].update(level="안전"), "actual")
+    mut(lambda t: t["defense"].update(safest=["1z"]), "safest")
+    mut(lambda t: t["defense"].update(efficient={"tile": "1z", "level": "낮음"}), "efficient")
+    mut(lambda t: t["defense"].update(stance="maybe"), "stance")
+    mut(lambda t: t["defense"].update(stance=None), "stance")                     # 수비 차례는 stance 가 있어야
+    bad.append((_bad_forced(ok, stance="pushed"), "stance"))                   # 리치 중 차례는 stance null
+    bad.append((_bad_forced(ok, efficient={"tile": "1m", "level": "높음"}), "efficient"))
+    mut(lambda t: t["defense"].update(fold_spot="yes"), "fold_spot")
+    mut(lambda t: t["defense"].update(threat_winds=["east"]), "threat_winds")
+    mut(lambda t: t.update(riichi_winds=[]), "리치한 자리가 있고")
+    for r, word in bad:
+        with pytest.raises(ValueError, match=word):
+            validate_request(r)
+
+
+# ---- 검증: 단계 말 · 판정 말
+
+
+DEF_8 = "8순에 버린 [9통]은 위험 '높음'으로 손의 13종 중 6위였다. 가장 안전한 패는 현물 [6만]으로 '안전'이었다."
+
+
+def test_verify_level_words_pass(r11, r19):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    assert verify_answer(DEF_8, ev, "8순에 버린 9통 위험했어?") == []
+    # 따옴표 밖 "안전" · "보통" 은 흔한 말이라 보지 않는다. 굽은 따옴표도 받는다.
+    assert verify_answer("8순에 버린 [9통]은 ‘높음’이었다. 보통은 안전한 패를 고른다.", ev, "8순?") == []
+    # 판정하지 않는다는 문장은 판정 말이 아니다.
+    assert verify_answer("8순 [9통]은 위험 '높음'이었다. 이 도우미는 밀지 접을지를 판정하지 않는다.", ev,
+                         "8순에 접었어야 했어?") == []
+    # what_if 의 risk · find_turns 줄의 level 도 근거.
+    ev2 = _ev(r11, ("what_if", {"turn": 8, "tile": "6m"}))
+    assert verify_answer("8순에 [6만]을 버렸다면 위험 '안전'으로 손의 13종 중 1위였다.", ev2, "8순에 6만은?") == []
+    ev3 = _ev(r11, ("find_turns", {"min_level": "높음"}))
+    assert verify_answer("11순 [5삭]은 '매우 높음'이었다.", ev3, "위험한 버림?") == []
+    # 그 단계 이상이 없다는 답(min_level 조건 값이 근거).
+    ev4 = _ev(r19, ("find_turns", {"min_level": "높음"}))
+    assert ev4[0]["result"]["count"] == 0
+    assert verify_answer("'높음' 이상 위험한 패를 버린 차례는 없다.", ev4, "위험한 버림?") == []
+    # rule '방총 위험' 을 읽으면 다섯 단계 · 관측 비율 % 가 근거가 된다.
+    ev5 = _ev(r11, ("rule", {"name": "방총 위험"}))
+    assert verify_answer("'매우 높음' 단계의 실제 방총은 약 15%였다.", ev5, "매우 높음은 얼마나 위험해?") == []
+
+
+@pytest.mark.parametrize("text,word", [
+    ("8순에 버린 [9통]은 위험 '매우 높음'이었다.", "사실표에 없는 위험 단계: '매우 높음'"),   # evidence 에는 안전 · 보통 · 높음뿐
+    ("8순에 버린 [9통]은 위험 '낮음'이었다.", "사실표에 없는 위험 단계: '낮음'"),
+    ("8순에 버린 [9통]은 위험이 높음이었다.", "작은따옴표 없이 쓴 위험 단계: 높음"),
+    ("8순에 버린 [9통]은 위험이 매우 높음이었다.", "작은따옴표 없이 쓴 위험 단계: 매우 높음"),
+    ("8순에 [6만]은 위험이 낮음이었다.", "작은따옴표 없이 쓴 위험 단계: 낮음"),
+    ("8순에 버린 [9통]의 방총 위험은 12%였다.", "12%"),                                   # % 를 지어냄
+    ("8순에 버린 [9통]은 손의 13종 중 7위였다.", "7위"),
+])
+def test_verify_level_words_catch(r11, text, word):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    v = verify_answer(text, ev, "8순?")
+    assert any(word in x for x in v), v
+
+
+@pytest.mark.parametrize("phrase", ["접었어야 했다", "접는 게 맞았다", "접어야 했다", "내렸어야 했다", "밀면 안 됐다",
+                                    "밀지 말았어야 했다", "밀어도 됐다", "밀어도 괜찮았다", "밀 만했다", "접는게 맞다"])
+def test_verify_verdict_words_need_fold_spot(r11, phrase):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    text = f"8순 [9통]은 위험 '높음'이었다. 여기서는 {phrase}."
+    assert any("판정 말" in x for x in verify_answer(text, ev, "8순?"))
+    # fold_spot 사실이 있는 차례를 evidence 로 받았으면 통과(3단계에서 채울 칸 — 여기선 손으로 넣어 봄).
+    f = copy.deepcopy(r11)
+    _turn(f, 8)["defense"]["fold_spot"] = True
+    assert verify_answer(text, _ev(f, ("defense_info", {"turn": 8})), "8순?") == []
+
+
+def test_verify_verdict_not_triggered_by_ordinary_words(r11):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    for text in ("8순 [9통]은 '높음'이었다. 이 도우미는 밀지 접을지를 판정하지 않는다.",
+                 "8순 [6만]을 밀면 안전하다는 뜻은 아니다. 현물이라 '안전'이었다.",
+                 "8순에는 [9통]을 밀었다. 위험은 '높음'이었다."):
+        assert verify_answer(text, ev, "8순?") == [], text
+
+
+# ---- 그래프(가짜 LLM): 수비 질문
+
+
+DEF_Q = "8순에 버린 9통 위험했어?"
+VERDICT_8 = DEF_8 + " 여기서는 접었어야 했다."
+
+
+def test_graph_defense_question_verified(r11):
+    gen = Script(tool("defense_info", turn=8), answer(DEF_8))
+    out = ask(_req(r11, DEF_Q), gen)
+    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a5"
+    assert out["tool_calls"] == [{"tool": "defense_info", "args": {"turn": 8}}]
+    # 지시문: 수비 규칙 · 새 도구, 둘째 지시문에 defense 칸이 그대로.
+    p1, p2 = gen.prompts
+    assert "- defense_info(turn):" in p1 and "'높음'" in p1
+    assert '"actual":{"tile":"9p","level":"높음","rank":6,"of":13}' in p2
+
+
+def test_graph_defense_verdict_retry_then_pass(r11):
+    gen = Script(tool("defense_info", turn=8), answer(VERDICT_8), answer(DEF_8))
+    s, _ = run(_req(r11, DEF_Q), gen)
+    assert s["outcome"] == "verified" and s["retries"] == 1 and s["answer"] == DEF_8
+    assert "판정 말(fold_spot 사실 없음): 접었어야" in gen.prompts[2]
+
+
+def test_graph_defense_verdict_twice_falls_back(r11):
+    gen = Script(tool("defense_info", turn=8), answer(VERDICT_8), answer(VERDICT_8))
+    out = ask(_req(r11, DEF_Q), gen)
+    assert out["outcome"] == "fallback" and out["retries"] == 1
+    assert any("판정 말" in v for v in out["violations"])
+    # 대체 답은 8번째 turn_info 문장(수비 차례 · 현물 아님) — 판정 말 없이 자기 검증을 통과.
+    assert out["answer"] == ("확인한 사실만 적는다. 8순은 서 자리가 리치 중이라 패효율 등급을 매기지 않았다. "
+                             "버린 [9통]은 현물이 아니다.")
+
+
+def test_graph_defense_whole_game_find_turns(r11):
+    a = ("리치한 자리가 있을 때 '높음' 이상 위험한 패를 버린 차례는 8순 [9통] · 9순 [4만] · 11순 [5삭] · 14순 [6통]이다. "
+         "11순과 14순은 '매우 높음'이었다. 이 도우미는 밀지 접을지를 판정하지 않는다.")
+    gen = Script(tool("find_turns", min_level="높음"), answer(a))
+    out = ask(_req(r11, "리치 받은 뒤 위험하게 버린 곳 있어?"), gen)
+    assert out["outcome"] == "verified", out["violations"]
+
+
+def test_graph_v1_request_runs_as_before(r19, r11):
+    # 사실표 1 요청이 그대로 돈다(a2 때의 흐름 · 답).
+    gen = Script(tool("turn_info", turn=6), answer(GOOD_6))
+    out = ask(_req(_v1(r19), "6순에 왜 4만이 실수야?"), gen)
+    assert out["outcome"] == "verified" and out["answer"] == GOOD_6
+    # 판 1 의 수비 질문: 단계가 없다고 알리고, 단계 말을 쓰면 걸린다.
+    gen = Script(tool("defense_info", turn=8), answer(DEF_8),
+                 answer("8순 [9통]은 현물이 아니었다. 이 사실표에는 위험 단계가 없다."))
+    s, _ = run(_req(_v1(r11), DEF_Q), gen)
+    assert s["outcome"] == "verified" and s["retries"] == 1
+    assert s["evidence"][0]["result"]["defense"] is None and "판 1" in s["evidence"][0]["result"]["note"]
+
+
+def test_prompt_rules_a3():
+    p = ra.PROMPT_RULES
+    for word in ("리치한 자리에 대한 방총 위험의 크기까지 말한다", "밀지 접을지의 옳고 그름", "다섯 단계",
+                 "'안전' · '낮음' · '보통' · '높음' · '매우 높음'", "작은따옴표", "defense_info 로 확인한 뒤",
+                 "위험 % 를 지어내지 않는다", "fold_spot 이 null 이 아닌 차례에서만", "이 도우미는 밀지 접을지를 판정하지 않는다"):
+        assert word in p, word
+    props = _variant("find_turns")["properties"]["args"]["properties"]
+    assert "- defense_info(turn):" in p and "stance" in props and "min_level" in props
+    assert ra.TOOL_NAMES == ["turn_info", "discard_options", "what_if", "safe_tiles", "defense_info", "find_turns",
+                             "game_summary", "rule"]
+    # 지시문의 단계 말 예시가 검증 규칙과 같은 꼴(작은따옴표)이다.
+    assert ra._LEVEL_QUOTED.search("'높음'") and not ra._LEVEL_QUOTED.search("높음")
+
+
+def test_script_fake_defense_question(tmp_path):
+    out = tmp_path / "out.json"
+    p = subprocess.run([sys.executable, str(ROOT / "scripts" / "review_ask.py"), str(FIXTURES / "r11_130921.json"),
+                        DEF_Q, "--fake", "--out", str(out)], capture_output=True, cwd=ROOT, timeout=120)
+    assert p.returncode == 0, p.stderr.decode("utf-8", "replace")
+    text = p.stdout.decode("utf-8")
+    assert "판정 말(fold_spot 사실 없음)" in text and "결과: verified" in text
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["outcome"] == "verified" and body["retries"] == 1
+    assert [c["tool"] for c in body["tool_calls"]] == ["defense_info"]
+    assert "'높음'" in body["answer"] and "접었어야" not in body["answer"]
+
+
+def _bad_forced(ok: dict, **change) -> dict:
+    """r11 10번째(리치 중) defense 를 바꾼 요청."""
+    r = copy.deepcopy(ok)
+    t = _turn(r["facts"], 10)
+    assert t["status"] == "forced"
+    if "efficient" in change:
+        change["efficient"]["tile"] = t["defense"]["tiles"][0]["tile"]
+        change["efficient"]["level"] = t["defense"]["tiles"][0]["level"]
+    t["defense"].update(change)
+    return r
+
+
+def test_defense_info_forced_turn_r12(r12):
+    # r12 12번째: 내가 리치 중 · 북 리치. 버린 [5삭] 의 단계는 남고, stance · efficient 는 null.
+    out = run_tool(r12, "defense_info", {"turn": 12})
+    d = out["defense"]
+    assert (out["status"], out["can_choose"]) == ("forced", False)
+    assert d["actual"] == {"tile": "5s", "level": "매우 높음", "rank": 11, "of": 11}
+    assert d["stance"] is None and d["efficient"] is None and d["safest"] == ["2m", "4p"]
+    assert "리치 중이라 고를 수 없던 차례 — 밀었다 · 접었다를 말하지 않는다" in out["note"]
+
+
+def test_graph_whole_game_forced_turns_not_pushed(r11):
+    # "리치 받은 뒤 위험하게 버린 곳": min_level 줄에 리치 중 차례(11 · 14)가 섞여도 stance 는 없고 고를 수 없던 차례로 보인다.
+    a = ("리치 받은 뒤 '높음' 이상 위험한 패를 버린 차례는 8순 [9통] · 9순 [4만]이고, 둘 다 가장 안전한 패보다 위험한 패를 밀었다. "
+         "11순 [5삭] · 14순 [6통]도 '매우 높음'이었지만 리치 중이라 고를 수 없던 차례다. 이 도우미는 밀지 접을지를 판정하지 않는다.")
+    gen = Script(tool("find_turns", min_level="높음"), answer(a))
+    s, _ = run(_req(r11, "리치 받은 뒤 위험하게 버린 곳 있어?"), gen)
+    assert s["outcome"] == "verified", s["violations"]
+    rows = {r["turn"]: r for r in s["evidence"][0]["result"]["turns"]}
+    assert all(rows[n]["stance"] is None and rows[n]["can_choose"] is False for n in (11, 14))
+    assert rows[8]["stance"] == rows[9]["stance"] == "pushed"
+    # LLM 이 본 지시문: 리치 중 줄은 can_choose false · stance null, 규칙 줄도 들어 있다.
+    p2 = gen.prompts[1]
+    assert '"turn":11,"discard":"5s","status":"forced","grade":null,"can_choose":false' in p2
+    assert '"level":"매우 높음","stance":null' in p2
+    assert "리치 중 차례(can_choose 가 false, stance 가 null)는 버린 패의 위험 단계까지만" in gen.prompts[0]
+
+
+def test_script_fake_whole_game_forced_not_pushed(tmp_path):
+    out = tmp_path / "out.json"
+    p = subprocess.run([sys.executable, str(ROOT / "scripts" / "review_ask.py"), str(FIXTURES / "r11_130921.json"),
+                        "리치 받은 뒤 위험하게 버린 곳 있어?", "--fake", "--out", str(out)],
+                       capture_output=True, cwd=ROOT, timeout=120)
+    assert p.returncode == 0, p.stderr.decode("utf-8", "replace")
+    body = json.loads(out.read_text(encoding="utf-8"))
+    assert body["outcome"] == "verified" and [c["tool"] for c in body["tool_calls"]] == ["find_turns"]
+    assert "밀었다" not in body["answer"] and "접었다" not in body["answer"]
+    # a4 F2: 옳고 그름을 묻지 않은 질문이라 "판정하지 않는다" 를 붙이지 않는다. F5: 첫 시도의 판정 말 위반이 남는다.
+    assert "판정하지 않는다" not in body["answer"]
+    assert len(body["retry_violations"]) == 1 and any("판정 말" in v for v in body["retry_violations"][0])
+
+
+# ---------------------------------------------------------------- a4(설계서 1122 "a4" F1 ~ F5)
+
+
+def test_a4_schema_per_tool_variants():
+    s = ra.action_schema()
+    assert set(s) == {"anyOf"}
+    variants = s["anyOf"]
+    assert len(variants) == len(ra.TOOLS) + 1
+    tools = [v for v in variants if v["properties"]["action"]["enum"] == ["tool"]]
+    assert [v["properties"]["tool"]["enum"] for v in tools] == [[n] for n in ra.TOOL_NAMES]   # 변형마다 도구 이름 하나
+    for v in tools:
+        assert v["type"] == "object" and v["propertyOrdering"] == list(v["properties"])
+        assert v["required"][:2] == ["action", "tool"]
+        name = v["properties"]["tool"]["enum"][0]
+        names = [a.rstrip("?") for a in ra.TOOLS[name]["args"]]
+        if "args" in v["properties"]:
+            a = v["properties"]["args"]
+            assert a["type"] == "object" and list(a["properties"]) == names == a["propertyOrdering"]
+            assert all(a["properties"][k] == ra._ARG_PROPS[k] for k in names)        # 설명 · 타입은 한 곳(_ARG_PROPS)
+            assert ("args" in v["required"]) == bool(a.get("required"))
+        else:
+            assert names == []
+    # what_if: 둘 다 꼭. game_summary: args 칸 자체가 없다. find_turns: 모두 선택이라 args 가 required 가 아님.
+    w = _variant("what_if")
+    assert w["required"] == ["action", "tool", "args"] and w["properties"]["args"]["required"] == ["turn", "tile"]
+    assert w["propertyOrdering"] == ["action", "tool", "args"]
+    g = _variant("game_summary")
+    assert "args" not in g["properties"] and g["required"] == ["action", "tool"] and g["propertyOrdering"] == ["action", "tool"]
+    f = _variant("find_turns")
+    assert f["required"] == ["action", "tool"] and "required" not in f["properties"]["args"]
+    assert list(f["properties"]["args"]["properties"]) == ["grade", "status", "min_ukeire_loss", "tile", "after_riichi",
+                                                            "stance", "min_level"]
+    assert _variant("rule")["properties"]["args"]["required"] == ["name"]
+    assert _variant("defense_info")["properties"]["args"]["required"] == ["turn"]
+    # 빈 properties 를 가진 object 가 어디에도 없다(Gemini 가 거절).
+    def walk(x):
+        if isinstance(x, dict):
+            assert not (x.get("type") == "object" and x.get("properties") == {}), x
+            for y in x.values():
+                walk(y)
+        elif isinstance(x, list):
+            for y in x:
+                walk(y)
+    walk(s)
+    ans = variants[-1]
+    assert ans["properties"]["action"]["enum"] == ["answer"] and ans["required"] == ["action", "text"]
+    assert ans["propertyOrdering"] == ["action", "text"]
+    assert not ra.schema_answer_only(s) and ra.schema_answer_only(ra.action_schema(answer_only=True))
+    json.dumps(s, ensure_ascii=False)
+
+
+def test_a4_schema_switch_off_is_old_shape(monkeypatch):
+    monkeypatch.setattr(ra, "ACTION_SCHEMA_PER_TOOL", False)
+    s = ra.action_schema()
+    assert s == {"type": "object",
+                 "properties": {"action": {"type": "string", "enum": ["tool", "answer"]},
+                                "tool": {"type": "string", "enum": ra.TOOL_NAMES},
+                                "args": {"type": "object", "properties": ra._ARG_PROPS},
+                                "text": {"type": "string", "description": "action 이 answer 일 때 답(3~5문장)"}},
+                 "required": ["action"]}
+    assert not ra.schema_answer_only(s)
+    # answer_only 는 스위치와 상관없이 같은 꼴.
+    assert ra.action_schema(answer_only=True)["propertyOrdering"] == ["action", "text"]
+
+
+def test_a4_run_tool_still_rejects_extra_and_missing_turn(r19):
+    # 스키마가 막아도 방어는 남는다.
+    assert "받지 않는 인자" in run_tool(r19, "what_if", {"turn": 6, "tile": "3m", "name": "x"})["error"]
+    assert set(run_tool(r19, "what_if", {"tile": "3m"})) == {"error"}
+
+
+def test_a4_prompt_rules():
+    p = ra.PROMPT_RULES
+    # F3: 응답 형식에 what_if 예시 · args 는 그 도구의 인자만.
+    assert '{"action": "tool", "tool": "what_if", "args": {"turn": 6, "tile": "3m"}}' in p
+    assert "args 에는 그 도구의 인자만 넣는다" in p
+    # F2: "판정하지 않는다" 는 옳고 그름을 물었을 때만 한 번, 그 밖에는 붙이지 않는다. 권하는 꼴은 그대로.
+    assert "질문이 옳고 그름을 물었을 때만" in p and "붙이지 않는다" in p
+    assert "이 도우미는 밀지 접을지를 판정하지 않는다" in p
+    assert "판단을 묻지 않은 질문에는 그 말을 붙이지 않는다" in p
+    # 지시문의 예시 줄 자체가 판정 말 검사에 걸리지 않는다(위험한 말을 예시로 권하지 않음).
+    assert ra.verdict_words("이 도우미는 밀지 접을지를 판정하지 않는다.") == []
+
+
+def test_a4_rule_push_fold_text_same_band():
+    pf = run_tool({}, "rule", {"name": "밀기 접기"})["text"]
+    assert "같은 구간" in pf and "한 구간 더 위험하면 접었다고 하지 않는다" in pf
+    # 단계 말에 작은따옴표가 없다 — 이 글을 읽어도 위험 단계가 근거로 늘지 않는다.
+    assert ra.evidence_levels([{"tool": "rule", "args": {"name": "밀기 접기"}, "result": {"text": pf}}]) == set()
+
+
+@pytest.mark.parametrize("text", [
+    "이 도우미는 접었어야 했는지 여부를 직접 판단하지 않는다.",
+    "밀어도 됐는지는 판정하지 않는다.",
+    "접는 게 맞았는지는 단정할 수 없다.",
+    "내렸어야 했을지는 판단하지 않는다.",
+    "8순 [9통]은 '높음'이었다. 밀어도 됐는지는 판정하지 않는다.",
+])
+def test_a4_verdict_disclaimer_with_indirect_question_passes(r11, text):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    assert ra.check_risk_words(text, ev) == [], text
+    assert verify_answer(text, ev, "8순에 접었어야 했어?") == [], text
+
+
+@pytest.mark.parametrize("text,word", [
+    ("접었어야 했다.", "접었어야"),
+    ("접었어야 했다. 다만 이 도우미는 판정하지 않는다.", "접었어야"),          # 다른 문장의 부정
+    ("접었어야 했는지는 판정하지 않지만 접는 게 맞았다.", "접는 게 맞"),        # 뒤의 판정 말
+    ("밀어도 됐다고 본다.", "밀어도 됐"),
+    ("접었어야 했는지 모르겠지만 위험했다.", "접었어야"),                     # 부정 문구 없음
+    ("접었어야 했는지는\n판정하지 않는다.", "접었어야"),                       # 줄바꿈은 문장 끝
+])
+def test_a4_verdict_words_still_caught(r11, text, word):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    v = ra.check_risk_words(text, ev)
+    assert f"밀기 · 접기 판정 말(fold_spot 사실 없음): {word}" in v, (text, v)
+    if "접는 게 맞" in word:
+        assert not any(x.endswith(": 접었어야") for x in v)       # 앞의 간접 의문은 넘어갔다
+
+
+def test_a4_split_sentences():
+    assert ra.split_sentences("가. 나! 다?\n라\n\n마 1.5장") == ["가", " 나", " 다", "라", "마 1.5장"]
+    assert ra.split_sentences("") == []
+
+
+def test_a4_retry_violations_per_attempt(r11):
+    # 판정 말 → 재시도 → 또 판정 말 → 대체: 재시도를 부른 위반은 첫 시도의 것 하나, 마지막 위반은 violations 에.
+    gen = Script(tool("defense_info", turn=8), answer(VERDICT_8), answer(DEF_8 + " 밀어도 됐다."))
+    out = ask(_req(r11, DEF_Q), gen)
+    assert out["outcome"] == "fallback" and out["retries"] == 1
+    assert out["retry_violations"] == [["밀기 · 접기 판정 말(fold_spot 사실 없음): 접었어야"]]
+    assert "밀기 · 접기 판정 말(fold_spot 사실 없음): 밀어도 됐" in out["violations"]
+    # 재시도 둘(한도 2): 시도 순으로 둘이 쌓인다.
+    gen = Script(tool("defense_info", turn=8), answer(VERDICT_8), answer(DEF_8 + " 밀어도 됐다."), answer(DEF_8))
+    out = ask(_req(r11, DEF_Q), gen, limits=Limits(retries=2))
+    assert out["outcome"] == "verified" and out["retries"] == 2 and out["violations"] == []
+    assert [v[0].rsplit(": ", 1)[1] for v in out["retry_violations"]] == ["접었어야", "밀어도 됐"]
+
+
+# ---------------------------------------------------------------- a5(설계서 1122 "a5" G1 ~ G3)
+
+# du2b 꼴: 실제 버린 [2만]은 '낮음', 물어본 [백]만 '안전'(가장 안전한 패). 손 셋은 시험용으로 줄인 것.
+_DU2B_DEFENSE = {"tiles": [{"tile": "5z", "level": "안전", "genbutsu": True},
+                           {"tile": "2m", "level": "낮음", "genbutsu": True},
+                           {"tile": "8s", "level": "보통", "genbutsu": False}],
+                 "actual": {"tile": "2m", "level": "낮음", "rank": 2, "of": 3}, "safest": ["5z"]}
+
+
+def _du2b_ev(risk: dict) -> list[dict]:
+    return [{"tool": "what_if", "args": {"turn": 9, "tile": "5z"}, "result": {"turn": 9, "tile": "5z", "risk": risk}}]
+
+
+def test_a5_what_if_risk_actual_and_safest_levels():
+    r = ra._risk_of_tile(_DU2B_DEFENSE, "5z")
+    assert r["actual"] == {"tile": "2m", "level": "낮음", "rank": 2, "of": 3}
+    assert r["safest"] == [{"tile": "5z", "level": "안전"}]
+    # 사실표 쪽 defense.safest(코드 목록)는 그대로 — 찾기만 했다.
+    assert _DU2B_DEFENSE["safest"] == ["5z"]
+
+
+def test_a5_du2b_answer_grounded_by_what_if_only():
+    ev = _du2b_ev(ra._risk_of_tile(_DU2B_DEFENSE, "5z"))
+    q = "9순에 백을 버렸으면 어땠어?"
+    assert verify_answer("9순에 실제 버린 [2만]은 '낮음', [백]은 '안전' 이다.", ev, q) == []
+    # 순서 숫자도 risk.actual 에서: 버린 패의 "3종 중 2위".
+    assert verify_answer("9순에 실제 버린 [2만]은 '낮음'으로 손의 3종 중 2위였다.", ev, q) == []
+    # 도구 결과에 없는 단계는 그대로 위반.
+    v = verify_answer("9순에 실제 버린 [2만]은 '매우 높음' 이었다.", ev, q)
+    assert "도구로 찾은 사실표에 없는 위험 단계: '매우 높음'" in v
+    # a4 꼴(actual 없음 · safest 는 코드 목록)이었다면 [2만]의 '낮음' · "2위" 는 근거가 없었다.
+    old = {k: v for k, v in ra._risk_of_tile(_DU2B_DEFENSE, "5z").items() if k != "actual"}
+    old["safest"] = ["5z"]
+    v = verify_answer("9순에 실제 버린 [2만]은 '낮음'으로 손의 3종 중 2위였다.", _du2b_ev(old), q)
+    assert "도구로 찾은 사실표에 없는 위험 단계: '낮음'" in v and any("2위" in x for x in v), v
+
+
+def test_a5_evidence_from_new_risk_shape():
+    ev = _du2b_ev(ra._risk_of_tile(_DU2B_DEFENSE, "8s"))
+    # 물어본 [8삭] · 실제 버린 [2만] · 가장 안전한 [백] 셋 다 패 근거, 단계도 셋 다.
+    allow, _ = ra.evidence_allow(ev)
+    assert {"8s", "2m", "5z"} <= allow.tiles
+    assert {3, 2} <= allow.rank and 3 in allow.jong      # 물어본 패 3위 · 버린 패 2위(safest 줄에는 rank 가 없다)
+    assert ra.evidence_levels(ev) == {"보통", "낮음", "안전"}
+
+
+def test_a5_what_if_risk_real_game_actual_differs_from_safest():
+    # L16 17번째: 버린 [4만]은 '높음'(9종 중 4위), 가장 안전한 [7만]은 '낮음'. what_if(7만) 하나로 둘 다 말할 수 있다.
+    facts = load("L16_135321")
+    ev = _ev(facts, ("what_if", {"turn": 17, "tile": "7m"}))
+    r = ev[0]["result"]["risk"]
+    assert r["actual"] == {"tile": "4m", "level": "높음", "rank": 4, "of": 9}
+    assert r["safest"] == [{"tile": "7m", "level": "낮음"}]
+    text = "17순에 [7만]을 버렸다면 '낮음'이었다. 실제 버린 [4만]은 '높음'으로 손의 9종 중 4위였다."
+    q = "17순에 7만을 버렸으면 어땠어?"
+    assert verify_answer(text, ev, q) == []
+    assert "도구로 찾은 사실표에 없는 위험 단계: '안전'" in verify_answer("17순에 실제 버린 [4만]은 '안전'이었다.", ev, q)
+
+
+def test_a5_risk_only_in_what_if():
+    # risk 의 새 꼴은 what_if 에만. defense_info 의 defense 는 사실표 그대로(safest 는 코드 목록, actual 은 사실표 칸).
+    facts = load("L16_135321")
+    d = run_tool(facts, "defense_info", {"turn": 17})["defense"]
+    assert d == _turn(facts, 17)["defense"] and all(isinstance(x, str) for x in d["safest"])
+    # 사실표 1 · defense 없음 · 리치한 자리 없음은 그대로(null · null · 칸 없음).
+    r11 = load("r11_130921")
+    assert run_tool(_v1(r11), "what_if", {"turn": 8, "tile": "6m"})["risk"] is None
+    f = copy.deepcopy(r11)
+    _turn(f, 8)["defense"] = None
+    assert run_tool(f, "what_if", {"turn": 8, "tile": "6m"})["risk"] is None
+
+
+def test_a5_prompt_rules():
+    p = ra.PROMPT_RULES
+    # G1: 도구 설명 · 수비 절.
+    assert "실제 버린 패의 단계와 자리(actual)" in ra.TOOLS["what_if"]["desc"]
+    assert "가장 안전한 패마다의 단계(safest)" in ra.TOOLS["what_if"]["desc"]
+    assert "위험 단계는 패마다 따로 적힌 값만 말한다. 같은 목록(가장 안전한 패 · 현물)에 있다고 같은 단계로 말하지 않는다" in p
+    # G2: 자리는 대괄호 없이.
+    assert '자리(동 · 남 · 서 · 북)는 대괄호 없이 "남 자리" 처럼 쓴다. 대괄호는 패에만 쓴다 — [남] 은 바람패 남을 말할 때만.' in p
+    assert ra.PROMPT_VERSION == "a5"
+
+
+def test_a5_seat_wind_bracket_still_checked(r11):
+    # G2 는 지시문만 — 도구 결과에 없는 바람패 대괄호는 지금처럼 걸린다.
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    v = verify_answer(DEF_8 + " [남] 자리가 리치 중이었다.", ev, DEF_Q)
+    assert any("[남]" in x for x in v), v
+
+
+@pytest.mark.parametrize("text", [
+    "해당 차례에 접었어야 했는지에 대한 판정 정보는 없다.",
+    "밀어도 됐는지에 대한 판정 기록은 없다.",
+    "접었어야 했는지 판정이 없다.",
+    "접었어야 했는지는 판정은 없다.",
+    "밀어도 됐는지에 대한 판정정보가 없다.",
+])
+def test_a5_verdict_no_verdict_info_passes(r11, text):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    assert ra.verdict_words(text) == [], text
+    assert ra.check_risk_words(text, ev) == [], text
+    assert verify_answer(text, ev, "8순에 접었어야 했어?") == [], text
+
+
+@pytest.mark.parametrize("text,word", [
+    ("접었어야 했다. 판정 정보는 없다.", "접었어야"),             # 다른 문장의 부정
+    ("판정 정보는 없지만 접었어야 했다.", "접었어야"),             # 간접 의문이 아님
+    ("접었어야 했는지 정보가 없다.", "접었어야"),                 # 부정 문구에 "판정" 이 없음
+    ("밀어도 됐다. 판정 기록은 없다.", "밀어도 됐"),
+])
+def test_a5_verdict_words_still_caught(r11, text, word):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    v = ra.check_risk_words(text, ev)
+    assert f"밀기 · 접기 판정 말(fold_spot 사실 없음): {word}" in v, (text, v)

@@ -34,7 +34,9 @@ from .review import Generate, tile_name
 # 도구마다 따로인 스키마(F3) · 판정 말 검사의 부정문 오검출(F4) · 시도마다의 위반(F5).
 # a5(11-22 아침, 같은 설계서 "a5"): what_if risk 에 실제 버린 패 · 가장 안전한 패마다의 단계(G1) · 자리 바람을 패 대괄호로
 # 쓰지 않게(G2) · 판정 말 검사의 부정 문구에 "판정 정보는 없다" 꼴(G3).
-PROMPT_VERSION = "a5"
+# a6(11-23): 답의 말투 — stance 는 단정 사실문 하나로("사실상 밀었다" · "…로 기록되었다" 금지) · 평가 꾸밈말 금지(지시문 +
+# 검사 8) · "판정하지 않는다" 는 남 리치가 있는 밀기 · 접기 질문에만(지시문 + 검사 9, 리치 없는 패효율 질문에 붙이던 것).
+PROMPT_VERSION = "a6"
 # 사실표 판: 1(설계서 1121) · 2(설계서 1122 — 차례마다 defense). 1 은 defense 가 없는 것으로 본다.
 FACTS_VERSION = 2
 FACTS_VERSIONS = (1, 2)
@@ -952,6 +954,79 @@ def check_risk_words(text: str, evidence: list[dict]) -> list[str]:
     return out
 
 
+# a6 검사 8 — 평가 말: 좋고 나쁨을 꾸미는 낱말과 "…고 · 라고 · 로 볼 수 있다" 꼴의 둘러대기. 대괄호 밖 답 글에서만 찾는다
+# (질문 글에 같은 낱말이 있어도 답에 옮길 까닭은 없어 위반으로 둔다). 11-22 앱 질문 답의 "사실상 밀었다" · "무난하게 진행한 판" 꼴.
+EVAL_WORDS = re.compile(r"사실상|비교적|무난|깔끔|성공적|승리|훌륭|현명|안타깝")
+_EVAL_HEDGE = re.compile(r"(?:고|라고|로)\s*볼\s*수\s*있")
+# a6 검사 9 — 밀기 · 접기 부정 문구: 한 문장 안에 "밀지 접을지 · 밀기 · 접기" 와 판정 부정 문구([_VERDICT_DISCLAIM])가 같이 있는 것.
+_PUSHFOLD = re.compile(r"밀지\s*접을지|밀기\s*·?\s*접기")
+
+
+def eval_words(text: str) -> list[str]:
+    """대괄호 밖 글의 평가 말(나온 차례대로 · 같은 말은 한 번, 둘러대기는 공백을 하나로)."""
+    plain = rv._BRACKET.sub(" ", text)
+    found = [(m.start(), m.group(0)) for m in EVAL_WORDS.finditer(plain)]
+    found += [(m.start(), re.sub(r"\s+", " ", m.group(0))) for m in _EVAL_HEDGE.finditer(plain)]
+    return list(dict.fromkeys(w for _, w in sorted(found)))
+
+
+def has_pushfold_disclaimer(text: str) -> bool:
+    """답에 밀기 · 접기 부정 문구("이 도우미는 밀지 접을지를 판정하지 않는다" 꼴)가 있나 — 한 문장 안에 [_PUSHFOLD] 와
+    [_VERDICT_DISCLAIM] 이 같이 있으면 참."""
+    return any(_PUSHFOLD.search(s) and _VERDICT_DISCLAIM.search(s) for s in split_sentences(rv._BRACKET.sub(" ", text)))
+
+
+# 남 리치 맥락이 되는 도구 · 칸. 도구: defense_info · safe_tiles(부른 것만으로), find_turns 의 after_riichi · stance ·
+# min_level 조건(리치한 자리가 있는 차례에만 뜻이 있는 조건), rule 의 '밀기 접기'(밀기 · 접기 뜻을 물은 것).
+_RIICHI_TOOLS = {"defense_info", "safe_tiles"}
+_RIICHI_FIND_ARGS = ("after_riichi", "stance", "min_level")
+_RIICHI_KEYS = ("stance", "fold_spot", "defense", "risk", "riichi")
+
+
+def evidence_has_riichi(evidence: list[dict]) -> bool:
+    """이번 질문의 evidence 에 남 리치(밀기 · 접기) 맥락이 하나라도 있나(a6 검사 9).
+
+    참이 되는 것: (1) defense_info · safe_tiles 를 불렀다. (2) find_turns 를 after_riichi · stance · min_level 조건으로 불렀다.
+    (3) rule 을 '밀기 접기'(별칭 포함)로 불렀다. (4) 도구 결과 어디든 `riichi_winds` 가 빈 목록이 아니다(turn_info ·
+    what_if · discard_options · find_turns 줄 — 남이 리치한 자리만 든 칸), `stance` · `fold_spot` · `defense` · `risk` ·
+    `riichi`(find_turns 의 리치 사건)가 null 이 아니다, game_summary 의 `others` 에 kind 가 riichi 인 줄이 있다.
+    내 리치(`riichi_declared`)는 남 리치가 아니라 보지 않는다. 오류 결과도 부른 도구 · 인자로는 센다."""
+
+    def walk(v, key) -> bool:
+        if key in _RIICHI_KEYS and v is not None:
+            return True
+        if isinstance(v, dict):
+            if key == "others" and v.get("kind") == "riichi":
+                return True
+            return any(walk(x, k) for k, x in v.items())
+        if isinstance(v, list):
+            if key == "riichi_winds" and v:
+                return True
+            return any(walk(x, key) for x in v)
+        return False
+
+    for e in evidence:
+        tool, args = e.get("tool"), e.get("args") or {}
+        if tool in _RIICHI_TOOLS:
+            return True
+        if tool == "find_turns" and any(args.get(k) not in (None, "") for k in _RIICHI_FIND_ARGS):
+            return True
+        if tool == "rule" and isinstance(args.get("name"), str) \
+                and _RULE_ALIASES.get(args["name"].replace(" ", "").lower()) == "밀기 접기":
+            return True
+        if walk(e.get("result"), None):
+            return True
+    return False
+
+
+def check_tone(text: str, evidence: list[dict]) -> list[str]:
+    """a6 의 말투 검사(검사 8 · 9). 위반 줄 목록."""
+    out = [f"평가 말: {w}" for w in eval_words(text)]
+    if has_pushfold_disclaimer(text) and not evidence_has_riichi(evidence):
+        out.append("리치 없는 질문에 밀기 · 접기 부정 문구")
+    return out
+
+
 def question_turns(question: str) -> list[int]:
     return list(dict.fromkeys(int(m.group(1)) for m in _QUESTION_TURN.finditer(question or "")))
 
@@ -982,7 +1057,12 @@ def verify_answer(text: Any, evidence: list[dict], question: str) -> list[str]:
     7 (a3) 밀기 · 접기 판정 말([VERDICT_WORDS])은 evidence 에 fold_spot 이 null 이 아닌 차례가 있을 때만.
       (a4) 판정 말 바로 뒤가 간접 의문(…는지 · …을지 …)이고 같은 문장에 "판정하지 않 · 판단하지 않 · 단정할 수 없 ·
       단정하지 않" 이 있으면 판정 말로 보지 않는다([verdict_words]). (a5) 그 부정 문구에 "판정 정보(기록)는 없 · 판정은 없 ·
-      판정이 없" 을 더한다."""
+      판정이 없" 을 더한다.
+    8 (a6) 평가 말: 대괄호 밖에 [EVAL_WORDS](사실상 · 비교적 · 무난 · 깔끔 · 성공적 · 승리 · 훌륭 · 현명 · 안타깝)나
+      "…고 · 라고 · 로 볼 수 있" 이 있으면 위반 "평가 말: …"(질문에 같은 말이 있어도).
+    9 (a6) 한 문장에 "밀지 접을지 · 밀기 · 접기" 와 판정 부정 문구가 같이 있는데 evidence 에 남 리치 맥락이 없으면
+      위반 "리치 없는 질문에 밀기 · 접기 부정 문구"(맥락의 정의는 [evidence_has_riichi]).
+    8 · 9 는 앞 검사들의 위반 뒤에 붙는다(앞 위반 줄은 a5 와 같다)."""
     text = text.strip() if isinstance(text, str) else ""
     if not text:
         return ["답 없음"]
@@ -1005,6 +1085,7 @@ def verify_answer(text: Any, evidence: list[dict], question: str) -> list[str]:
         out.append(f"답 문장 {n}개({ANSWER_MAX_SENTENCES}개 이하)")
     if not rv._HANGUL.search(text):
         out.append("답에 한글 없음")
+    out += check_tone(text, evidence)
     return rv._dedupe(out)
 
 
@@ -1139,7 +1220,7 @@ def _tool_lines() -> str:
 PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 자기 패보 한 판을 보며 묻는 말에 답한다.
 이 도우미는 **패효율(샹텐 · 유효패)과, 리치한 자리에 대한 방총 위험의 크기까지 말한다**. 밀지 접을지의 옳고 그름 · 타점 · 역 ·
 상대 대기 읽기는 판단하지 않는다 — 그런 판단을 묻는 질문에는 현물 여부 · 위험 단계처럼 도구로 확인되는 사실까지만 말하고,
-판단하지 않는다고 한 번 밝힌다. 판단을 묻지 않은 질문에는 그 말을 붙이지 않는다.
+판단하지 않는다고 한 번 밝힌다(밀기 · 접기는 아래 수비 절의 때와 꼴을 따른다). 판단을 묻지 않은 질문에는 그 말을 붙이지 않는다.
 
 ## 도구 — 사실은 도구로만 찾는다
 숫자와 패는 프로그램이 미리 계산해 두었다. 너는 계산하지 않고 도구로 찾아 읽는다. 한 번에 도구 하나를 부르고, 결과를 본 뒤 다음을 정한다.
@@ -1162,12 +1243,18 @@ PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 
 - 순서는 defense_info 의 rank / of(1 = 가장 안전)를 "손의 N종 중 R위" 처럼 그대로 쓴다. 가장 안전한 패는 safest, 효율대로 버릴 패는 efficient.
 - 위험 단계는 패마다 따로 적힌 값만 말한다. 같은 목록(가장 안전한 패 · 현물)에 있다고 같은 단계로 말하지 않는다 — what_if 면
   물어본 패는 risk 의 level, 실제 버린 패는 risk.actual, 가장 안전한 패는 risk.safest 의 패마다 level.
-- stance(pushed · folded · between)는 버린 패가 가장 안전한 패보다 얼마나 위험했나의 사실이지 판정이 아니다.
+- stance(pushed · folded · between)는 버린 패가 가장 안전한 패보다 얼마나 위험했나의 사실이지 판정이 아니다. 말할 때는
+  단정하는 사실문 하나로 쓴다. pushed: "가장 안전한 [백] 대신 '높음' 인 [5통]을 버려 밀었다". folded: 버린 패가 가장 안전한
+  패면 "가장 안전한 패를 버려 접었다", 아니면 "가장 안전한 [백]과 위험 차이가 거의 없는 [5통]을 버려 접었다". between:
+  "가장 안전한 [백] 대신 [5통]을 버렸고, 밀었다 · 접었다 어느 쪽도 아니다"(뜻은 rule("밀기 접기") 글 그대로).
+  "사실상" · "…라고 볼 수 있다" · "…로 기록되었다" · "…셈이다" 를 붙이지 않는다.
 - 리치 중 차례(can_choose 가 false, stance 가 null)는 버린 패의 위험 단계까지만 말하고 밀었다 · 접었다고 하지 않는다.
 - "접었어야 했다 · 밀어도 됐다" 같은 판정 말은 fold_spot 이 null 이 아닌 차례에서만, 그 값 그대로 쓴다. fold_spot 이 null 이면
   판정 말을 쓰지 않고 단계 · 순서 · 가장 안전한 패 같은 사실까지만 말한다.
-- "판정하지 않는다" 는 말은 질문이 옳고 그름을 물었을 때만("접었어야 했어?" · "밀어도 됐어?" · "그게 맞았어?" · "실수야?" ·
-  "잘한 거야?") 답에 한 번 쓴다. 꼴은 "이 도우미는 밀지 접을지를 판정하지 않는다". 그 밖의 질문("위험했어?" · "뭐가 안전했어?" ·
+- "판정하지 않는다" 는 말은 질문이 옳고 그름을 물었을 때만, 그것도 리치한 자리가 있는 차례(또는 판)의 밀기 · 접기를 물었을 때만
+  ("접었어야 했어?" · "밀어도 됐어?" · 리치 받은 차례의 "그게 맞았어?") 답에 한 번 쓴다. 꼴은 "이 도우미는 밀지 접을지를 판정하지 않는다".
+  리치한 자리가 없는 차례나 손패를 모르는 차례의 "잘한 거야?" · "실수야?" 는 패효율 질문이다 — 밀기 · 접기 말을 꺼내지 않고
+  "패효율 기준" 등급까지, 손패를 모르면 "모른다" 까지만 말한다. 그 밖의 질문("위험했어?" · "뭐가 안전했어?" ·
   "몇 번째로 위험했어?")에는 붙이지 않는다.
 
 ## 답 규칙 — 프로그램이 도구 결과와 대조해 검사한다
@@ -1180,6 +1267,9 @@ PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 
   상태는 등급 매김 · 리치 중 · 수비 · 화료 형태 · 손패 기록 없음 · 손패 기록 어긋남 · 짐작 손패, stance 는 밀었다 · 접었다 · 어느 쪽도 아니다.
 - 해라체("…다")로 쓴다. 존댓말("…습니다" · "…해요")을 쓰지 않는다. "반드시" · "무조건" · "절대" 를 쓰지 않는다. 점수("N점")를 쓰지 않는다.
 - 3~5문장, 500자 안. 숫자를 늘어놓지 말고 질문에 필요한 것만.
+- 좋고 나쁨 · 잘하고 못함을 꾸미는 말을 쓰지 않는다: "사실상" · "비교적" · "무난" · "깔끔" · "성공적" · "승리" · "훌륭" · "현명" ·
+  "안타깝", 그리고 "…할 수 있었던 선택" 처럼 다른 선택을 권하는 말. 총평을 물으면 결과 · 등급 개수 · 아까운 수 같은 사실로 답하고, 판 전체를 좋다 · 나쁘다로 꾸미는 맺음 문장은 붙이지 않는다. 화료는 "화료했다"
+  (론 · 쯔모)로 쓴다. 등급 말(최선 · 좋음 · 부정확 · 실수 · 큰 실수)은 도구 결과의 등급으로만 쓴다.
 - 손패를 모르는 차례(손패 기록 없음 · 어긋남 · 짐작 손패)는 숫자가 없다 — 모른다고 답한다.
 - 등급은 패효율만 본 것이라 수비 · 타점 때문에 일부러 고른 수일 수 있다. "실수" 라고 단정하기보다 "패효율 기준" 임을 밝힌다.
 - 모양(양면 · 간짱 · 샤보 …)과 대기는 도구 결과에 없으니 단정하지 않는다. 손패 · 유효패 목록으로 말할 수 있는 것만 말한다.

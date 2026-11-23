@@ -482,7 +482,7 @@ def test_graph_tool_then_answer(r19):
     assert out["outcome"] == "verified" and out["answer"] == GOOD_6 and out["violations"] == []
     assert out["tool_calls"] == [{"tool": "turn_info", "args": {"turn": 6}}]
     assert out["retries"] == 0 and out["usage"] == {"input_tokens": 200, "output_tokens": 40, "llm_calls": 2}
-    assert out["prompt_version"] == "a5" and out["model"] == "m"   # 11-22 a2 → a3(수비 확장) → a4(F1 ~ F5) → a5(G1 ~ G3)
+    assert out["prompt_version"] == "a6" and out["model"] == "m"   # 11-22 a2 → a3(수비 확장) → a4(F1 ~ F5) → a5(G1 ~ G3) → a6(말투)
     assert out["retry_violations"] == []
     # 첫 지시문: 규칙 · 도구 목록 · 질문, 아직 도구 없음. 둘째: 도구 결과가 붙음.
     p1, p2 = gen.prompts
@@ -658,7 +658,7 @@ def test_prompt_rules_a2():
     # 11-22 a3: find_turns 에 stance? · min_level? 이 더해짐(설계서 1122 4절) — 앞 다섯 인자는 그대로.
     assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?, stance?, min_level?)" in p
     assert "after_riichi" in _variant("find_turns")["properties"]["args"]["properties"]
-    assert ra.PROMPT_VERSION == "a5"
+    assert ra.PROMPT_VERSION == "a6"
 
 
 # ---------------------------------------------------------------- 요청 검사
@@ -1110,7 +1110,7 @@ VERDICT_8 = DEF_8 + " 여기서는 접었어야 했다."
 def test_graph_defense_question_verified(r11):
     gen = Script(tool("defense_info", turn=8), answer(DEF_8))
     out = ask(_req(r11, DEF_Q), gen)
-    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a5"
+    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a6"
     assert out["tool_calls"] == [{"tool": "defense_info", "args": {"turn": 8}}]
     # 지시문: 수비 규칙 · 새 도구, 둘째 지시문에 defense 칸이 그대로.
     p1, p2 = gen.prompts
@@ -1455,7 +1455,7 @@ def test_a5_prompt_rules():
     assert "위험 단계는 패마다 따로 적힌 값만 말한다. 같은 목록(가장 안전한 패 · 현물)에 있다고 같은 단계로 말하지 않는다" in p
     # G2: 자리는 대괄호 없이.
     assert '자리(동 · 남 · 서 · 북)는 대괄호 없이 "남 자리" 처럼 쓴다. 대괄호는 패에만 쓴다 — [남] 은 바람패 남을 말할 때만.' in p
-    assert ra.PROMPT_VERSION == "a5"
+    assert ra.PROMPT_VERSION == "a6"
 
 
 def test_a5_seat_wind_bracket_still_checked(r11):
@@ -1489,3 +1489,156 @@ def test_a5_verdict_words_still_caught(r11, text, word):
     ev = _ev(r11, ("defense_info", {"turn": 8}))
     v = ra.check_risk_words(text, ev)
     assert f"밀기 · 접기 판정 말(fold_spot 사실 없음): {word}" in v, (text, v)
+
+
+# ---------------------------------------------------------------- a6(11-23 말투: stance 단정문 · 평가 말 · 엉뚱한 부정 문구)
+
+# 11-22 앱 질문 실제 답(mahjong_calc experiments/paifu_review/results/agent_1122app · agent_1122app_old_b). 틀린 사실은 없고 말투만.
+B3A = ("17순에 버린 [4만]은 서 자리가 리치한 상황에서 현물이 아니며 위험 단계는 '높음'이었다. 당시 손에 있던 패 9종 가운데 "
+       "안전한 순서로는 4위였다. 가장 안전했던 패는 '낮음' 단계인 [7만]이었다. 버린 패가 가장 안전한 패보다 위험했던 사실상 밀었던 차례다.")
+B4A = ("서 자리가 리치한 뒤 내 버림 차례는 17순과 18순의 2번 있었다. 17순에는 현물이 아닌 [4만]을 버렸고, 방총 위험은 '높음' "
+       "단계였으며 가장 안전한 패보다 위험한 패를 버려 사실상 밀었다. 18순에도 [4만]을 버렸는데, 이때는 서 자리의 현물이었으나 "
+       "위험 단계는 '보통'이었고 사실상 밀었다. 두 차례 모두 수비 상태에서 비교적 위험한 패를 버려 나아간 진행이었다.")
+UG4_DISCLAIM = "이 도우미는 밀지 접을지를 판정하지 않으며, 손패 기록이 없어 패효율 판단도 불가능하다."
+NO_RIICHI = "리치 없는 질문에 밀기 · 접기 부정 문구"
+
+
+def test_a6_prompt_rules():
+    p = ra.PROMPT_RULES
+    assert ra.PROMPT_VERSION == "a6"
+    # stance 는 단정 사실문 하나로 — 셋의 예시와 붙이지 않을 말.
+    assert "단정하는 사실문 하나로 쓴다" in p
+    assert "pushed: \"가장 안전한 [백] 대신 '높음' 인 [5통]을 버려 밀었다\"" in p
+    assert "\"가장 안전한 패를 버려 접었다\"" in p and "어느 쪽도 아니다\"(뜻은 rule(\"밀기 접기\") 글 그대로)" in p
+    assert '"사실상" · "…라고 볼 수 있다" · "…로 기록되었다" · "…셈이다" 를 붙이지 않는다' in p
+    # 평가 말 금지 · 화료 · 등급 말.
+    assert "좋고 나쁨 · 잘하고 못함을 꾸미는 말을 쓰지 않는다" in p and "\"…할 수 있었던 선택\"" in p
+    assert "화료는 \"화료했다\"" in p and "등급 말(최선 · 좋음 · 부정확 · 실수 · 큰 실수)은 도구 결과의 등급으로만" in p
+    # "판정하지 않는다" 는 리치가 있는 밀기 · 접기 질문에만, 패효율 질문에는 밀기 · 접기 말을 꺼내지 않는다.
+    assert "리치한 자리가 있는 차례(또는 판)의 밀기 · 접기를 물었을 때만" in p
+    assert "패효율 질문이다 — 밀기 · 접기 말을 꺼내지 않고" in p
+    # 지시문의 stance 예시 문장 자체는 새 검사(평가 말 · 판정 말)에 걸리지 않는다.
+    for example in ("가장 안전한 [백] 대신 '높음' 인 [5통]을 버려 밀었다", "가장 안전한 패를 버려 접었다",
+                    "가장 안전한 [백]과 위험 차이가 거의 없는 [5통]을 버려 접었다",
+                    "가장 안전한 [백] 대신 [5통]을 버렸고, 밀었다 · 접었다 어느 쪽도 아니다"):
+        assert ra.eval_words(example) == [] and ra.verdict_words(example) == [], example
+
+
+def test_a6_response_prompt_version(r19):
+    out = ask(_req(r19, "6순에 왜 4만이 실수야?"), Script(tool("turn_info", turn=6), answer(GOOD_6)))
+    assert out["outcome"] == "verified" and out["prompt_version"] == "a6"
+
+
+def test_a6_real_answers_caught_only_by_eval_words():
+    # b3a · b4a 전문은 a5 검사를 모두 통과했고, a6 에서는 평가 말만 걸린다(다른 위반 없음).
+    facts = load("L16_135321")
+    assert verify_answer(B3A, _ev(facts, ("defense_info", {"turn": 17})), "17순에 버린 4만 위험했어?") == ["평가 말: 사실상"]
+    assert verify_answer(B4A, _ev(facts, ("find_turns", {"after_riichi": "서"})), "서 리치 뒤에 나는 어떻게 했어?") == \
+        ["평가 말: 사실상", "평가 말: 비교적"]
+
+
+@pytest.mark.parametrize("text,words", [
+    ("버린 패가 가장 안전한 패보다 위험했던 사실상 밀었던 차례다.", ["사실상"]),                              # b3a
+    ("가장 안전한 패 대신 위험 단계가 더 높은 패를 버려 수비 사실상 밀었다로 기록되었다.", ["사실상"]),         # ax4a
+    ("가장 안전한 패보다 위험한 패를 버려 사실상 밀었다고 볼 수 있다.", ["사실상", "고 볼 수 있"]),
+    ("두 차례 모두 수비 상태에서 비교적 위험한 패를 버려 나아간 진행이었다.", ["비교적"]),                     # b4a
+    ("전반적으로 큰 실수 없이 높은 패효율을 유지하며 무난하게 진행한 판이다.", ["무난"]),                       # ax3c
+    ("실수나 큰 실수 없이 패효율 기준 깔끔하게 조패를 마친 판이다.", ["깔끔"]),                                 # ug3
+    ("[4만]을 쯔모해 성공적으로 화료했다.", ["성공적"]),
+    ("[4만] 쯔모로 승리를 거두었다.", ["승리"]),
+    ("훌륭한 수비였다. 현명한 선택이다. 안타깝게도 방총했다.", ["훌륭", "현명", "안타깝"]),
+    ("8순은 밀었다라고 볼 수 있다.", ["라고 볼 수 있"]),
+    ("8순은 수비로 볼 수 있다.", ["로 볼 수 있"]),
+    ("8순은 밀었다고 볼  수 있다.", ["고 볼 수 있"]),                                                          # 공백 둘도
+])
+def test_a6_eval_words_caught(r11, text, words):
+    assert ra.eval_words(text) == words
+    v = verify_answer(text, _ev(r11, ("defense_info", {"turn": 8})), "8순 어땠어?")
+    assert [x for x in v if x.startswith("평가 말: ")] == [f"평가 말: {w}" for w in words], v
+
+
+def test_a6_eval_words_pass_and_question_words(r11):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    for text in (DEF_8, "8순에 가장 안전한 [6만] 대신 '높음' 인 [9통]을 버려 밀었다.", "8순은 가장 안전한 패를 버려 접었다.",
+                 "8순 [9통]은 현물로 보지 않는다.", "볼 수 없다.", "승부를 걸었는지는 모른다."):
+        assert ra.eval_words(text) == [], text
+    assert verify_answer("8순에 가장 안전한 [6만] 대신 '높음' 인 [9통]을 버려 밀었다.", ev, "8순 어땠어?") == []
+    # 질문에만 있으면 통과, 답에 옮기면 질문에 있어도 위반.
+    assert verify_answer(DEF_8, ev, "8순 무난했어?") == []
+    assert "평가 말: 무난" in verify_answer(DEF_8 + " 무난한 버림이었다.", ev, "8순 무난했어?")
+    # 대괄호 안은 보지 않는다.
+    assert ra.eval_words("[사실상]") == []
+
+
+def test_a6_new_checks_append_after_old_violations(r19):
+    ev = _ev(r19, ("turn_info", {"turn": 6}))
+    q = "6순에 왜 4만이 실수야?"
+    old = verify_answer(BAD_6, ev, q)
+    assert old and not any(x.startswith("평가 말") for x in old)
+    assert verify_answer(BAD_6 + " 무난하지 않았다.", ev, q) == old + ["평가 말: 무난"]
+    assert verify_answer(BAD_6 + " 이 도우미는 밀지 접을지를 판정하지 않는다.", ev, q) == old + [NO_RIICHI]
+
+
+def test_a6_pushfold_disclaimer_without_riichi_caught(r19):
+    # ug4 꼴: 리치한 자리가 없는 손패 모름 차례(r19 1번째 — 짐작 손패)의 "잘한 거야?" 에 밀기 · 접기 부정 문구.
+    ev = _ev(r19, ("turn_info", {"turn": 1}))
+    assert not ra.evidence_has_riichi(ev)
+    d = ra.bracket(_turn(r19, 1)["discard"])
+    text = f"1순은 손패가 짐작이라 숫자로 평가하지 않았다. 버린 패는 {ra.with_ida(d)}. {UG4_DISCLAIM}"
+    assert verify_answer(text, ev, "1순에 버린 건 잘한 거야?") == [NO_RIICHI]
+    # 등급 매긴 차례(6번째)의 "실수야?" 도 패효율 질문 — 꼴이 달라도(밀기 · 접기 · 판정은 없다) 걸린다.
+    ev6 = _ev(r19, ("turn_info", {"turn": 6}))
+    for tail in (" 이 도우미는 밀지 접을지를 판정하지 않는다.", " 밀기 · 접기는 판정하지 않는다.", " 밀기접기 판정은 없다."):
+        assert verify_answer(GOOD_6 + tail, ev6, "6순에 왜 4만이 실수야?") == [NO_RIICHI], tail
+    # game_summary · 조건 없는 find_turns 도 리치가 없는 판이면 맥락이 없다.
+    assert not ra.evidence_has_riichi(_ev(r19, ("game_summary", {}), ("find_turns", {})))
+
+
+def test_a6_pushfold_disclaimer_with_riichi_passes(r11, r19):
+    facts = load("L16_135321")
+    cases = [
+        (r11, ("defense_info", {"turn": 8})),                 # 수비 도구
+        (r19, ("safe_tiles", {"turn": 6})),                    # 부른 것만으로(리치 없다는 결과여도)
+        (r11, ("find_turns", {"min_level": "높음"})),          # 수비 조건
+        (r19, ("find_turns", {"after_riichi": "동"})),         # after_riichi 조건(리치가 없던 자리여도)
+        (r19, ("rule", {"name": "밀기 접기"})),               # 밀기 · 접기 뜻을 찾음
+        (facts, ("turn_info", {"turn": 17})),                  # 결과의 riichi_winds
+        (facts, ("what_if", {"turn": 17, "tile": "7m"})),      # risk
+        (r11, ("game_summary", {})),                           # others 의 남 리치
+        (r11, ("find_turns", {})),                             # 줄의 riichi_winds · stance
+    ]
+    for f, call in cases:
+        ev = _ev(f, call)
+        assert ra.evidence_has_riichi(ev), call
+        assert ra.check_tone("이 도우미는 밀지 접을지를 판정하지 않는다.", ev) == [], call
+    # a5 의 시험 답 꼴(리치 맥락이 있는 부정 문구)은 그대로 통과.
+    assert verify_answer(DEF_8 + " 이 도우미는 밀지 접을지를 판정하지 않는다.", _ev(r11, ("defense_info", {"turn": 8})),
+                         "8순에 접었어야 했어?") == []
+
+
+def test_a6_pushfold_disclaimer_needs_one_sentence():
+    assert ra.has_pushfold_disclaimer(UG4_DISCLAIM)
+    assert ra.has_pushfold_disclaimer("밀기·접기 판정 정보는 없다.")
+    # 밀기 · 접기 말만, 부정 문구만, 다른 문장에 나뉘면 부정 문구가 아니다.
+    assert not ra.has_pushfold_disclaimer("이 차례는 밀기 · 접기와 상관없다.")
+    assert not ra.has_pushfold_disclaimer("타점은 판정하지 않는다.")
+    assert not ra.has_pushfold_disclaimer("밀기 · 접기 질문이다. 판정하지 않는다.")
+
+
+def test_a6_graph_disclaimer_retry_then_pass(r19):
+    d = ra.bracket(_turn(r19, 1)["discard"])
+    clean = f"1순은 손패가 짐작이라 숫자로 평가하지 않았다. 버린 패는 {ra.with_ida(d)}. 손패를 몰라 패효율 기준 등급도 모른다."
+    gen = Script(tool("turn_info", turn=1), answer(f"{clean} {UG4_DISCLAIM}"), answer(clean))
+    out = ask(_req(r19, "1순에 버린 건 잘한 거야?"), gen)
+    assert out["outcome"] == "verified" and out["retries"] == 1 and out["answer"] == clean
+    assert out["retry_violations"] == [[NO_RIICHI]] and out["prompt_version"] == "a6"
+    assert f"위반: {NO_RIICHI}" in gen.prompts[2]
+
+
+def test_a6_graph_eval_words_twice_falls_back(r19):
+    gen = Script(tool("turn_info", turn=6), answer(GOOD_6 + " 무난한 선택은 아니었다."),
+                 answer(GOOD_6 + " 사실상 실수다."))
+    out = ask(_req(r19, "6순에 왜 4만이 실수야?"), gen)
+    assert out["outcome"] == "fallback" and out["retries"] == 1
+    assert out["retry_violations"] == [["평가 말: 무난"]] and out["violations"] == ["평가 말: 사실상"]
+    assert ra.eval_words(out["answer"]) == []                 # 대체 답(turn_info 문장)은 평가 말이 없다

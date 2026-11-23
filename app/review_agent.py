@@ -17,6 +17,7 @@ GeminiTextGenerator, 시험은 가짜. 검증 규칙(대괄호 패 · 숫자 단
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import time
@@ -36,10 +37,17 @@ from .review import Generate, tile_name
 # 쓰지 않게(G2) · 판정 말 검사의 부정 문구에 "판정 정보는 없다" 꼴(G3).
 # a6(11-23): 답의 말투 — stance 는 단정 사실문 하나로("사실상 밀었다" · "…로 기록되었다" 금지) · 평가 꾸밈말 금지(지시문 +
 # 검사 8) · "판정하지 않는다" 는 남 리치가 있는 밀기 · 접기 질문에만(지시문 + 검사 9, 리치 없는 패효율 질문에 붙이던 것).
-PROMPT_VERSION = "a6"
-# 사실표 판: 1(설계서 1121) · 2(설계서 1122 — 차례마다 defense). 1 은 defense 가 없는 것으로 본다.
-FACTS_VERSION = 2
-FACTS_VERSIONS = (1, 2)
+# a7(11-23 밤, mahjong_calc docs/review_agent_foldspot_scores_design_1123.md 3절): 사실표 3 의 "보통 접는 자리"(fold_spot 객체)와
+# 국 시작 점수(game.scores)를 사실로 말함 — 판정 말은 fold_spot 이 있어도 위반(검사 7), "접는 자리" 말은 fold_spot 사실이 있을
+# 때만(검사 10), "N점" 은 scores 의 score · gap 값만(검사 11).
+# a8(11-23 밤, 같은 설계서 8-1절): a7 측정(표 15-12)의 흠 넷 — 묻지 않은 "접는 자리 판정이 없다"(검사 12) · 묻지 않은
+# "점수 기록이 없다"(game_summary 알림 뺌 + 검사 13) · find_turns 결과의 "AI" 영어 재시도(fold_spot 객체면 허용) · 안전한 순
+# 자리를 위험 순위처럼 씀(검사 14).
+PROMPT_VERSION = "a8"
+# 사실표 판: 1(설계서 1121) · 2(설계서 1122 — 차례마다 defense) · 3(설계서 1123 — fold_spot 객체 · game.scores).
+# 1 은 defense 가 없는 것으로, 2 의 fold_spot(null · bool)은 null 로 본다(판정 말을 허락하지 않게).
+FACTS_VERSION = 3
+FACTS_VERSIONS = (1, 2, 3)
 
 # 방총 위험 다섯 단계(안전한 순). 앱 lib/paifu/agent_facts.dart `riskLevels` 와 같은 말.
 LEVELS = ["안전", "낮음", "보통", "높음", "매우 높음"]
@@ -47,6 +55,7 @@ LEVEL_INDEX = {x: i for i, x in enumerate(LEVELS)}
 STANCES = ["pushed", "folded", "between"]
 STANCE_KO = {"pushed": "밀었다", "folded": "접었다", "between": "어느 쪽도 아님"}
 DEFENSE_KEYS = ("threat_winds", "tiles", "actual", "safest", "efficient", "stance", "fold_spot")
+SCORES_BASIS = "국 시작 점수(이 국의 리치봉 · 결과 반영 전)"
 
 # 요청 상한(설계서 5절). 사실표는 예시 11판에서 압축 2.3 ~ 33.2KB(11-22 v2, 엔진 켬).
 MAX_REQUEST_BYTES = 200 * 1024
@@ -174,6 +183,9 @@ def validate_request(req: Any) -> None:
         need(isinstance(d, dict) and all(x in keys and int_in(v, 0, 999) for x, v in d.items()), "facts.game", k)
     res = g["result"]
     need(res is None or (isinstance(res, dict) and res.get("type") in RESULT_KO), "facts.game", "result")
+    if version >= 3:
+        need("scores" in g, "facts.game", "scores 없음(사실표 3)")
+        _validate_scores(g)
 
     turns = f["turns"]
     need(isinstance(turns, list) and len(turns) <= MAX_TURNS, "facts.turns", f"목록(최대 {MAX_TURNS})")
@@ -220,7 +232,7 @@ def validate_request(req: Any) -> None:
         need(tiles_ok(t["safe_tiles"]), w, "safe_tiles")
         if version >= 2:
             need("defense" in t, w, "defense 없음(사실표 2)")
-            _validate_defense(t, w)
+            _validate_defense(t, w, version)
 
     others = f["others"]
     need(isinstance(others, list) and len(others) <= MAX_OTHERS, "facts.others", f"목록(최대 {MAX_OTHERS})")
@@ -229,8 +241,64 @@ def validate_request(req: Any) -> None:
              and (o.get("wind") is None or o.get("wind") in WINDS), f"facts.others[{i}]", "{step, wind, kind}")
 
 
-def _validate_defense(t: dict, w: str) -> None:
-    """사실표 2 의 `defense` 꼴(설계서 1122 2절). null 이거나, 리치한 자리가 있고 손패를 아는 차례의 객체."""
+FOLD_SHANTEN = (3, 8)        # fold_spot.shanten — 규칙 R3 은 버리기 전 3샹텐 이상
+FOLD_PCT = (1, 100)          # fold_spot.ai_fold_pct
+SCORE_ABS_MAX = 1_000_000    # 점수 상한(값 검사용 — 실제 판은 한참 작다)
+KYOTAKU_MAX = 99
+
+
+def _validate_fold_spot(v: Any, dw: str, version: int) -> None:
+    """판 2: null 또는 참 · 거짓(도구는 null 로 다룸). 판 3: null 또는 {shanten(3~8 정수), ai_fold_pct(1~100 정수)}."""
+    need, int_in = rv._need, rv._int_in
+    if version < 3:
+        need(v is None or isinstance(v, bool), dw, "fold_spot 은 null 또는 참 · 거짓")
+        return
+    need(v is None or (isinstance(v, dict) and int_in(v.get("shanten"), *FOLD_SHANTEN)
+                       and int_in(v.get("ai_fold_pct"), *FOLD_PCT)),
+         dw, f"fold_spot 은 null 또는 {{shanten({FOLD_SHANTEN[0]}~{FOLD_SHANTEN[1]} 정수), "
+             f"ai_fold_pct({FOLD_PCT[0]}~{FOLD_PCT[1]} 정수)}}")
+
+
+def _score_ok(v: Any) -> bool:
+    return rv._int_in(v, -SCORE_ABS_MAX, SCORE_ABS_MAX) and v % 100 == 0
+
+
+def _validate_scores(g: dict) -> None:
+    """사실표 3 의 `game.scores`(설계서 1123 2-2): null 또는
+    {hero: {wind, score, rank}, others: [{wind, score, rank, gap, ahead}] × 3(동 · 남 · 서 · 북 순), kyotaku: null | 0 이상 정수}.
+    점수는 100 의 배수 정수, rank 는 1 + (나보다 점수가 높은 자리 수), gap = |그 자리 − 나|, ahead = 그 자리가 높은가."""
+    need, int_in = rv._need, rv._int_in
+    s = g["scores"]
+    if s is None:
+        return
+    w = "facts.game.scores"
+    need(isinstance(s, dict) and all(k in s for k in ("hero", "others", "kyotaku")), w, "객체(hero · others · kyotaku)")
+    hero, others = s["hero"], s["others"]
+    need(isinstance(hero, dict) and hero.get("wind") in WINDS and _score_ok(hero.get("score"))
+         and int_in(hero.get("rank"), 1, 4), f"{w}.hero", "{wind, score(100 의 배수 정수), rank(1~4)}")
+    need(hero["wind"] == g["hero_wind"], f"{w}.hero", "wind 는 game.hero_wind 와 같아야 함")
+    need(isinstance(others, list) and len(others) == 3, f"{w}.others", "3개 목록")
+    for i, o in enumerate(others):
+        need(isinstance(o, dict) and o.get("wind") in WINDS and _score_ok(o.get("score")) and int_in(o.get("rank"), 1, 4)
+             and int_in(o.get("gap"), 0, 2 * SCORE_ABS_MAX) and isinstance(o.get("ahead"), bool), f"{w}.others[{i}]",
+             "{wind, score(100 의 배수 정수), rank(1~4), gap(0 이상 정수), ahead(참 · 거짓)}")
+    winds = [hero["wind"], *(o["wind"] for o in others)]
+    need(len(set(winds)) == 4, w, "wind 넷이 겹침")
+    need([o["wind"] for o in others] == [x for x in WINDS if x != hero["wind"]], f"{w}.others", "동 · 남 · 서 · 북 순")
+    k = s["kyotaku"]
+    need(k is None or int_in(k, 0, KYOTAKU_MAX), w, f"kyotaku 는 null 또는 0~{KYOTAKU_MAX} 정수")
+    # 값끼리 맞나(앱이 계산한 값 — 에이전트는 이 값을 그대로 말하므로 어긋난 표는 받지 않는다).
+    pts = [hero["score"], *(o["score"] for o in others)]
+    ranks = [hero["rank"], *(o["rank"] for o in others)]
+    need(all(r == 1 + sum(p > x for p in pts) for r, x in zip(ranks, pts)), w,
+         "rank 는 1 + (점수가 더 높은 자리 수) — 같은 점수면 같은 순위")
+    for i, o in enumerate(others):
+        need(o["gap"] == abs(o["score"] - hero["score"]) and o["ahead"] == (o["score"] > hero["score"]),
+             f"{w}.others[{i}]", "gap = |그 자리 점수 − 내 점수|, ahead = 그 자리가 나보다 높은가")
+
+
+def _validate_defense(t: dict, w: str, version: int = 2) -> None:
+    """사실표 2 · 3 의 `defense` 꼴(설계서 1122 2절 · 1123 2-1). null 이거나, 리치한 자리가 있고 손패를 아는 차례의 객체."""
     need, tile_ok, int_in = rv._need, rv._tile_ok, rv._int_in
     d = t["defense"]
     if d is None:
@@ -263,7 +331,7 @@ def _validate_defense(t: dict, w: str) -> None:
     need(d["stance"] is None if forced else d["stance"] in STANCES, dw,
          "stance 는 리치 중 차례면 null, 그 밖은 " + " · ".join(STANCES))
     need(not forced or e is None, dw, "리치 중 차례의 efficient 는 null")
-    need(d["fold_spot"] is None or isinstance(d["fold_spot"], bool), dw, "fold_spot 은 null 또는 참 · 거짓")
+    _validate_fold_spot(d["fold_spot"], dw, version)
 
 
 # ---------------------------------------------------------------- 도구(사실표에서 찾기만)
@@ -282,14 +350,20 @@ TOOLS: dict[str, dict] = {
     "defense_info": {"args": ["turn"],
                      "desc": "리치한 자리가 있는 그 차례의 방총 위험: 손의 패마다 위험 단계(안전한 순) · 버린 패의 단계와 안전한 순 자리"
                              "(rank / of, 1 = 가장 안전) · 가장 안전한 패 · 효율대로 버릴 패와 그 단계 · stance(버린 패가 가장 안전한 패보다 "
-                             "얼마나 위험했나의 사실) · fold_spot(밀기 · 접기 판정, null 이면 판정 없음) · 상태 · 알림"},
-    "find_turns": {"args": ["grade?", "status?", "min_ukeire_loss?", "tile?", "after_riichi?", "stance?", "min_level?"],
+                             "얼마나 위험했나의 사실) · fold_spot(보통 접는 자리 사실 — 내 손 샹텐 shanten · 강한 AI 가 이런 자리에서 "
+                             "접는 비율 ai_fold_pct, null 이면 접는 자리 판정이 없다) · 상태 · 알림"},
+    "find_turns": {"args": ["grade?", "status?", "min_ukeire_loss?", "tile?", "after_riichi?", "stance?", "min_level?",
+                            "fold_spot?"],
                    "desc": "조건에 맞는 내 버림 차례를 판 전체에서 한 번에: 줄마다 버린 패 · 상태 · 등급 · 쯔모기리 · 리치한 자리 · "
-                           "현물인가 · 버린 패의 위험 단계(level) · stance. after_riichi 에 자리 바람(동 · 남 · 서 · 북)을 주면 그 자리가 "
+                           "현물인가 · 버린 패의 위험 단계(level) · stance · fold_spot(보통 접는 자리면 줄 끝에 '보통 접는 자리'). "
+                           "after_riichi 에 자리 바람(동 · 남 · 서 · 북)을 주면 그 자리가 "
                            "리치한 뒤의 내 버림, stance(pushed · folded · between)는 그 사실인 차례(리치 중 차례는 stance 없음), min_level(안전 · 낮음 · 보통 · 높음 · "
-                           "매우 높음)은 그 단계 이상 위험한 패를 버린 차례(조건은 모두 그리고, 없으면 전부)"},
-    "game_summary": {"args": [], "desc": "판 요약: 국 · 패효율 · 등급 개수 · 상태 개수 · 결과 · 남의 리치 · 울기 · 화료"},
-    "rule": {"args": ["name"], "desc": "용어 풀이: 유효패 · 샹텐 · 현물 · 쯔모기리 · 등급 · 패효율 · 방총 위험 · 밀기 접기"},
+                           "매우 높음)은 그 단계 이상 위험한 패를 버린 차례, fold_spot 이 true 면 보통 접는 자리인 차례"
+                           "(조건은 모두 그리고, 없으면 전부)"},
+    "game_summary": {"args": [], "desc": "판 요약: 국 · 패효율 · 등급 개수 · 상태 개수 · 결과 · 남의 리치 · 울기 · 화료 · "
+                                         "국 시작 점수(scores: 내 점수 · 순위, 다른 자리마다 점수 · 순위 · 나와의 점수 차 gap · "
+                                         "나보다 높은가 ahead, 공탁 리치봉 kyotaku — null 이면 점수 기록이 없다)"},
+    "rule": {"args": ["name"], "desc": "용어 풀이: 유효패 · 샹텐 · 현물 · 쯔모기리 · 등급 · 패효율 · 방총 위험 · 밀기 접기 · 점수"},
 }
 TOOL_NAMES = list(TOOLS)
 PER_TURN_TOOLS = {"turn_info", "discard_options", "what_if", "safe_tiles", "defense_info"}
@@ -321,7 +395,14 @@ RULES: dict[str, str] = {
              "엔진 위험의 차이가 크면 밀었다(pushed), 차이가 거의 없고 두 패의 엔진 위험이 같은 구간(엔진 값으로 나눈 "
              "낮음 · 보통 · 높음 · 매우 높음 넷, 안전 표시는 따로 보지 않음)이면 접었다(folded), 그 밖은 어느 쪽도 "
              "아니다(between). 차이가 작아도 버린 패가 한 구간 더 위험하면 접었다고 하지 않는다. "
-             "이 도우미는 밀지 접을지의 옳고 그름을 판정하지 않는다 — 판정은 fold_spot 이 null 이 아닌 차례에서만 그 값을 옮긴다.",
+             # a7(설계서 1123 3절): 보통 접는 자리의 뜻 · 94% 의 출처 · 판정이 아님. 94 는 앱 pushFoldAiFoldPct(metrics 표 16-15).
+             "보통 접는 자리(fold_spot)는 리치를 받았고, 버리기 전 내 손이 3샹텐 이상이며, 효율대로 버릴 패가 가장 안전한 패보다 "
+             "뚜렷이 위험한 차례다. 천봉 고수 판에서 강한 AI 는 이런 자리의 약 94% 에서 접었다. 판정이 아니라 참고다 — "
+             "이 도우미는 밀지 접을지의 옳고 그름을 판정하지 않는다. fold_spot 이 null 인 차례는 접는 자리 판정이 없는 것이고, "
+             "접는 자리가 아니라는 뜻이 아니다.",
+    "점수": "점수는 이 국을 시작할 때의 점수다(이 국의 리치봉 · 결과 반영 전). 순위는 그 점수로 센 것이고, 점수가 같으면 같은 "
+          "순위다. 점수 차는 그 자리 점수와 내 점수의 차이, 공탁은 국 시작 때 걸려 있던 리치봉 수다. 이 도우미는 역전에 필요한 "
+          "타점 · 순위 전망을 계산하지 않고, 점수로 밀지 접을지를 판단하지 않는다.",
 }
 _RULE_ALIASES = {
     "유효패": "유효패", "대기": "유효패", "ukeire": "유효패", "샹텐": "샹텐", "향청": "샹텐", "shanten": "샹텐",
@@ -330,6 +411,9 @@ _RULE_ALIASES = {
     "방총위험": "방총 위험", "방총": "방총 위험", "위험": "방총 위험", "위험단계": "방총 위험", "단계": "방총 위험",
     "risk": "방총 위험", "level": "방총 위험", "밀기접기": "밀기 접기", "밀기": "밀기 접기", "접기": "밀기 접기",
     "밀기·접기": "밀기 접기", "stance": "밀기 접기", "pushfold": "밀기 접기", "fold_spot": "밀기 접기",
+    "접는자리": "밀기 접기", "보통접는자리": "밀기 접기", "foldspot": "밀기 접기",
+    "점수": "점수", "점수상황": "점수", "순위": "점수", "등수": "점수", "점수차": "점수", "공탁": "점수", "리치봉": "점수",
+    "scores": "점수", "score": "점수", "gap": "점수", "kyotaku": "점수",
 }
 
 
@@ -381,11 +465,28 @@ def _tile_genbutsu(t: dict, code: str) -> bool | None:
 
 
 def _defense_of(facts: dict, t: dict) -> dict | None:
-    """그 차례의 defense 칸. 사실표 1 은 defense 가 없는 것으로 본다."""
-    if facts.get("version") != 2:
+    """그 차례의 defense 칸. 사실표 1 은 defense 가 없는 것으로 본다. fold_spot 은 객체(사실표 3)일 때만 남기고, 그 밖
+    (판 2 의 참 · 거짓 등)은 null 로 바꾼 사본을 돌려준다 — 판 2 의 참으로 판정 · 접는 자리 말이 허락되지 않게."""
+    if facts.get("version") not in (2, 3):
         return None
     d = t.get("defense")
-    return d if isinstance(d, dict) else None
+    if not isinstance(d, dict):
+        return None
+    if d.get("fold_spot") is not None and not isinstance(d.get("fold_spot"), dict):
+        d = {**d, "fold_spot": None}
+    return d
+
+
+def _fold_spot_of(d: dict | None) -> dict | None:
+    """defense 칸([_defense_of] 를 거친 것)의 fold_spot 객체 또는 None."""
+    fs = d.get("fold_spot") if d else None
+    return fs if isinstance(fs, dict) else None
+
+
+def fold_spot_note(fs: dict) -> str:
+    """fold_spot 객체 → defense_info 알림(설계서 1123 3절 글 그대로, 숫자만 사실표 값)."""
+    return (f"보통 접는 자리다(리치를 받았고 내 손이 {fs['shanten']}샹텐, 효율대로 버릴 패가 가장 안전한 패보다 뚜렷이 위험) — "
+            f"강한 AI 는 이런 자리의 약 {fs['ai_fold_pct']}% 에서 접는다. 판정이 아니라 참고다")
 
 
 def _risk_of_tile(d: dict, code: str) -> dict | None:
@@ -558,7 +659,7 @@ def _defense_info(facts: dict, args: dict) -> dict:
         notes.append("이 차례에는 리치한 다른 자리가 없다 — 방총 위험 단계를 내지 않는다")
     elif t.get("hand") is None:
         notes.append(f"{STATUS_KO.get(s, '손패 모름')} 차례라 손패를 몰라 패마다의 위험 단계를 알 수 없다")
-    elif facts.get("version") != 2:
+    elif facts.get("version") not in (2, 3):
         notes.append("이 사실표(판 1)에는 방총 위험 단계가 없다")
     elif d is None:
         notes.append("이 차례에는 엔진 위험 값이 없다")
@@ -570,15 +671,19 @@ def _defense_info(facts: dict, args: dict) -> dict:
         if d.get("stance") is None:
             notes.append("리치 중이라 고를 수 없던 차례 — 밀었다 · 접었다를 말하지 않는다(버린 패의 위험 단계까지만)")
         # a4 F2: "이 도우미는 밀지 접을지를 판정하지 않는다" 를 차례마다 실으면 묻지 않은 답에도 옮겨 적었다 — 사실까지만.
-        if d.get("fold_spot") is None:
+        # a7: fold_spot 객체(사실표 3)면 "보통 접는 자리" 사실과 근거 숫자, null 이면 지금 알림 그대로.
+        fs = _fold_spot_of(d)
+        if fs is None:
             notes.append("이 차례의 밀기 · 접기 판정은 없다(fold_spot null)")
+        else:
+            notes.append(fold_spot_note(fs))
     if notes:
         out["note"] = ". ".join(notes)
     return out
 
 
-def _turn_line(t: dict) -> str:
-    """find_turns 의 한 줄: "6순 [4만] 버림 · 실수 · 유효패 5장 손해"."""
+def _turn_line(t: dict, fold_spot: bool = False) -> str:
+    """find_turns 의 한 줄: "6순 [4만] 버림 · 실수 · 유효패 5장 손해". 보통 접는 자리(a7)면 끝에 " · 보통 접는 자리"."""
     label = GRADE_KO[t["grade"]] if t.get("grade") else STATUS_KO.get(t["status"], t["status"])
     line = f"{t['turn']}순 {bracket(t['discard'])} 버림 · {label}"
     sl, ul = t.get("shanten_loss"), t.get("ukeire_loss")
@@ -590,6 +695,8 @@ def _turn_line(t: dict) -> str:
         g = t.get("genbutsu")
         safe = "현물 판단 없음" if g is None else "현물" if g else "현물 아님"
         line += f" · {' · '.join(t['riichi_winds'])} 리치에 {safe}"
+    if fold_spot:
+        line += " · 보통 접는 자리"
     return line
 
 
@@ -614,6 +721,25 @@ def wind_arg(v: Any) -> str | None:
 _STANCE_ARG = {"pushed": "pushed", "push": "pushed", "밀었다": "pushed", "밀기": "pushed", "밂": "pushed", "밀었음": "pushed",
                "folded": "folded", "fold": "folded", "접었다": "folded", "접기": "folded", "접음": "folded",
                "between": "between", "사이": "between", "중간": "between", "어느쪽도아님": "between"}
+# find_turns 의 fold_spot? 조건: 참만 뜻이 있다(null 은 "접는 자리가 아니다" 가 아니라 판정이 없다는 뜻이라 거짓으로 고르지 않음).
+# 거짓은 조건 없음으로 본다(선택 인자를 모델이 false 로 채워 보내도 오류로 도구 한 번을 버리지 않게).
+_BOOL_TRUE = {"true", "참", "yes", "1", "예", "네"}
+_BOOL_FALSE = {"false", "거짓", "no", "0", "아니오", "아니요"}
+
+
+def fold_spot_arg(v: Any) -> bool | None:
+    """fold_spot 조건 인자 → 참 · 거짓(모르면 None)."""
+    if isinstance(v, bool):
+        return v
+    if rv._int(v) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in _BOOL_TRUE:
+            return True
+        if s in _BOOL_FALSE:
+            return False
+    return None
 
 
 def level_arg(v: Any) -> str | None:
@@ -690,6 +816,12 @@ def _find_turns(facts: dict, args: dict) -> dict:
         if lv is None:
             raise ToolError(f"모르는 min_level: {args['min_level']!r}(쓸 수 있는 값: {' · '.join(LEVELS)})")
         cond["min_level"] = lv
+    if args.get("fold_spot") not in (None, ""):
+        fsv = fold_spot_arg(args["fold_spot"])
+        if fsv is None:
+            raise ToolError(f"모르는 fold_spot: {args['fold_spot']!r}(true 면 보통 접는 자리인 차례만)")
+        if fsv:
+            cond["fold_spot"] = True
     # 줄 수 상한은 두지 않는다 — 사실표의 차례가 최대 MAX_TURNS(40)라 판 전체가 한 번에 들어간다(g4: 차례마다 부르다 한도에 닿음).
     rows = []
     for t in facts.get("turns") or []:
@@ -709,19 +841,42 @@ def _find_turns(facts: dict, args: dict) -> dict:
             continue
         if "min_level" in cond and (level is None or LEVEL_INDEX[level] < LEVEL_INDEX[cond["min_level"]]):
             continue
-        rows.append({"turn": t["turn"], "discard": t["discard"], "status": t["status"], "grade": t.get("grade"),
-                     # 고를 수 있었나(what_if · discard_options 와 같은 뜻, 리치 중이면 false) — min_level 줄에 리치 중 차례가 섞여도 드러나게.
-                     "can_choose": t["status"] != "forced", "tsumogiri": t.get("tsumogiri"), "riichi_winds": t.get("riichi_winds") or [],
-                     "genbutsu": t.get("genbutsu"),
-                     "shanten_loss": t.get("shanten_loss"), "ukeire_loss": t.get("ukeire_loss"),
-                     # 버린 패의 방총 위험 단계 · stance(사실표 2 의 defense 가 있는 차례만, 그 밖은 null).
-                     "level": level, "stance": d.get("stance") if d else None, "line": _turn_line(t)})
+        if "fold_spot" in cond and _fold_spot_of(d) is None:
+            continue
+        rows.append(_find_row(facts, t))
     out: dict = {"conditions": cond, "count": len(rows), "turns": rows}
     if "after_riichi" in cond:
         out["riichi"] = event
-    if note:
-        out["note"] = note
+    notes = [note] if note else []
+    if "fold_spot" in cond and not rows:
+        # 검토(11-23): 판에 접는 자리가 아예 없는 때(가)와, 있는데 다른 조건에서 다 걸러진 때(나)를 가른다 — (나)를 "판정이 없다"
+        # 로 알리면 "접는 자리에서 민 곳 있어?" 의 답이 "판정이 없다" 로 샜다. (나)는 접는 자리 줄(fold_spot_turns)을 같이 싣는다.
+        spots = [_find_row(facts, t) for t in facts.get("turns") or [] if _fold_spot_of(_defense_of(facts, t)) is not None]
+        if spots:
+            out["fold_spot_turns"] = spots
+            notes.append(f"보통 접는 자리는 {' · '.join(str(r['turn']) + '순' for r in spots)}에 있지만 "
+                         "다른 조건까지 맞는 차례는 없다")
+        else:
+            # 이 알림을 답에 옮겨도 검사 10 을 통과하는 꼴("판정이 있는 차례가 없다" — [_NO_VERDICT]).
+            notes.append("이 판에는 보통 접는 자리 판정이 있는 차례가 없다(접는 자리가 아니라는 뜻이 아니다)")
+    if notes:
+        out["note"] = ". ".join(notes)
     return out
+
+
+def _find_row(facts: dict, t: dict) -> dict:
+    """find_turns 의 한 줄(turns · fold_spot_turns 같은 꼴)."""
+    d = _defense_of(facts, t)
+    fs = _fold_spot_of(d)
+    return {"turn": t["turn"], "discard": t["discard"], "status": t["status"], "grade": t.get("grade"),
+            # 고를 수 있었나(what_if · discard_options 와 같은 뜻, 리치 중이면 false) — min_level 줄에 리치 중 차례가 섞여도 드러나게.
+            "can_choose": t["status"] != "forced", "tsumogiri": t.get("tsumogiri"), "riichi_winds": t.get("riichi_winds") or [],
+            "genbutsu": t.get("genbutsu"),
+            "shanten_loss": t.get("shanten_loss"), "ukeire_loss": t.get("ukeire_loss"),
+            # 버린 패의 방총 위험 단계 · stance(사실표 2 의 defense 가 있는 차례만, 그 밖은 null).
+            "level": (d.get("actual") or {}).get("level") if d else None, "stance": d.get("stance") if d else None,
+            # 보통 접는 자리(사실표 3 의 fold_spot 객체, 그 밖은 null).
+            "fold_spot": fs, "line": _turn_line(t, fs is not None)}
 
 
 def _game_summary(facts: dict, args: dict) -> dict:
@@ -738,13 +893,21 @@ def _game_summary(facts: dict, args: dict) -> dict:
             {"riichi": "리치", "ron": "론", "tsumo": "쯔모"}.get(o.get("kind"), o.get("kind"))
         others.append({**o, "kind_name": name})
     turns = facts.get("turns") or []
-    return {
+    out = {
         "round": g.get("round"), "honba": g.get("honba"), "hero_wind": g.get("hero_wind"),
         "dora_indicators": g.get("dora_indicators"), "efficiency_pct": g.get("efficiency_pct"),
         "grades": {GRADE_KO[k]: v for k, v in (g.get("grades") or {}).items() if k in GRADE_KO},
         "statuses": {STATUS_KO[k]: v for k, v in (g.get("statuses") or {}).items() if k in STATUS_KO},
         "hero_discards": len(turns), "result": result, "others": others,
     }
+    # a7: 국 시작 점수(사실표 3 의 game.scores 그대로 + 기준). 판 1 · 2 와 null 은 점수 기록이 없는 것으로.
+    scores = g.get("scores") if facts.get("version") == 3 else None
+    if isinstance(scores, dict):
+        out["scores"] = {**copy.deepcopy(scores), "basis": SCORES_BASIS}
+    else:
+        # a8: 알림("이 판에는 점수 기록이 없다")은 뺀다 — 총평 끝에 묻지 않은 그 말을 붙였다(a7 ug3 · g3 · t19).
+        out["scores"] = None
+    return out
 
 
 def _rule(facts: dict, args: dict) -> dict:
@@ -850,19 +1013,43 @@ def evidence_allow(evidence: list[dict]) -> tuple[rv._Allow, set[int]]:
             a.shanten.add(v)
         elif key == "turn":
             a.jun.add(v)
-        elif key == "efficiency_pct":
+        elif key in ("efficiency_pct", "ai_fold_pct"):  # ai_fold_pct: 사실표 3 fold_spot 의 "약 94%"
             pct.add(v)
 
     for e in evidence:
         walk(e, None, None)
+    # 검토(11-23): rule '밀기 접기' 를 불렀으면 그 글의 "3샹텐 이상"(보통 접는 자리의 문턱)을 옮겨 쓸 수 있다.
+    if evidence_has_pushfold_rule(evidence):
+        a.shanten.add(FOLD_SHANTEN[0])
     return a, pct
+
+
+def evidence_points(evidence: list[dict]) -> set[int]:
+    """"N점" 으로 쓸 수 있는 값(a7 검사 11): evidence 결과의 `score` · `gap` 칸(game_summary 의 scores). 음수 점수는 부호 없는
+    값도 넣는다("N점" 정규식은 부호를 보지 않는다)."""
+    out: set[int] = set()
+
+    def walk(v, key):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, k)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key)
+        elif key in ("score", "gap") and rv._int(v):
+            out.update({v, abs(v)})
+
+    for e in evidence:
+        walk(e.get("result"), None)
+    return out
 
 
 # 위험 단계 말(지시문 a3): 작은따옴표('높음' · ‘높음’) 안의 단계만 단계 말로 본다. 따옴표 밖 "낮음" · "높음" · "매우 높음" 은
 # 위반("안전" · "보통" 은 흔한 말이라 따옴표 밖은 보지 않음).
 _LEVEL_QUOTED = re.compile(r"['‘](" + "|".join(sorted(LEVELS, key=len, reverse=True)) + r")['’]")
 _LEVEL_BARE = re.compile(r"매우\s*높음|높음|낮음")
-# 밀기 · 접기 판정 말: evidence 에 fold_spot 이 null 이 아닌 차례가 있을 때만. "이 도우미는 밀지 접을지를 판정하지 않는다" 는 안 걸림.
+# 밀기 · 접기 판정 말: a3 ~ a6 은 evidence 에 fold_spot 이 null 이 아닌 차례가 있으면 허락, a7 부터 늘 위반.
+# "이 도우미는 밀지 접을지를 판정하지 않는다" 는 안 걸림.
 VERDICT_WORDS = [
     (re.compile(r"접었어야"), "접었어야"),
     (re.compile(r"접는\s*게\s*맞"), "접는 게 맞"),
@@ -873,6 +1060,10 @@ VERDICT_WORDS = [
     (re.compile(r"밀어도\s*됐"), "밀어도 됐"),
     (re.compile(r"밀어도\s*괜찮"), "밀어도 괜찮"),
     (re.compile(r"밀\s*만했"), "밀 만했"),
+    # a7(11-23 검토): 평가 꼴 — fold_spot 이 있어도 위반.
+    (re.compile(r"잘\s*접었"), "잘 접었"),
+    (re.compile(r"잘\s*밀었"), "잘 밀었"),
+    (re.compile(r"잘\s*내렸"), "잘 내렸"),
 ]
 # a4 F4: 판정 말 바로 뒤(한글 0 ~ 3자 안)가 간접 의문 어미이고 같은 문장에 판정을 안 한다는 말이 있으면 판정 말이 아니다
 # ("접었어야 했는지 여부를 판단하지 않는다" · "밀어도 됐는지는 판정하지 않는다"). 2단계 유도 질문 8개 중 3개가 이 오검출로
@@ -926,11 +1117,12 @@ def evidence_levels(evidence: list[dict]) -> set[str]:
 
 
 def evidence_has_fold_spot(evidence: list[dict]) -> bool:
-    """evidence 안에 fold_spot 이 null 이 아닌 차례가 있나(밀기 · 접기 판정 사실)."""
+    """evidence 안에 fold_spot 객체(사실표 3 — 보통 접는 자리 사실)가 있는 차례가 있나. 객체만 센다 — find_turns 의
+    조건 칸 `{"fold_spot": true}` 나 판 2 의 참 · 거짓은 사실이 아니다(도구가 판 2 의 참 · 거짓은 null 로 바꿔 낸다)."""
 
     def walk(v) -> bool:
         if isinstance(v, dict):
-            return any((k == "fold_spot" and x is not None) or walk(x) for k, x in v.items())
+            return any((k == "fold_spot" and isinstance(x, dict)) or walk(x) for k, x in v.items())
         if isinstance(v, list):
             return any(walk(x) for x in v)
         return False
@@ -939,7 +1131,8 @@ def evidence_has_fold_spot(evidence: list[dict]) -> bool:
 
 
 def check_risk_words(text: str, evidence: list[dict]) -> list[str]:
-    """a3 의 단계 말 · 판정 말 검사(설계서 1122 4절 검증 1 · 2). 판정 말은 a4 부터 [verdict_words] 로(부정문 간접 의문은 뺌)."""
+    """a3 의 단계 말 · 판정 말 검사(설계서 1122 4절 검증 1 · 2). 판정 말은 a4 부터 [verdict_words] 로(부정문 간접 의문은 뺌).
+    a7: 판정 말은 fold_spot 사실이 있어도 위반(위반 줄의 괄호 말만 다르다 — 재시도 지시에 까닭이 보이게)."""
     out: list[str] = []
     levels = evidence_levels(evidence)
     plain = rv._BRACKET.sub(" ", text)
@@ -948,10 +1141,76 @@ def check_risk_words(text: str, evidence: list[dict]) -> list[str]:
             out.append(f"도구로 찾은 사실표에 없는 위험 단계: '{m.group(1)}'")
     for m in _LEVEL_BARE.finditer(_LEVEL_QUOTED.sub(" ", plain)):
         out.append(f"작은따옴표 없이 쓴 위험 단계: {m.group(0)}")
-    if not evidence_has_fold_spot(evidence):
-        for word in verdict_words(plain):
-            out.append(f"밀기 · 접기 판정 말(fold_spot 사실 없음): {word}")
+    why = "보통 접는 자리여도 판정은 쓰지 않음" if evidence_has_fold_spot(evidence) else "fold_spot 사실 없음"
+    for word in verdict_words(plain):
+        out.append(f"밀기 · 접기 판정 말({why}): {word}")
     return out
+
+
+# a7 검사 10 — "접는 자리" 말: evidence 에 fold_spot 객체가 있을 때만. 같은 문장에 "판정(정보 · 기록)(은 · 는 · 이 · 가) 없" 이
+# 있으면 통과("이 차례에는 접는 자리 판정이 없다"). 검토(11-23): find_turns (가) 알림 꼴 "판정이 있는 차례가 없" 도 통과.
+_FOLD_SPOT_WORD = re.compile(r"접는\s*자리")
+_NO_VERDICT = re.compile(r"판정\s*(?:정보|기록)?\s*(?:은|는|이|가)\s*없|판정\s*(?:이|가)\s*있는\s*차례\s*(?:가|는|도)?\s*없")
+
+
+def evidence_has_pushfold_rule(evidence: list[dict]) -> bool:
+    """이번 질문에서 rule 도구를 '밀기 접기'(별칭 포함)로 불렀나 — 용어 풀이("보통 접는 자리가 뭐야?")의 근거."""
+    return any(e.get("tool") == "rule" and isinstance((e.get("args") or {}).get("name"), str)
+               and _RULE_ALIASES.get(e["args"]["name"].replace(" ", "").lower()) == "밀기 접기" for e in evidence)
+
+
+def check_fold_spot_words(text: str, evidence: list[dict]) -> list[str]:
+    """검사 10. 위반 줄 목록(한 줄 — 몇 번 나와도). fold_spot 객체가 있거나 rule '밀기 접기' 를 불렀으면 통과(검토 11-23)."""
+    if evidence_has_fold_spot(evidence) or evidence_has_pushfold_rule(evidence):
+        return []
+    for s in split_sentences(rv._BRACKET.sub(" ", text)):
+        if _FOLD_SPOT_WORD.search(s) and not _NO_VERDICT.search(s):
+            return ["접는 자리 말(fold_spot 사실 없음)"]
+    return []
+
+
+# a7 검사 11 — 점수: "N점"(쉼표 허용, review.py 의 _N_POINT 와 같은 꼴)은 evidence 의 score · gap 값만. 한글 수사 점수
+# ("3만 점" · "2만 5천 점" · "8천점")는 늘 위반. 한글 수사 점수는 공용 검사 전에 지운다 — "3만" 이 대괄호 없는 패로도
+# 잡혀 위반 줄이 엉뚱해지지 않게.
+_KO_POINT = re.compile(r"\d[\d,]*\s?(?:만|천|백)(?:\s?\d[\d,]*\s?(?:천|백))*(?:\s?\d[\d,]*)?\s?점")
+_POINT_COMMA_OK = re.compile(r"\d+|\d{1,3}(?:,\d{3})+")
+_RV_POINT_LINE = "점수 말: "
+
+
+def check_points(text: str, evidence: list[dict]) -> list[str]:
+    """검사 11. [text] 는 대괄호 밖 글."""
+    out: list[str] = []
+    allowed = evidence_points(evidence)
+    for m in _KO_POINT.finditer(text):
+        out.append(f"한글 수로 쓴 점수(숫자 그대로 써야 함): {m.group(0).strip()}")
+    for m in rv._N_POINT.finditer(_KO_POINT.sub(" ", text)):
+        raw = m.group(0).strip()
+        digits = re.sub(r"\s?점$", "", raw)
+        if not _POINT_COMMA_OK.fullmatch(digits) or int(digits.replace(",", "")) not in allowed:
+            out.append(f"도구로 찾은 점수 기록에 없는 점수: {raw}")
+    return out
+
+
+# 영어 검사의 예외: "AI" — fold_spot 알림 · rule '밀기 접기' 글의 "강한 AI" 를 옮긴 답(evidence 글에 "AI" 가 있을 때만).
+_EN_OK = "AI"
+
+
+def _evidence_texts(evidence: list[dict]) -> str:
+    parts: list[str] = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+        elif isinstance(v, str):
+            parts.append(v)
+
+    for e in evidence:
+        walk(e.get("result"))
+    return "\n".join(parts)
 
 
 # a6 검사 8 — 평가 말: 좋고 나쁨을 꾸미는 낱말과 "…고 · 라고 · 로 볼 수 있다" 꼴의 둘러대기. 대괄호 밖 답 글에서만 찾는다
@@ -979,14 +1238,15 @@ def has_pushfold_disclaimer(text: str) -> bool:
 # 남 리치 맥락이 되는 도구 · 칸. 도구: defense_info · safe_tiles(부른 것만으로), find_turns 의 after_riichi · stance ·
 # min_level 조건(리치한 자리가 있는 차례에만 뜻이 있는 조건), rule 의 '밀기 접기'(밀기 · 접기 뜻을 물은 것).
 _RIICHI_TOOLS = {"defense_info", "safe_tiles"}
-_RIICHI_FIND_ARGS = ("after_riichi", "stance", "min_level")
+_RIICHI_FIND_ARGS = ("after_riichi", "stance", "min_level", "fold_spot")
 _RIICHI_KEYS = ("stance", "fold_spot", "defense", "risk", "riichi")
 
 
 def evidence_has_riichi(evidence: list[dict]) -> bool:
     """이번 질문의 evidence 에 남 리치(밀기 · 접기) 맥락이 하나라도 있나(a6 검사 9).
 
-    참이 되는 것: (1) defense_info · safe_tiles 를 불렀다. (2) find_turns 를 after_riichi · stance · min_level 조건으로 불렀다.
+    참이 되는 것: (1) defense_info · safe_tiles 를 불렀다. (2) find_turns 를 after_riichi · stance · min_level · fold_spot(참)
+    조건으로 불렀다.
     (3) rule 을 '밀기 접기'(별칭 포함)로 불렀다. (4) 도구 결과 어디든 `riichi_winds` 가 빈 목록이 아니다(turn_info ·
     what_if · discard_options · find_turns 줄 — 남이 리치한 자리만 든 칸), `stance` · `fold_spot` · `defense` · `risk` ·
     `riichi`(find_turns 의 리치 사건)가 null 이 아니다, game_summary 의 `others` 에 kind 가 riichi 인 줄이 있다.
@@ -1009,7 +1269,7 @@ def evidence_has_riichi(evidence: list[dict]) -> bool:
         tool, args = e.get("tool"), e.get("args") or {}
         if tool in _RIICHI_TOOLS:
             return True
-        if tool == "find_turns" and any(args.get(k) not in (None, "") for k in _RIICHI_FIND_ARGS):
+        if tool == "find_turns" and any(args.get(k) not in (None, "", False) for k in _RIICHI_FIND_ARGS):
             return True
         if tool == "rule" and isinstance(args.get("name"), str) \
                 and _RULE_ALIASES.get(args["name"].replace(" ", "").lower()) == "밀기 접기":
@@ -1044,11 +1304,12 @@ def checked_turns(evidence: list[dict]) -> set[int]:
     return out
 
 
-def verify_answer(text: Any, evidence: list[dict], question: str) -> list[str]:
+def verify_answer(text: Any, evidence: list[dict], question: str, history: list | None = None) -> list[str]:
     """답 검증(설계서 4절 verify). 위반마다 사람이 읽는 한 줄, 통과면 빈 목록.
 
     1 패: 대괄호 `[3만]` 만 패로 보고, evidence 에 나온 패여야 한다. 대괄호 밖 `3만` · `3m` 은 위반.
-    2 숫자: `N장 · N종 · N샹텐 · N순(N번째) · N위 · N%` 는 evidence 안의 값(`0샹텐` 은 늘 위반 — 텐파이). `N점` 위반.
+    2 숫자: `N장 · N종 · N샹텐 · N순(N번째) · N위 · N%` 는 evidence 안의 값(`0샹텐` 은 늘 위반 — 텐파이). `N점` 은 a6 까지
+      늘 위반, a7 부터 검사 11.
     3 영어(대괄호 밖 영문자 2자 이상) · 금지어(반드시 · 무조건 · 절대) · 존댓말(해라체로).
     4 질문이 물은 차례(`N순 · N번째 · N차례`)를 차례 도구로 확인하지 않고 답함.
     5 길이 1~500자 · 문장 5개 이하 · 한글 한 글자 이상.
@@ -1062,13 +1323,28 @@ def verify_answer(text: Any, evidence: list[dict], question: str) -> list[str]:
       "…고 · 라고 · 로 볼 수 있" 이 있으면 위반 "평가 말: …"(질문에 같은 말이 있어도).
     9 (a6) 한 문장에 "밀지 접을지 · 밀기 · 접기" 와 판정 부정 문구가 같이 있는데 evidence 에 남 리치 맥락이 없으면
       위반 "리치 없는 질문에 밀기 · 접기 부정 문구"(맥락의 정의는 [evidence_has_riichi]).
-    8 · 9 는 앞 검사들의 위반 뒤에 붙는다(앞 위반 줄은 a5 와 같다)."""
+    8 · 9 는 앞 검사들의 위반 뒤에 붙는다(앞 위반 줄은 a5 와 같다).
+    (a7) 7 의 판정 말은 fold_spot 사실이 있어도 위반(부정문 간접 의문 예외는 그대로).
+    10 (a7) "접는 자리" 는 evidence 에 fold_spot 객체가 있거나 rule '밀기 접기'(별칭 포함)를 불렀을 때만. 같은 문장에 "판정(정보 · 기록)(은 · 는 · 이 · 가) 없" 이
+      있으면 통과. 위반 "접는 자리 말(fold_spot 사실 없음)".
+    11 (a7) "N점"(쉼표 허용)은 evidence 의 score · gap 값만(2 의 "N점 위반" 을 대신함). "N천 점 · N만 점" 같은 한글 수사
+      점수는 늘 위반. "N위" 는 2 그대로(scores 의 rank 도 근거), "N%" 에는 fold_spot 의 ai_fold_pct 가 들어간다.
+      "AI" 는 evidence 글에 "AI" 가 있으면 영어 위반으로 보지 않는다(fold_spot 알림 · rule '밀기 접기' 의 "강한 AI").
+    10 · 11 은 9 뒤에 붙는다.
+    (a8) [history] 는 요청의 history([{q, a}] — 앞 질문만 본다). 12 · 13 · 14 는 11 뒤에 붙는다([check_unasked_disclaimers]).
+    12 한 문장에 "접는 자리" 와 판정 없음 꼴([_NO_VERDICT])이 있는데 질문(+ 앞 질문)에 접 · 밀 · 내리 · 내릴 · 내렸 · 판정 이 없으면 위반.
+    13 "점수 기록(은 · 이 · 도) 없" 이 있는데 질문(+ 앞 질문)에 점수 · 몇 점 · 점 차 · 몇 등 · 등수 · 순위 · 몇 위 · 공탁 · 리치봉 이
+      없으면 위반. 14 "위험 순위" · "N위의 위험" · "N위로 위험" 은 위반. "AI" 는 fold_spot 객체가 있어도 허용."""
     text = text.strip() if isinstance(text, str) else ""
     if not text:
         return ["답 없음"]
     allow, pct = evidence_allow(evidence)
-    out = rv._check_tiles_numbers(text, allow, "도구로 찾은")
     plain = rv._BRACKET.sub(" ", text)
+    # 한글 수사 점수는 지운 글로 공용 검사(검사 11 이 따로 잡는다). 공용 검사의 "점수 말" 줄은 검사 11 이 대신한다.
+    # a8: fold_spot 객체가 있으면 글에 "AI" 가 없어도(find_turns 줄) 허용.
+    en_ok = evidence_has_fold_spot(evidence) or _EN_OK in _evidence_texts(evidence)
+    out = [v for v in rv._check_tiles_numbers(_KO_POINT.sub(" ", text), allow, "도구로 찾은")
+           if not v.startswith(_RV_POINT_LINE) and not (en_ok and v == f"영어(한국어로 써야 함): {_EN_OK}")]
     for m in _PCT.finditer(plain):
         if int(m.group(1)) not in pct:
             out.append(f"도구로 찾은 사실표에 없는 숫자: {m.group(0).strip()}")
@@ -1086,7 +1362,42 @@ def verify_answer(text: Any, evidence: list[dict], question: str) -> list[str]:
     if not rv._HANGUL.search(text):
         out.append("답에 한글 없음")
     out += check_tone(text, evidence)
+    out += check_fold_spot_words(text, evidence)
+    out += check_points(plain, evidence)
+    out += check_unasked_disclaimers(text, question, history)
     return rv._dedupe(out)
+
+
+# a8 검사 12 · 13 · 14(설계서 1123 8-1). 질문 글 = 이번 질문 + history 의 앞 질문들(이어 묻기).
+_ASKED_PUSHFOLD = re.compile(r"접|밀|내리|내릴|내렸|판정")
+# "등급" 의 "등" 에 걸리지 않게 낱말을 한정한다.
+_ASKED_SCORE = re.compile(r"점수|몇\s*점|점\s*차|몇\s*등|등수|순위|몇\s*위|공탁|리치봉")
+_NO_SCORE_RECORD = re.compile(r"점수\s*기록\s*(?:은|이|도)?\s*없")
+_RISK_RANK = re.compile(r"위험\s*순위|\d+\s*위의\s*위험|\d+\s*위로\s*위험")
+
+
+def _asked_texts(question: str, history: list | None) -> str:
+    qs = [question or ""]
+    for h in history or []:
+        q = h.get("q") if isinstance(h, dict) else h
+        if isinstance(q, str):
+            qs.append(q)
+    return "\n".join(qs)
+
+
+def check_unasked_disclaimers(text: str, question: str, history: list | None = None) -> list[str]:
+    """a8 검사 12(묻지 않은 접는 자리 부정 문구) · 13(묻지 않은 점수 기록 부정 문구) · 14(안전한 순 자리를 위험 순위처럼)."""
+    out: list[str] = []
+    asked = _asked_texts(question, history)
+    plain = rv._BRACKET.sub(" ", text)
+    if not _ASKED_PUSHFOLD.search(asked) and any(
+            _FOLD_SPOT_WORD.search(s) and _NO_VERDICT.search(s) for s in split_sentences(plain)):
+        out.append("묻지 않은 접는 자리 부정 문구")
+    if not _ASKED_SCORE.search(asked) and _NO_SCORE_RECORD.search(plain):
+        out.append("묻지 않은 점수 기록 부정 문구")
+    if _RISK_RANK.search(plain):
+        out.append("안전한 순 자리를 위험 순위처럼 씀")
+    return out
 
 
 # ---------------------------------------------------------------- 대체 답(LLM 없이 코드가)
@@ -1153,6 +1464,7 @@ _ARG_PROPS = {
     "after_riichi": {"type": "string", "description": "자리 바람(동 · 남 · 서 · 북) — 그 자리가 리치한 뒤의 내 버림"},
     "stance": {"type": "string", "description": "pushed · folded · between — 그 사실인 차례"},
     "min_level": {"type": "string", "description": "안전 · 낮음 · 보통 · 높음 · 매우 높음 — 그 단계 이상 위험한 패를 버린 차례"},
+    "fold_spot": {"type": "boolean", "description": "true 면 보통 접는 자리인 차례만(false 는 조건 없음과 같다)"},
     "name": {"type": "string", "description": "용어 이름"},
 }
 
@@ -1239,8 +1551,9 @@ PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 
   답한다. 여러 차례에 걸친 질문("리치 받은 뒤 위험하게 버린 곳 있어")은 find_turns 의 after_riichi · stance · min_level 조건으로.
 - 위험은 다섯 단계 '안전' · '낮음' · '보통' · '높음' · '매우 높음' 으로만 말한다. 단계는 작은따옴표 하나로 감싼다: '높음'
   (패를 대괄호로 쓰는 것과 같은 약속 — 검사가 이것을 본다). 도구 결과에 나온 단계만 쓰고, 따옴표 없이 쓰지 않는다.
-- 위험 % 를 지어내지 않는다. 사실표에는 % 가 없다. 단계의 뜻 · 관측 비율은 rule("방총 위험")에 있다 — 그 글을 읽었을 때만 그 % 를 옮긴다.
-- 순서는 defense_info 의 rank / of(1 = 가장 안전)를 "손의 N종 중 R위" 처럼 그대로 쓴다. 가장 안전한 패는 safest, 효율대로 버릴 패는 efficient.
+- 위험 % 를 지어내지 않는다. 사실표의 위험에는 % 가 없다(쓸 수 있는 % 는 rule("방총 위험") 글의 관측 비율과 fold_spot 의 ai_fold_pct 뿐이다). 단계의 뜻 · 관측 비율은 rule("방총 위험")에 있다 — 그 글을 읽었을 때만 그 % 를 옮긴다.
+- 순서는 defense_info 의 rank / of(1 = 가장 안전)를 "안전한 순으로 손의 N종 중 R위" 처럼 그대로 쓴다. "위험 순위 R위 · R위의 위험도" 처럼
+  위험한 순으로 읽히게 쓰지 않는다. 가장 안전한 패는 safest, 효율대로 버릴 패는 efficient.
 - 위험 단계는 패마다 따로 적힌 값만 말한다. 같은 목록(가장 안전한 패 · 현물)에 있다고 같은 단계로 말하지 않는다 — what_if 면
   물어본 패는 risk 의 level, 실제 버린 패는 risk.actual, 가장 안전한 패는 risk.safest 의 패마다 level.
 - stance(pushed · folded · between)는 버린 패가 가장 안전한 패보다 얼마나 위험했나의 사실이지 판정이 아니다. 말할 때는
@@ -1249,8 +1562,13 @@ PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 
   "가장 안전한 [백] 대신 [5통]을 버렸고, 밀었다 · 접었다 어느 쪽도 아니다"(뜻은 rule("밀기 접기") 글 그대로).
   "사실상" · "…라고 볼 수 있다" · "…로 기록되었다" · "…셈이다" 를 붙이지 않는다.
 - 리치 중 차례(can_choose 가 false, stance 가 null)는 버린 패의 위험 단계까지만 말하고 밀었다 · 접었다고 하지 않는다.
-- "접었어야 했다 · 밀어도 됐다" 같은 판정 말은 fold_spot 이 null 이 아닌 차례에서만, 그 값 그대로 쓴다. fold_spot 이 null 이면
-  판정 말을 쓰지 않고 단계 · 순서 · 가장 안전한 패 같은 사실까지만 말한다.
+- fold_spot 이 있는(null 이 아닌) 차례를 말할 때는 "이 차례는 보통 접는 자리다" 와 근거(내 손 N샹텐 · 강한 AI 는 이런 자리의
+  약 94% 에서 접는다 — 숫자는 fold_spot 의 shanten · ai_fold_pct 값 그대로)를 사실로 말하고, 플레이어가 한 것은 stance 사실문으로
+  잇는다. "접었어야 했다 · 밀면 안 됐다 · 밀어도 됐다 · 잘 접었다" 같은 판정 · 평가 말은 fold_spot 이 있어도 쓰지 않는다.
+- "접었어야 했어?" 같은 판정 질문에는 "이 도우미는 밀지 접을지를 판정하지 않는다" 를 한 번 쓰고, fold_spot 이 있으면 보통 접는
+  자리 사실을 더한다.
+- fold_spot 이 null 인 차례는 단계 · 순서 · 가장 안전한 패 같은 사실까지만 말한다. "접는 자리가 아니다" 라고 하지 않는다 —
+  접는 자리 · 밀기 · 접기를 물었을 때만 "이 차례에는 접는 자리 판정이 없다" 고 답한다. 묻지 않았으면 그 말을 붙이지 않는다.
 - "판정하지 않는다" 는 말은 질문이 옳고 그름을 물었을 때만, 그것도 리치한 자리가 있는 차례(또는 판)의 밀기 · 접기를 물었을 때만
   ("접었어야 했어?" · "밀어도 됐어?" · 리치 받은 차례의 "그게 맞았어?") 답에 한 번 쓴다. 꼴은 "이 도우미는 밀지 접을지를 판정하지 않는다".
   리치한 자리가 없는 차례나 손패를 모르는 차례의 "잘한 거야?" · "실수야?" 는 패효율 질문이다 — 밀기 · 접기 말을 꺼내지 않고
@@ -1265,7 +1583,10 @@ PROMPT_RULES = f"""너는 리치마작 패보 복기 도우미다. 사용자가 
 - 자리(동 · 남 · 서 · 북)는 대괄호 없이 "남 자리" 처럼 쓴다. 대괄호는 패에만 쓴다 — [남] 은 바람패 남을 말할 때만.
 - 영어를 쓰지 않는다(도구의 칸 이름 best · shanten · ukeire 등을 옮기지 않는다). 등급은 최선 · 좋음 · 부정확 · 실수 · 큰 실수,
   상태는 등급 매김 · 리치 중 · 수비 · 화료 형태 · 손패 기록 없음 · 손패 기록 어긋남 · 짐작 손패, stance 는 밀었다 · 접었다 · 어느 쪽도 아니다.
-- 해라체("…다")로 쓴다. 존댓말("…습니다" · "…해요")을 쓰지 않는다. "반드시" · "무조건" · "절대" 를 쓰지 않는다. 점수("N점")를 쓰지 않는다.
+- 해라체("…다")로 쓴다. 존댓말("…습니다" · "…해요")을 쓰지 않는다. "반드시" · "무조건" · "절대" 를 쓰지 않는다.
+- 점수는 game_summary 의 scores 값만 "N점"(숫자 그대로, 쉼표는 써도 됨: 25000점 · 25,000점)으로 말한다. 더하거나 빼 새 점수를
+  만들지 않는다(점수 차는 gap 값). "2만 5천 점" 처럼 한글 수로 쓰지 않는다. 순위는 rank 값을 "N위" 로 쓴다. scores 가 null 이면,
+  점수 · 순위를 물었을 때만 "이 판에는 점수 기록이 없다" 고 답한다. 묻지 않았으면 그 말을 붙이지 않는다. 점수로 밀기 · 접기 · 필요한 타점 · 순위 전망을 판단하지 않는다.
 - 3~5문장, 500자 안. 숫자를 늘어놓지 말고 질문에 필요한 것만.
 - 좋고 나쁨 · 잘하고 못함을 꾸미는 말을 쓰지 않는다: "사실상" · "비교적" · "무난" · "깔끔" · "성공적" · "승리" · "훌륭" · "현명" ·
   "안타깝", 그리고 "…할 수 있었던 선택" 처럼 다른 선택을 권하는 말. 총평을 물으면 결과 · 등급 개수 · 아까운 수 같은 사실로 답하고, 판 전체를 좋다 · 나쁘다로 꾸미는 맺음 문장은 붙이지 않는다. 화료는 "화료했다"
@@ -1383,7 +1704,7 @@ def build_graph(generate: Generate, limits: Limits = Limits(), clock: Callable[[
                 "pending": None, "route": "plan"}
 
     def verify(state: AgentState) -> dict:
-        v = verify_answer(state.get("answer"), state["evidence"], state["question"])
+        v = verify_answer(state.get("answer"), state["evidence"], state["question"], state.get("history"))
         if not v:
             return {"violations": [], "outcome": "verified", "route": "end"}
         if state["retries"] < limits.retries:

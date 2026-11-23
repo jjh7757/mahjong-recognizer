@@ -482,7 +482,7 @@ def test_graph_tool_then_answer(r19):
     assert out["outcome"] == "verified" and out["answer"] == GOOD_6 and out["violations"] == []
     assert out["tool_calls"] == [{"tool": "turn_info", "args": {"turn": 6}}]
     assert out["retries"] == 0 and out["usage"] == {"input_tokens": 200, "output_tokens": 40, "llm_calls": 2}
-    assert out["prompt_version"] == "a6" and out["model"] == "m"   # 11-22 a2 → a3(수비 확장) → a4(F1 ~ F5) → a5(G1 ~ G3) → a6(말투)
+    assert out["prompt_version"] == "a8" and out["model"] == "m"   # 11-22 a2 → a3(수비 확장) → a4(F1 ~ F5) → a5(G1 ~ G3) → a6(말투)
     assert out["retry_violations"] == []
     # 첫 지시문: 규칙 · 도구 목록 · 질문, 아직 도구 없음. 둘째: 도구 결과가 붙음.
     p1, p2 = gen.prompts
@@ -656,9 +656,10 @@ def test_prompt_rules_a2():
     for word in ("can_choose", "고를 수 없던 차례", "차례마다 도구를 부르지 말고", "after_riichi"):
         assert word in p, word
     # 11-22 a3: find_turns 에 stance? · min_level? 이 더해짐(설계서 1122 4절) — 앞 다섯 인자는 그대로.
-    assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?, stance?, min_level?)" in p
+    # 11-23 a7: fold_spot? 이 끝에 더해짐(설계서 1123 3절).
+    assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?, stance?, min_level?, fold_spot?)" in p
     assert "after_riichi" in _variant("find_turns")["properties"]["args"]["properties"]
-    assert ra.PROMPT_VERSION == "a6"
+    assert ra.PROMPT_VERSION == "a8"
 
 
 # ---------------------------------------------------------------- 요청 검사
@@ -668,7 +669,7 @@ def test_validate_rejects(r19):
     ok = _req(r19, "6순에 왜?")
     validate_request(ok)
     bad = []
-    r = copy.deepcopy(ok); r["facts"]["version"] = 3; bad.append((r, "version"))  # 11-22: 2 는 이제 받는 판(1 · 2)
+    r = copy.deepcopy(ok); r["facts"]["version"] = 4; bad.append((r, "version"))  # 11-23: 3 도 받는 판(1 · 2 · 3)
     r = copy.deepcopy(ok); r["question"] = ""; bad.append((r, "question"))
     r = copy.deepcopy(ok); r["question"] = "가" * 301; bad.append((r, "question"))
     r = copy.deepcopy(ok); r["history"] = [{"q": "a", "a": "b"}] * 5; bad.append((r, "history"))
@@ -1086,10 +1087,15 @@ def test_verify_verdict_words_need_fold_spot(r11, phrase):
     ev = _ev(r11, ("defense_info", {"turn": 8}))
     text = f"8순 [9통]은 위험 '높음'이었다. 여기서는 {phrase}."
     assert any("판정 말" in x for x in verify_answer(text, ev, "8순?"))
-    # fold_spot 사실이 있는 차례를 evidence 로 받았으면 통과(3단계에서 채울 칸 — 여기선 손으로 넣어 봄).
+    # a7(11-23): 판정 말은 fold_spot 이 있어도 위반 — 전에는 fold_spot 이 참이면 통과였다. 판 2 의 참은 도구가 null 로 다루고,
+    # 판 3 의 객체(보통 접는 자리 사실)여도 판정 말은 쓰지 않는다(위반 줄의 까닭만 다름).
     f = copy.deepcopy(r11)
     _turn(f, 8)["defense"]["fold_spot"] = True
-    assert verify_answer(text, _ev(f, ("defense_info", {"turn": 8})), "8순?") == []
+    assert f"밀기 · 접기 판정 말(fold_spot 사실 없음): {ra.verdict_words(text)[0]}" in \
+        verify_answer(text, _ev(f, ("defense_info", {"turn": 8})), "8순?")
+    f3 = _v3(r11, fold={8: FOLD_8})
+    v = verify_answer(text, _ev(f3, ("defense_info", {"turn": 8})), "8순?")
+    assert f"밀기 · 접기 판정 말(보통 접는 자리여도 판정은 쓰지 않음): {ra.verdict_words(text)[0]}" in v, v
 
 
 def test_verify_verdict_not_triggered_by_ordinary_words(r11):
@@ -1110,7 +1116,7 @@ VERDICT_8 = DEF_8 + " 여기서는 접었어야 했다."
 def test_graph_defense_question_verified(r11):
     gen = Script(tool("defense_info", turn=8), answer(DEF_8))
     out = ask(_req(r11, DEF_Q), gen)
-    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a6"
+    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a8"
     assert out["tool_calls"] == [{"tool": "defense_info", "args": {"turn": 8}}]
     # 지시문: 수비 규칙 · 새 도구, 둘째 지시문에 defense 칸이 그대로.
     p1, p2 = gen.prompts
@@ -1160,7 +1166,7 @@ def test_prompt_rules_a3():
     p = ra.PROMPT_RULES
     for word in ("리치한 자리에 대한 방총 위험의 크기까지 말한다", "밀지 접을지의 옳고 그름", "다섯 단계",
                  "'안전' · '낮음' · '보통' · '높음' · '매우 높음'", "작은따옴표", "defense_info 로 확인한 뒤",
-                 "위험 % 를 지어내지 않는다", "fold_spot 이 null 이 아닌 차례에서만", "이 도우미는 밀지 접을지를 판정하지 않는다"):
+                 "위험 % 를 지어내지 않는다", "이 도우미는 밀지 접을지를 판정하지 않는다"):
         assert word in p, word
     props = _variant("find_turns")["properties"]["args"]["properties"]
     assert "- defense_info(turn):" in p and "stance" in props and "min_level" in props
@@ -1267,7 +1273,7 @@ def test_a4_schema_per_tool_variants():
     f = _variant("find_turns")
     assert f["required"] == ["action", "tool"] and "required" not in f["properties"]["args"]
     assert list(f["properties"]["args"]["properties"]) == ["grade", "status", "min_ukeire_loss", "tile", "after_riichi",
-                                                            "stance", "min_level"]
+                                                            "stance", "min_level", "fold_spot"]   # a7: fold_spot 더함
     assert _variant("rule")["properties"]["args"]["required"] == ["name"]
     assert _variant("defense_info")["properties"]["args"]["required"] == ["turn"]
     # 빈 properties 를 가진 object 가 어디에도 없다(Gemini 가 거절).
@@ -1455,7 +1461,7 @@ def test_a5_prompt_rules():
     assert "위험 단계는 패마다 따로 적힌 값만 말한다. 같은 목록(가장 안전한 패 · 현물)에 있다고 같은 단계로 말하지 않는다" in p
     # G2: 자리는 대괄호 없이.
     assert '자리(동 · 남 · 서 · 북)는 대괄호 없이 "남 자리" 처럼 쓴다. 대괄호는 패에만 쓴다 — [남] 은 바람패 남을 말할 때만.' in p
-    assert ra.PROMPT_VERSION == "a6"
+    assert ra.PROMPT_VERSION == "a8"
 
 
 def test_a5_seat_wind_bracket_still_checked(r11):
@@ -1505,7 +1511,7 @@ NO_RIICHI = "리치 없는 질문에 밀기 · 접기 부정 문구"
 
 def test_a6_prompt_rules():
     p = ra.PROMPT_RULES
-    assert ra.PROMPT_VERSION == "a6"
+    assert ra.PROMPT_VERSION == "a8"
     # stance 는 단정 사실문 하나로 — 셋의 예시와 붙이지 않을 말.
     assert "단정하는 사실문 하나로 쓴다" in p
     assert "pushed: \"가장 안전한 [백] 대신 '높음' 인 [5통]을 버려 밀었다\"" in p
@@ -1526,7 +1532,7 @@ def test_a6_prompt_rules():
 
 def test_a6_response_prompt_version(r19):
     out = ask(_req(r19, "6순에 왜 4만이 실수야?"), Script(tool("turn_info", turn=6), answer(GOOD_6)))
-    assert out["outcome"] == "verified" and out["prompt_version"] == "a6"
+    assert out["outcome"] == "verified" and out["prompt_version"] == "a8"
 
 
 def test_a6_real_answers_caught_only_by_eval_words():
@@ -1631,7 +1637,7 @@ def test_a6_graph_disclaimer_retry_then_pass(r19):
     gen = Script(tool("turn_info", turn=1), answer(f"{clean} {UG4_DISCLAIM}"), answer(clean))
     out = ask(_req(r19, "1순에 버린 건 잘한 거야?"), gen)
     assert out["outcome"] == "verified" and out["retries"] == 1 and out["answer"] == clean
-    assert out["retry_violations"] == [[NO_RIICHI]] and out["prompt_version"] == "a6"
+    assert out["retry_violations"] == [[NO_RIICHI]] and out["prompt_version"] == "a8"
     assert f"위반: {NO_RIICHI}" in gen.prompts[2]
 
 
@@ -1642,3 +1648,695 @@ def test_a6_graph_eval_words_twice_falls_back(r19):
     assert out["outcome"] == "fallback" and out["retries"] == 1
     assert out["retry_violations"] == [["평가 말: 무난"]] and out["violations"] == ["평가 말: 사실상"]
     assert ra.eval_words(out["answer"]) == []                 # 대체 답(turn_info 문장)은 평가 말이 없다
+
+
+# ---------------------------------------------------------------- a7(설계서 mahjong_calc docs/review_agent_foldspot_scores_design_1123.md)
+#
+# 사실표 3: turns[i].defense.fold_spot = null | {shanten, ai_fold_pct}, game.scores = null | 2-2 꼴. 예시 11판에는 접는 자리가
+# 없어(설계서 6절) 시험은 사실표 2 견본을 판 3 으로 올리고 fold_spot · scores 를 손으로 넣는다.
+
+FOLD_8 = {"shanten": 3, "ai_fold_pct": 94}
+# 설계서 2-2 예시 그대로(내 자리 서 — r19 의 hero_wind).
+DESIGN_SCORES = {"hero": {"wind": "서", "score": 22000, "rank": 3},
+                 "others": [{"wind": "동", "score": 25000, "rank": 2, "gap": 3000, "ahead": True},
+                            {"wind": "남", "score": 31000, "rank": 1, "gap": 9000, "ahead": True},
+                            {"wind": "북", "score": 22000, "rank": 3, "gap": 0, "ahead": False}],
+                 "kyotaku": 1}
+NO_SCORE_NOTE = "이 판에는 점수 기록이 없다"
+
+
+def _v3(facts: dict, fold: dict | None = None, scores=None) -> dict:
+    """사실표 2 → 3: version 3, game.scores, 차례마다 fold_spot(손으로 넣은 것 말고는 null)."""
+    f = copy.deepcopy(facts)
+    f["version"] = 3
+    f["game"]["scores"] = copy.deepcopy(scores)
+    for t in f["turns"]:
+        if t["defense"] is not None:
+            t["defense"]["fold_spot"] = copy.deepcopy((fold or {}).get(t["turn"]))
+    return f
+
+
+def _scores_of(hero_wind: str, pts: dict, kyotaku=0) -> dict:
+    """{바람: 점수} → scores(앱 설계서 2-2 의 계산: rank = 1 + 더 높은 자리 수, gap = |차|, ahead = 더 높은가)."""
+    def rank(w):
+        return 1 + sum(p > pts[w] for p in pts.values())
+    me = pts[hero_wind]
+    return {"hero": {"wind": hero_wind, "score": me, "rank": rank(hero_wind)},
+            "others": [{"wind": w, "score": pts[w], "rank": rank(w), "gap": abs(pts[w] - me), "ahead": pts[w] > me}
+                       for w in ra.WINDS if w != hero_wind],
+            "kyotaku": kyotaku}
+
+
+@pytest.fixture(scope="module")
+def r11f() -> dict:
+    """r11 판 3: 8번째(수비, 서 리치)만 보통 접는 자리, 점수 없음."""
+    return _v3(load("r11_130921"), fold={8: FOLD_8})
+
+
+@pytest.fixture(scope="module")
+def r19s() -> dict:
+    """r19 판 3: 설계서 예시 점수(내 자리 서), 접는 자리 없음(리치 없는 판)."""
+    return _v3(load("r19_142013"), scores=DESIGN_SCORES)
+
+
+# 앱이 보낼 사실표 3 의 최소 꼴(검사만 통과하면 되는 손 — 실제 앱은 손 14장 · 후보 · 사건을 다 싣는다).
+MINIMAL_V3 = {
+    "version": 3,
+    "game": {"round": "남2국", "honba": 0, "hero_wind": "서", "dora_indicators": ["3p"], "efficiency_pct": None,
+             "grades": {}, "statuses": {"defense": 1}, "result": None,
+             "scores": {"hero": {"wind": "서", "score": 22000, "rank": 3},
+                        "others": [{"wind": "동", "score": 25000, "rank": 2, "gap": 3000, "ahead": True},
+                                   {"wind": "남", "score": 31000, "rank": 1, "gap": 9000, "ahead": True},
+                                   {"wind": "북", "score": 22000, "rank": 3, "gap": 0, "ahead": False}],
+                        "kyotaku": 1}},
+    "turns": [{"turn": 1, "step": 30, "status": "defense", "grade": None, "hand": ["1m", "9p", "5z"], "drawn": "5z",
+               "discard": "9p", "tsumogiri": False, "melds": 0, "riichi_declared": False, "shanten_prev": None,
+               "shanten_before": 3, "shanten_loss": None, "ukeire_loss": None, "options": [], "actual": None, "best": [],
+               "riichi_winds": ["남"], "genbutsu": False, "safe_tiles": ["5z"],
+               "defense": {"threat_winds": ["남"],
+                           "tiles": [{"tile": "5z", "level": "안전", "genbutsu": True},
+                                     {"tile": "1m", "level": "보통", "genbutsu": False},
+                                     {"tile": "9p", "level": "높음", "genbutsu": False}],
+                           "actual": {"tile": "9p", "level": "높음", "rank": 3, "of": 3},
+                           "safest": ["5z"], "efficient": {"tile": "9p", "level": "높음"}, "stance": "pushed",
+                           "fold_spot": {"shanten": 3, "ai_fold_pct": 94}}}],
+    "others": [{"step": 27, "wind": "남", "kind": "riichi", "tile": "4s"}],
+}
+
+
+# ---- 요청 검사(사실표 3)
+
+
+def test_a7_validate_v3_accepts(r11f, r19s):
+    validate_request(_req(r11f, "8순에 접었어야 했어?"))
+    validate_request(_req(r19s, "이 판 시작할 때 점수 상황은 어땠어?"))
+    validate_request(_req(MINIMAL_V3, "1순 위험했어?"))
+    # 같은 점수는 같은 순위(셋이 같아도), 공탁 모름(null), 음수 점수(100 의 배수).
+    for pts, k in (({"동": 25000, "남": 25000, "서": 25000, "북": 25000}, 0),
+                   ({"동": 41200, "남": 30000, "서": -1200, "북": 30000}, None),
+                   ({"동": 25000, "남": 30000, "서": 30000, "북": 15000}, 3)):
+        validate_request(_req(_v3(load("r19_142013"), scores=_scores_of("서", pts, k)), "점수?"))
+    assert _scores_of("서", {"동": 25000, "남": 30000, "서": 30000, "북": 15000})["hero"]["rank"] == 1
+    assert ra.FACTS_VERSION == 3 and ra.FACTS_VERSIONS == (1, 2, 3)
+
+
+def _mut_scores(fn):
+    r = _req(_v3(load("r19_142013"), scores=DESIGN_SCORES), "점수?")
+    fn(r["facts"]["game"]["scores"])
+    return r
+
+
+def _mut_fold(value):
+    r = _req(_v3(load("r11_130921"), fold={8: FOLD_8}), "8순?")
+    _turn(r["facts"], 8)["defense"]["fold_spot"] = value
+    return r
+
+
+def _no_scores_key():
+    r = _req(_v3(load("r19_142013")), "점수?")
+    del r["facts"]["game"]["scores"]
+    return r
+
+
+@pytest.mark.parametrize("make,word", [
+    (_no_scores_key, "scores 없음"),                                # 판 3 은 scores 칸이 꼭(null 이어도)
+    (lambda: _mut_fold(True), "fold_spot"),                         # 판 3 에 참 · 거짓은 안 됨
+    (lambda: _mut_fold({"shanten": 2, "ai_fold_pct": 94}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 9, "ai_fold_pct": 94}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 3, "ai_fold_pct": 0}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 3, "ai_fold_pct": 101}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 3, "ai_fold_pct": 94.0}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 3, "ai_fold_pct": "94"}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": True, "ai_fold_pct": 94}), "fold_spot"),
+    (lambda: _mut_fold({"shanten": 3}), "fold_spot"),
+    (lambda: _mut_fold([3, 94]), "fold_spot"),
+    (lambda: _mut_scores(lambda s: s.clear()), "객체"),
+    (lambda: _mut_scores(lambda s: s.pop("kyotaku")), "객체"),
+    (lambda: _mut_scores(lambda s: s["hero"].update(score=22050)), "hero"),         # 100 의 배수가 아님
+    (lambda: _mut_scores(lambda s: s["hero"].update(score=22000.0)), "hero"),
+    (lambda: _mut_scores(lambda s: s["hero"].update(rank=5)), "hero"),
+    (lambda: _mut_scores(lambda s: s["hero"].update(rank=0)), "hero"),
+    (lambda: _mut_scores(lambda s: s["hero"].update(wind="북")), "hero_wind"),     # game.hero_wind(서)와 다름
+    (lambda: _mut_scores(lambda s: s["others"].pop()), "3개"),
+    (lambda: _mut_scores(lambda s: s["others"][1].update(wind="동")), "겹침"),
+    (lambda: _mut_scores(lambda s: s["others"].reverse()), "순"),                   # 동 · 남 · 서 · 북 순이 아님
+    (lambda: _mut_scores(lambda s: s["others"][0].update(gap=-3000)), "others\\[0\\]"),
+    (lambda: _mut_scores(lambda s: s["others"][0].update(ahead="yes")), "others\\[0\\]"),
+    (lambda: _mut_scores(lambda s: s["others"][0].update(score=25010)), "others\\[0\\]"),
+    (lambda: _mut_scores(lambda s: s.update(kyotaku=-1)), "kyotaku"),
+    (lambda: _mut_scores(lambda s: s.update(kyotaku=1.5)), "kyotaku"),
+    (lambda: _mut_scores(lambda s: s["hero"].update(rank=2)), "rank"),            # 값끼리 어긋남
+    (lambda: _mut_scores(lambda s: s["others"][2].update(rank=4)), "rank"),        # 같은 점수는 같은 순위
+    (lambda: _mut_scores(lambda s: s["others"][0].update(gap=3100)), "gap ="),
+    (lambda: _mut_scores(lambda s: s["others"][2].update(ahead=True)), "ahead"),   # 같은 점수면 false
+])
+def test_a7_validate_v3_rejects(make, word):
+    r = make()
+    with pytest.raises(ValueError, match=word):
+        validate_request(r)
+
+
+def test_a7_validate_v1_v2_still_pass():
+    # 예전 견본(판 2)은 그대로 — scores 칸 없이, fold_spot null.
+    for name in GAMES:
+        f = load(name)
+        assert f["version"] == 2 and "scores" not in f["game"]
+        validate_request(_req(f, "6순에 왜?"))
+        validate_request(_req(_v1(f), "6순에 왜?"))
+    # 판 2 의 참 · 거짓 fold_spot 은 받는다(도구가 null 로 다룸). 판 2 에 객체는 안 된다.
+    f = copy.deepcopy(load("r11_130921"))
+    _turn(f, 8)["defense"]["fold_spot"] = True
+    validate_request(_req(f, "8순?"))
+    _turn(f, 8)["defense"]["fold_spot"] = dict(FOLD_8)
+    with pytest.raises(ValueError, match="참 · 거짓"):
+        validate_request(_req(f, "8순?"))
+    # 판 2 에 scores 칸이 있어도 보지 않는다(무시).
+    f = copy.deepcopy(load("r19_142013"))
+    f["game"]["scores"] = "아무거나"
+    validate_request(_req(f, "점수?"))
+
+
+# ---- 도구
+
+
+def test_a7_defense_info_fold_spot_note(r11f):
+    out = run_tool(r11f, "defense_info", {"turn": 8})
+    assert out["defense"]["fold_spot"] == FOLD_8 and out["defense"] == _turn(r11f, 8)["defense"]
+    want = ("보통 접는 자리다(리치를 받았고 내 손이 3샹텐, 효율대로 버릴 패가 가장 안전한 패보다 뚜렷이 위험) — "
+            "강한 AI 는 이런 자리의 약 94% 에서 접는다. 판정이 아니라 참고다")
+    assert out["note"] == want
+    assert "판정은 없다" not in out["note"] and "판정하지 않는다" not in out["note"]
+    # 숫자는 사실표 값 그대로.
+    f = _v3(load("r11_130921"), fold={8: {"shanten": 4, "ai_fold_pct": 90}})
+    note = run_tool(f, "defense_info", {"turn": 8})["note"]
+    assert "내 손이 4샹텐" in note and "약 90% 에서" in note
+    # null 인 차례는 지금 알림 그대로.
+    out9 = run_tool(r11f, "defense_info", {"turn": 9})
+    assert out9["defense"]["fold_spot"] is None and "이 차례의 밀기 · 접기 판정은 없다(fold_spot null)" in out9["note"]
+    # 판 2 의 참은 null 로(사실표는 그대로 두고 사본으로).
+    v2 = copy.deepcopy(load("r11_130921"))
+    _turn(v2, 8)["defense"]["fold_spot"] = True
+    o2 = run_tool(v2, "defense_info", {"turn": 8})
+    assert o2["defense"]["fold_spot"] is None and "판정은 없다(fold_spot null)" in o2["note"]
+    assert _turn(v2, 8)["defense"]["fold_spot"] is True
+    assert {k: v for k, v in o2["defense"].items() if k != "fold_spot"} == \
+        {k: v for k, v in _turn(v2, 8)["defense"].items() if k != "fold_spot"}
+
+
+def test_a7_find_turns_fold_spot(r11f, r19):
+    out = run_tool(r11f, "find_turns", {"fold_spot": True})
+    assert out["conditions"] == {"fold_spot": True} and out["count"] == 1 and "note" not in out
+    row = out["turns"][0]
+    assert row["turn"] == 8 and row["fold_spot"] == FOLD_8
+    assert row["line"] == "8순 [9통] 버림 · 수비 · 서 리치에 현물 아님 · 보통 접는 자리"
+    for arg in ("true", "참", " True "):
+        assert run_tool(r11f, "find_turns", {"fold_spot": arg}) == out, arg
+    # 다른 조건과 그리고.
+    assert [r["turn"] for r in run_tool(r11f, "find_turns", {"after_riichi": "서", "fold_spot": True})["turns"]] == [8]
+    assert run_tool(r11f, "find_turns", {"stance": "folded", "fold_spot": True})["count"] == 0
+    # 조건 없음: 줄마다 fold_spot 칸, 접는 자리 줄에만 꼬리말.
+    rows = run_tool(r11f, "find_turns", {})["turns"]
+    assert [r["fold_spot"] for r in rows] == [FOLD_8 if r["turn"] == 8 else None for r in rows]
+    assert [r["turn"] for r in rows if r["line"].endswith(" · 보통 접는 자리")] == [8]
+    # 거짓은 조건 없음과 같다(참만 뜻이 있음). 모르는 값은 오류.
+    assert run_tool(r11f, "find_turns", {"fold_spot": False}) == run_tool(r11f, "find_turns", {})
+    assert run_tool(r11f, "find_turns", {"fold_spot": "false"})["conditions"] == {}
+    bad = run_tool(r11f, "find_turns", {"fold_spot": "maybe"})
+    assert set(bad) == {"error"} and "fold_spot" in bad["error"]
+    # 접는 자리가 없는 판(리치 없음 · 판 2): 빈 목록 + "판정이 없다" 알림(접는 자리가 아니라는 말이 아님).
+    for f in (r19, load("r11_130921")):
+        none = run_tool(f, "find_turns", {"fold_spot": True})
+        assert none["count"] == 0
+        assert none["note"] == NOTE_NO_SPOT and "fold_spot_turns" not in none
+    # 판 2 의 참은 접는 자리로 고르지 않는다.
+    v2 = copy.deepcopy(load("r11_130921"))
+    _turn(v2, 8)["defense"]["fold_spot"] = True
+    assert run_tool(v2, "find_turns", {"fold_spot": True})["count"] == 0
+    assert _turn_line_tail(run_tool(v2, "find_turns", {})) == []
+    # after_riichi 알림과 겹치면 둘 다.
+    both = run_tool(load("r12_131655"), "find_turns", {"after_riichi": "동", "fold_spot": True})
+    assert both["note"] == "동 자리는 이 판에서 리치하지 않았다. " + NOTE_NO_SPOT
+
+
+NOTE_NO_SPOT = "이 판에는 보통 접는 자리 판정이 있는 차례가 없다(접는 자리가 아니라는 뜻이 아니다)"
+
+
+def _folded_spot_10() -> dict:
+    """접는 자리가 10순 하나(stance folded)인 판: r11 판 3, 10번째(리치 중)의 defense 를 수비 · folded 로 바꿈(도구 시험용 —
+    요청 검사는 거치지 않는다). 10번째 버린 [중]은 '보통'."""
+    f = _v3(load("r11_130921"), fold={10: dict(FOLD_8)})
+    t = _turn(f, 10)
+    t["status"] = "defense"
+    t["defense"]["stance"] = "folded"
+    return f
+
+
+def test_a7_find_turns_zero_rows_two_notes(r19):
+    # (가) 판 전체에 접는 자리가 없다: "이 판에는 … 판정이 있는 차례가 없다", fold_spot_turns 없음.
+    a = run_tool(r19, "find_turns", {"fold_spot": True, "stance": "pushed"})
+    assert a["count"] == 0 and a["note"] == NOTE_NO_SPOT and "fold_spot_turns" not in a
+    ev_a = [{"tool": "find_turns", "args": {"fold_spot": True}, "result": a}]
+    assert verify_answer(NOTE_NO_SPOT + ".", ev_a, "접는 자리에서 민 곳 있어?") == []       # 알림을 옮긴 답은 검사 10 통과
+    # (나) 접는 자리는 있는데 다른 조건(stance)에서 다 걸러졌다: 알림 + 접는 자리 줄.
+    f = _folded_spot_10()
+    out = run_tool(f, "find_turns", {"fold_spot": True, "stance": "pushed"})
+    assert out["count"] == 0 and out["turns"] == []
+    assert out["note"] == "보통 접는 자리는 10순에 있지만 다른 조건까지 맞는 차례는 없다"
+    spots = out["fold_spot_turns"]
+    assert spots == run_tool(f, "find_turns", {"fold_spot": True})["turns"]      # turns 줄과 같은 꼴
+    s = spots[0]
+    assert (s["turn"], s["discard"], s["level"], s["stance"], s["fold_spot"]) == (10, "7z", "보통", "folded", FOLD_8)
+    assert s["line"].endswith(" · 보통 접는 자리")
+    # 근거: 순 번호 · 패 · 단계 · fold_spot(검사 10).
+    ev = [{"tool": "find_turns", "args": {"fold_spot": True, "stance": "pushed"}, "result": out}]
+    allow, pct = ra.evidence_allow(ev)
+    assert 10 in allow.jun and "7z" in allow.tiles and 3 in allow.shanten and 94 in pct
+    assert "보통" in ra.evidence_levels(ev) and ra.evidence_has_fold_spot(ev)
+    q = "리치 받은 뒤에 접는 자리에서 민 곳 있어?"
+    for text in ("없다. 보통 접는 자리는 10순 하나이고, 가장 안전한 패를 버려 접었다.",
+                 "보통 접는 자리는 10순 하나이고, 그때 '보통' 인 [중]을 버려 접었다. 접는 자리에서 민 차례는 없다.",
+                 out["note"] + "."):
+        assert verify_answer(text, ev, q) == [], text
+    # 줄에 없는 순 · 패는 그대로 위반.
+    v = verify_answer("보통 접는 자리는 12순 [9통]이었다.", ev, q)
+    assert any("12순" in x for x in v) and any("[9통]" in x for x in v)
+    # 접는 자리가 둘이면 순 번호를 모두.
+    f2 = _v3(load("r11_130921"), fold={8: dict(FOLD_8), 9: dict(FOLD_8)})
+    two = run_tool(f2, "find_turns", {"fold_spot": True, "stance": "folded"})
+    assert two["note"] == "보통 접는 자리는 8순 · 9순에 있지만 다른 조건까지 맞는 차례는 없다"
+    assert [r["turn"] for r in two["fold_spot_turns"]] == [8, 9]
+    # after_riichi 알림과 겹치면 둘 다(앞이 after_riichi). 조건 없이 줄이 있으면 fold_spot_turns 는 싣지 않는다.
+    both = run_tool(f, "find_turns", {"after_riichi": "동", "fold_spot": True})
+    assert both["note"] == "동 자리는 이 판에서 리치하지 않았다. 보통 접는 자리는 10순에 있지만 다른 조건까지 맞는 차례는 없다"
+    assert "fold_spot_turns" not in run_tool(f, "find_turns", {"fold_spot": True})
+    # 검사 10 의 새 통과 꼴은 "판정이 있는 차례가 없" 까지만 — "판정이 있는 차례다" 는 아님.
+    assert ra.check_fold_spot_words("9순은 접는 자리 판정이 있는 차례다.", []) == ["접는 자리 말(fold_spot 사실 없음)"]
+
+
+def _turn_line_tail(out: dict) -> list[int]:
+    return [r["turn"] for r in out["turns"] if r["line"].endswith("보통 접는 자리")]
+
+
+def test_a7_game_summary_scores(r19s, r19):
+    s = run_tool(r19s, "game_summary", {})
+    assert s["scores"] == {**DESIGN_SCORES, "basis": "국 시작 점수(이 국의 리치봉 · 결과 반영 전)"} and "note" not in s
+    assert "basis" not in r19s["game"]["scores"]                  # 사실표는 그대로
+    # 다른 칸은 그대로.
+    base = run_tool(r19, "game_summary", {})
+    assert {k: v for k, v in s.items() if k != "scores"} == {k: v for k, v in base.items() if k not in ("scores", "note")}
+    # 점수 없음: 판 3 의 null · 판 2 · 판 1.
+    for f in (_v3(r19), r19, _v1(r19)):
+        out = run_tool(f, "game_summary", {})
+        assert out["scores"] is None and "note" not in out      # a8: 점수 없음 알림은 뺌(scores: null 만)
+    # 판 2 에 scores 칸이 남아 있어도 보지 않는다.
+    v2 = copy.deepcopy(r19)
+    v2["game"]["scores"] = copy.deepcopy(DESIGN_SCORES)
+    assert run_tool(v2, "game_summary", {})["scores"] is None
+
+
+def test_a7_rule_scores_and_push_fold():
+    sc = run_tool({}, "rule", {"name": "점수"})
+    assert sc["name"] == "점수"
+    for word in ("이 국을 시작할 때의 점수", "리치봉 · 결과 반영 전", "점수가 같으면 같은", "필요한 타점", "계산하지 않"):
+        assert word in sc["text"], word
+    for alias in ("점수 상황", "점수상황", "순위", "scores", "Score", "공탁", "점수 차"):
+        assert run_tool({}, "rule", {"name": alias})["name"] == "점수", alias
+    pf = run_tool({}, "rule", {"name": "밀기 접기"})["text"]
+    for word in ("보통 접는 자리", "3샹텐 이상", "약 94%", "판정이 아니라 참고다", "판정하지 않는다",
+                 "접는 자리가 아니라는 뜻이 아니다", "fold_spot"):
+        assert word in pf, word
+    assert run_tool({}, "rule", {"name": "접는 자리"})["name"] == "밀기 접기"
+    # 새 글에도 작은따옴표 단계 말 · 영어 칸 이름(AI 말고) · "N점" 이 없다.
+    for text in (pf, sc["text"]):
+        assert ra.evidence_levels([{"tool": "rule", "args": {}, "result": {"text": text}}]) == set()
+    assert not ra.rv._N_POINT.search(sc["text"])
+    assert "점수" in ra.TOOLS["rule"]["desc"] and "scores" in ra.TOOLS["game_summary"]["desc"]
+    assert "fold_spot" in ra.TOOLS["find_turns"]["desc"] and "보통 접는 자리" in ra.TOOLS["defense_info"]["desc"]
+
+
+def test_a7_evidence_helpers(r11f, r19):
+    ev = _ev(r11f, ("defense_info", {"turn": 8}))
+    assert ra.evidence_has_fold_spot(ev) and ra.evidence_has_riichi(ev)
+    assert not ra.evidence_has_fold_spot(_ev(r11f, ("defense_info", {"turn": 9})))
+    # find_turns 의 조건 칸 {"fold_spot": true} 는 사실이 아니다(0 줄).
+    ev0 = _ev(r19, ("find_turns", {"fold_spot": True}))
+    assert not ra.evidence_has_fold_spot(ev0)
+    assert ra.evidence_has_riichi(ev0)                       # 접는 자리 조건은 남 리치 맥락
+    assert not ra.evidence_has_riichi(_ev(r19, ("find_turns", {"fold_spot": False})))
+    # 판 2 의 참: 도구가 null 로 바꾸니 사실이 아니다.
+    v2 = copy.deepcopy(load("r11_130921"))
+    _turn(v2, 8)["defense"]["fold_spot"] = True
+    assert not ra.evidence_has_fold_spot(_ev(v2, ("defense_info", {"turn": 8}), ("find_turns", {})))
+    # 손으로 만든 evidence 에 참이 있어도 객체만 센다.
+    assert not ra.evidence_has_fold_spot([{"tool": "x", "args": {}, "result": {"fold_spot": True}}])
+    # ai_fold_pct 는 % 근거, rank 는 위 근거, score · gap 은 점 근거.
+    _, pct = ra.evidence_allow(_ev(_v3(load("r11_130921"), fold={8: {"shanten": 3, "ai_fold_pct": 90}}),
+                                   ("find_turns", {"fold_spot": True})))
+    assert 90 in pct
+    sev = _ev(_v3(r19, scores=DESIGN_SCORES), ("game_summary", {}))
+    allow, _ = ra.evidence_allow(sev)
+    assert {1, 2, 3} <= allow.rank
+    assert ra.evidence_points(sev) == {22000, 25000, 31000, 3000, 9000, 0}
+
+
+# ---- 검증: 판정 말 · 접는 자리 말 · 점수
+
+
+FOLD_8_A = ("8순은 보통 접는 자리다. 내 손이 3샹텐이었고 강한 AI 는 이런 자리의 약 94% 에서 접는다. "
+            "가장 안전한 [6만] 대신 '높음' 인 [9통]을 버려 밀었다.")
+
+
+def test_a7_fold_spot_answer_passes(r11f):
+    ev = _ev(r11f, ("defense_info", {"turn": 8}))
+    assert verify_answer(FOLD_8_A, ev, "8순에 버린 9통 위험했어?") == []
+    # 판정 질문: 부정 문구 한 번 + 접는 자리 사실.
+    a = "이 도우미는 밀지 접을지를 판정하지 않는다. " + FOLD_8_A
+    assert verify_answer(a, ev, "8순에 접었어야 했어?") == []
+    # find_turns 줄로도.
+    ev2 = _ev(r11f, ("find_turns", {"fold_spot": True}))
+    assert verify_answer("보통 접는 자리는 8순 하나였고, 그때 [9통]을 버려 밀었다.", ev2, "접는 자리에서 민 곳 있어?") == []
+
+
+@pytest.mark.parametrize("phrase", ["접었어야 했다", "밀면 안 됐다", "밀어도 됐다", "접는 게 맞았다", "밀지 말았어야 했다"])
+def test_a7_verdict_words_caught_even_with_fold_spot(r11f, phrase):
+    ev = _ev(r11f, ("defense_info", {"turn": 8}))
+    v = verify_answer(f"{FOLD_8_A} 여기서는 {phrase}.", ev, "8순에 접었어야 했어?")
+    assert len(v) == 1 and v[0].startswith("밀기 · 접기 판정 말(보통 접는 자리여도 판정은 쓰지 않음): "), v
+    # 부정문 간접 의문 예외는 그대로.
+    assert verify_answer(f"{FOLD_8_A} 접었어야 했는지는 판정하지 않는다.", ev, "8순에 접었어야 했어?") == []
+
+
+@pytest.mark.parametrize("text,ok", [
+    ("9순은 보통 접는 자리다.", False),
+    ("9순은 접는 자리가 아니다.", False),
+    ("9순에는 접는 자리 판정이 없다.", True),
+    ("9순은 접는 자리 판정은 없다.", True),
+    ("9순에 대한 접는 자리 판정 정보는 없다.", True),
+    ("9순은 접는자리 판정이 없다.", True),
+    ("9순에는 접는 자리 판정이 없다. 접는 자리가 아니다.", False),   # 다른 문장
+    ("9순은 접는 자리인지 모른다.", False),                           # "판정 … 없" 꼴이 아님
+    ("9순에는 판정이 없다. 접어도 된다.", True),                      # "접는 자리" 말이 없다(검사 10 밖)
+])
+def test_a7_fold_spot_words_need_fold_spot(r11f, text, ok):
+    ev = _ev(r11f, ("defense_info", {"turn": 9}))        # 9번째는 fold_spot null
+    v = verify_answer(text, ev, "9순은 접는 자리였어?")
+    assert (v == []) == ok, v
+    if not ok:
+        assert v == ["접는 자리 말(fold_spot 사실 없음)"]
+
+
+def test_a7_fold_spot_words_with_zero_row_find_turns(r19):
+    # 접는 자리 조건으로 찾았는데 0 줄: "없다" 고 단정하면 위반, "판정이 없다" 는 통과.
+    ev = _ev(r19, ("find_turns", {"fold_spot": True}))
+    assert verify_answer("이 판에는 보통 접는 자리가 없다.", ev, "접는 자리 있었어?") == ["접는 자리 말(fold_spot 사실 없음)"]
+    assert verify_answer("이 판에는 접는 자리 판정이 없다.", ev, "접는 자리 있었어?") == []
+    # 도구 알림을 그대로 옮긴 답도 통과(알림이 검사 10 의 통과 꼴로 쓰여 있다).
+    assert verify_answer(ev[0]["result"]["note"] + ".", ev, "접는 자리 있었어?") == []
+
+
+def test_a7_percent_needs_fold_spot(r11f, r11):
+    q = "8순에 접었어야 했어?"
+    assert verify_answer("8순은 보통 접는 자리다. 강한 AI 는 이런 자리의 약 94% 에서 접는다.",
+                         _ev(r11f, ("defense_info", {"turn": 8})), q) == []
+    # fold_spot 이 없는 판 2 evidence: 94% · 접는 자리 · AI 모두 근거 없음.
+    v = verify_answer("8순은 보통 접는 자리다. 강한 AI 는 이런 자리의 약 94% 에서 접는다.",
+                      _ev(r11, ("defense_info", {"turn": 8})), q)
+    assert "도구로 찾은 사실표에 없는 숫자: 94%" in v and "접는 자리 말(fold_spot 사실 없음)" in v
+    assert "영어(한국어로 써야 함): AI" in v
+    # 사실표 값이 90 이면 94% 는 근거가 없다.
+    f = _v3(load("r11_130921"), fold={8: {"shanten": 3, "ai_fold_pct": 90}})
+    ev90 = _ev(f, ("defense_info", {"turn": 8}))
+    assert verify_answer("8순은 보통 접는 자리다. 이런 자리의 약 90% 에서 접는다.", ev90, q) == []
+    assert "도구로 찾은 사실표에 없는 숫자: 94%" in verify_answer("8순은 보통 접는 자리다. 약 94% 에서 접는다.", ev90, q)
+    # rule '밀기 접기' 를 읽었으면 94% · AI 는 근거(방총 위험 % 와 같은 규칙). 검토(11-23) 뒤로 "접는 자리" 말도 근거가 된다
+    # (용어 풀이 — 전에는 이 답이 위반이었다).
+    evr = _ev(r11, ("defense_info", {"turn": 8}), ("rule", {"name": "밀기 접기"}))
+    assert verify_answer("강한 AI 는 이런 자리의 약 94% 에서 접었다.", evr, q) == []
+    assert verify_answer("8순은 보통 접는 자리다.", evr, q) == []
+
+
+# ---- 검토(11-23) 고침: 검사 10 의 rule '밀기 접기' 예외 · 평가 꼴 판정 말 · 지시문 % 줄
+
+TERM_Q = "보통 접는 자리가 뭐야?"
+# "3샹텐 이상" 은 rule 글에만 있어 숫자 근거가 아니다(샹텐 수는 도구 결과의 칸에서만) — 용어 답에는 숫자 없이.
+TERM_A = ("보통 접는 자리는 리치를 받았고 내 손이 텐파이에서 멀며, 효율대로 버릴 패가 가장 안전한 패보다 뚜렷이 "
+          "위험한 차례다. 강한 AI 는 이런 자리의 약 94% 에서 접었다. 판정이 아니라 참고다.")
+
+
+@pytest.mark.parametrize("name", ["밀기 접기", "밀기접기", "접는 자리", "보통 접는 자리", "fold_spot", "stance"])
+def test_a7_fold_spot_words_ok_after_push_fold_rule(r19, name):
+    ev = _ev(r19, ("rule", {"name": name}))
+    assert ev[0]["result"]["name"] == "밀기 접기" and ra.evidence_has_pushfold_rule(ev)
+    assert verify_answer(TERM_A, ev, TERM_Q) == [], name
+
+
+def test_a7_fold_spot_words_need_rule_or_fold_spot(r19, r11):
+    # rule 을 안 불렀거나 다른 용어(방총 위험 · 점수)를 불렀으면 "접는 자리" 말은 위반(94% · AI 도 근거 없음).
+    for ev in ([], _ev(r19, ("rule", {"name": "방총 위험"})), _ev(r19, ("rule", {"name": "점수"})),
+               _ev(r11, ("defense_info", {"turn": 8}))):
+        assert not ra.evidence_has_pushfold_rule(ev)
+        assert "접는 자리 말(fold_spot 사실 없음)" in verify_answer("보통 접는 자리는 리치를 받은 차례다.", ev, TERM_Q)
+    # 모르는 이름으로 부른 rule(오류 결과)도 '밀기 접기' 가 아니다.
+    bad = _ev(r19, ("rule", {"name": "접기 자리"}))
+    assert "error" in bad[0]["result"] and not ra.evidence_has_pushfold_rule(bad)
+
+
+@pytest.mark.parametrize("phrase,word", [("잘 접었다", "잘 접었"), ("잘접었다", "잘 접었"), ("잘 밀었다", "잘 밀었"),
+                                         ("잘  밀었다", "잘 밀었"), ("잘 내렸다", "잘 내렸")])
+def test_a7_eval_verdict_words_caught_even_with_fold_spot(r11f, r11, phrase, word):
+    q = "8순에 접었어야 했어?"
+    ev = _ev(r11f, ("defense_info", {"turn": 8}))
+    assert verify_answer(f"{FOLD_8_A} 여기서는 {phrase}.", ev, q) == \
+        [f"밀기 · 접기 판정 말(보통 접는 자리여도 판정은 쓰지 않음): {word}"]
+    assert f"밀기 · 접기 판정 말(fold_spot 사실 없음): {word}" in \
+        verify_answer(f"8순 [9통]은 '높음'이었다. {phrase}.", _ev(r11, ("defense_info", {"turn": 8})), q)
+    # 부정문 간접 의문 예외는 그대로.
+    stem = phrase.removesuffix("다.").removesuffix("다")
+    assert verify_answer(f"{FOLD_8_A} {stem}는지는 판정하지 않는다.", ev, q) == []
+
+
+def test_a7_rule_push_fold_allows_3_shanten(r19):
+    a = ("보통 접는 자리는 리치를 받았고 버리기 전 내 손이 3샹텐 이상이며, 효율대로 버릴 패가 가장 안전한 패보다 뚜렷이 "
+         "위험한 차례다. 판정이 아니라 참고다.")
+    ev = _ev(r19, ("rule", {"name": "밀기 접기"}))
+    assert "3샹텐 이상" in ev[0]["result"]["text"] and 3 in ra.evidence_allow(ev)[0].shanten
+    assert verify_answer(a, ev, TERM_Q) == []
+    # rule 을 안 불렀거나 다른 rule 이면 3샹텐 · 접는 자리 말 모두 근거 없음. 다른 샹텐 수는 rule 을 불러도 위반.
+    for other in ([], _ev(r19, ("rule", {"name": "샹텐"}))):
+        v = verify_answer(a, other, TERM_Q)
+        assert "도구로 찾은 사실표에 없는 숫자: 3샹텐" in v and "접는 자리 말(fold_spot 사실 없음)" in v
+    assert verify_answer(a.replace("3샹텐", "4샹텐"), ev, TERM_Q) == ["도구로 찾은 사실표에 없는 숫자: 4샹텐"]
+
+
+def test_a7_prompt_percent_line():
+    p = ra.PROMPT_RULES
+    assert ('- 위험 % 를 지어내지 않는다. 사실표의 위험에는 % 가 없다(쓸 수 있는 % 는 rule("방총 위험") 글의 관측 비율과 '
+            'fold_spot 의 ai_fold_pct 뿐이다). 단계의 뜻 · 관측 비율은 rule("방총 위험")에 있다 — 그 글을 읽었을 때만 그 % 를 옮긴다.\n') in p
+    assert "사실표에는 % 가 없다" not in p
+
+
+SCORE_A = ("이 판 시작할 때 내 점수는 22000점으로 3위였다. 남 자리가 31,000점으로 1위였고 나와 9,000점 차였다. "
+           "동 자리는 25000점으로 3000점 앞서 있었고, 공탁 리치봉은 1개였다.")
+
+
+def test_a7_points_from_scores(r19s):
+    ev = _ev(r19s, ("game_summary", {}))
+    q = "이 판 시작할 때 점수 상황은 어땠어?"
+    assert verify_answer(SCORE_A, ev, q) == []
+    assert verify_answer("북 자리와는 0점 차로 같은 3위였다.", ev, q) == []
+    for text in ("남 자리는 31000점이었다.", "남 자리는 31,000점이었다.", "남 자리는 31,000 점이었다."):
+        assert verify_answer(text, ev, q) == [], text
+
+
+@pytest.mark.parametrize("text,line", [
+    ("남 자리는 30000점이었다.", "도구로 찾은 점수 기록에 없는 점수: 30000점"),             # 사실표에 없는 값
+    ("남 자리와는 6,000점 차였다.", "도구로 찾은 점수 기록에 없는 점수: 6,000점"),          # 계산해 만든 차(31000 − 25000)
+    ("1등이 되려면 9100점이 필요하다.", "도구로 찾은 점수 기록에 없는 점수: 9100점"),
+    ("남 자리는 3,1000점이었다.", "도구로 찾은 점수 기록에 없는 점수: 3,1000점"),           # 쉼표 자리가 틀림
+    ("남 자리는 3만 1천 점이었다.", "한글 수로 쓴 점수(숫자 그대로 써야 함): 3만 1천 점"),
+    ("내 점수는 2만 2천점이었다.", "한글 수로 쓴 점수(숫자 그대로 써야 함): 2만 2천점"),
+    ("동 자리와 3천 점 차였다.", "한글 수로 쓴 점수(숫자 그대로 써야 함): 3천 점"),
+    ("남 자리는 3만점을 넘었다.", "한글 수로 쓴 점수(숫자 그대로 써야 함): 3만점"),
+    ("나는 4위였다.", "도구로 찾은 사실표에 없는 숫자: 4위"),                                # rank 는 1 · 2 · 3 뿐
+])
+def test_a7_points_caught(r19s, text, line):
+    v = verify_answer(text, _ev(r19s, ("game_summary", {})), "점수 상황은?")
+    assert v == [line], v          # 한글 수사 점수는 "대괄호 없이 쓴 패(3만)" 로 따로 걸리지 않는다
+
+
+def test_a7_points_without_scores(r19):
+    # 점수 기록이 없는 판(판 2)과 점수 도구를 안 부른 답: "N점" 은 근거가 없다.
+    ev = _ev(r19, ("game_summary", {}))
+    assert ev[0]["result"]["scores"] is None and "note" not in ev[0]["result"]          # a8: 알림 없음
+    assert verify_answer("이 판에는 점수 기록이 없다.", ev, "내가 몇 등이었어?") == []
+    assert verify_answer("내 점수는 25000점이었다.", ev, "점수?") == ["도구로 찾은 점수 기록에 없는 점수: 25000점"]
+    assert verify_answer("나는 1위였다.", ev, "내가 몇 등이었어?") == ["도구로 찾은 사실표에 없는 숫자: 1위"]
+    # 차례 도구의 숫자(장 · 순)는 점이 아니다.
+    ev6 = _ev(r19, ("turn_info", {"turn": 6}))
+    assert verify_answer("6순에 [4만]을 버려 10점을 잃었다.", ev6, "6순?") == ["도구로 찾은 점수 기록에 없는 점수: 10점"]
+
+
+def test_a7_negative_score_and_ai_word(r19):
+    f = _v3(r19, scores=_scores_of("서", {"동": 41200, "남": 30000, "서": -1200, "북": 30000}, None))
+    ev = _ev(f, ("game_summary", {}))
+    assert verify_answer("내 점수는 -1,200점으로 4위였다. 동 자리와는 42,400점 차였다.", ev, "점수?") == []
+    # "AI" 는 evidence 글에 있을 때만 영어 예외.
+    assert verify_answer("강한 AI 는 모른다.", ev, "점수?") == ["영어(한국어로 써야 함): AI"]
+    assert verify_answer("강한 AI 가 접었다.", _ev(f, ("rule", {"name": "밀기 접기"})), "?") == []
+    assert verify_answer("강한 AIX 가 접었다.", _ev(f, ("rule", {"name": "밀기 접기"})), "?") == ["영어(한국어로 써야 함): AIX"]
+
+
+# ---- 그래프 · 지시문
+
+
+def test_a7_graph_fold_spot_verdict_retry_then_fact(r11f):
+    q = "8순에 접었어야 했어?"
+    first = FOLD_8_A + " 여기서는 접었어야 했다."
+    good = "이 도우미는 밀지 접을지를 판정하지 않는다. " + FOLD_8_A
+    gen = Script(tool("defense_info", turn=8), answer(first), answer(good))
+    out = ask(_req(r11f, q), gen)
+    assert out["outcome"] == "verified" and out["answer"] == good and out["prompt_version"] == "a8"
+    assert out["retry_violations"] == [["밀기 · 접기 판정 말(보통 접는 자리여도 판정은 쓰지 않음): 접었어야"]]
+    p2 = gen.prompts[1]
+    assert '"fold_spot":{"shanten":3,"ai_fold_pct":94}' in p2 and "보통 접는 자리다(리치를 받았고 내 손이 3샹텐" in p2
+
+
+def test_a7_graph_scores_question(r19s, r19):
+    gen = Script(tool("game_summary"), answer(SCORE_A))
+    out = ask(_req(r19s, "이 판 시작할 때 점수 상황은 어땠어?"), gen)
+    assert out["outcome"] == "verified" and out["tool_calls"] == [{"tool": "game_summary", "args": {}}]
+    assert '"basis":"국 시작 점수(이 국의 리치봉 · 결과 반영 전)"' in gen.prompts[1]
+    # 점수 없는 판에 점수를 지어내면 재시도 → 그래도 지어내면 대체(판 요약 — 점수 말 없음).
+    gen = Script(tool("game_summary"), answer("내 점수는 25000점이었다."), answer("내 점수는 25000점이었다."))
+    out = ask(_req(r19, "내 점수는 몇 점이었어?"), gen)
+    assert out["outcome"] == "fallback" and out["retry_violations"] == [["도구로 찾은 점수 기록에 없는 점수: 25000점"]]
+    assert "점" not in out["answer"].replace("확인할 수 있는", "")
+
+
+def test_a7_prompt_rules():
+    p = ra.PROMPT_RULES
+    assert ra.PROMPT_VERSION == "a8"
+    # 없어진 줄.
+    assert "fold_spot 이 null 이 아닌 차례에서만" not in p and '점수("N점")를 쓰지 않는다' not in p
+    # a7 네 항목.
+    for word in ('"이 차례는 보통 접는 자리다"', "강한 AI 는 이런 자리의", "약 94% 에서 접는다", "stance 사실문으로",
+                 '"접었어야 했다 · 밀면 안 됐다 · 밀어도 됐다 · 잘 접었다"', "fold_spot 이 있어도 쓰지 않는다",
+                 "fold_spot 이 있으면 보통 접는", '"접는 자리가 아니다" 라고 하지 않는다', '"이 차례에는 접는 자리 판정이 없다"',
+                 "game_summary 의 scores 값만", "쉼표는 써도 됨", "점수 차는 gap 값", '"2만 5천 점" 처럼 한글 수로 쓰지 않는다',
+                 '"이 판에는 점수 기록이 없다"', "필요한 타점 · 순위 전망을 판단하지 않는다"):
+        assert word in p, word
+    # 지키는 줄(a6 말투 측정 결과): 바뀌지 않음.
+    assert '- 해라체("…다")로 쓴다. 존댓말("…습니다" · "…해요")을 쓰지 않는다. "반드시" · "무조건" · "절대" 를 쓰지 않는다.\n' in p
+    assert "- find_turns(grade?, status?, min_ukeire_loss?, tile?, after_riichi?, stance?, min_level?, fold_spot?)" in p
+    # 지시문이 권하는 말 자체는 검사에 걸리지 않는다.
+    for s in ("이 차례는 보통 접는 자리다.", "이 차례에는 접는 자리 판정이 없다.", "이 판에는 점수 기록이 없다."):
+        assert ra.eval_words(s) == [] and ra.verdict_words(s) == [], s
+    assert ra.check_fold_spot_words("이 차례에는 접는 자리 판정이 없다.", []) == []
+    assert ra.check_points("25000점 · 25,000점", [{"tool": "game_summary", "args": {},
+                                                   "result": {"scores": {"hero": {"score": 25000}}}}]) == []
+    # find_turns 스키마: fold_spot 은 boolean.
+    assert _variant("find_turns")["properties"]["args"]["properties"]["fold_spot"]["type"] == "boolean"
+
+
+# ---------------------------------------------------------------- a8(설계서 1123 8-1절 — a7 측정 표 15-12 의 흠 넷)
+
+UNASKED_FOLD = "묻지 않은 접는 자리 부정 문구"
+UNASKED_SCORE = "묻지 않은 점수 기록 부정 문구"
+RISK_RANK = "안전한 순 자리를 위험 순위처럼 씀"
+# a7 실제 답 꼴(ax1a · ax2c · ax4a): 사실 뒤에 묻지 않은 "접는 자리 판정이 없다".
+A12 = "8순에 가장 안전한 [6만] 대신 '높음' 인 [9통]을 버려 밀었다. 이 차례에는 접는 자리 판정이 없다."
+
+
+def test_a8_check12_unasked_fold_spot_disclaimer(r11):
+    ev = _ev(r11, ("defense_info", {"turn": 8}))
+    assert verify_answer(A12, ev, "8순에 버린 9통 위험했어?") == [UNASKED_FOLD]
+    # 접 · 밀 · 내리 · 판정 을 물었으면 통과.
+    for q in ("8순에 대해: 여기서 접었어야 했어?", "8순은 접는 자리였어?", "8순에 밀어도 됐어?", "8순에 내렸어야 했어?",
+              "8순 판정은?"):
+        assert verify_answer(A12, ev, q) == [], q
+    # 이어 묻기: 앞 질문에 "접" 이 있으면 통과(답 글은 보지 않는다).
+    hist = [{"q": "8순에 접었어야 했어?", "a": "이 도우미는 밀지 접을지를 판정하지 않는다."}]
+    assert verify_answer(A12, ev, "8순에 버린 9통 위험했어?", hist) == []
+    assert verify_answer(A12, ev, "8순에 버린 9통 위험했어?", [{"q": "8순 어땠어?", "a": "접었다."}]) == [UNASKED_FOLD]
+    # 실제 질문 꼴 그대로(검사 함수만).
+    assert ra.check_unasked_disclaimers("이 차례에는 접는 자리 판정이 없다.", "11순에 버린 6삭 위험했어?") == [UNASKED_FOLD]
+    assert ra.check_unasked_disclaimers("이 차례에는 접는 자리 판정이 없다.", "9순에 대해: 여기서 접었어야 했어?") == []
+    # "접는 자리" 와 판정 없음이 다른 문장이거나, 판정 없음만 있으면 검사 12 밖.
+    assert ra.check_unasked_disclaimers("접는 자리는 아래다. 판정이 없다.", "위험했어?") == []
+    assert ra.check_unasked_disclaimers("이 차례의 판정은 없다.", "위험했어?") == []
+
+
+def test_a8_check12_graph_passes_history(r11):
+    hist = [{"q": "8순에 접었어야 했어?", "a": "이 도우미는 밀지 접을지를 판정하지 않는다."}]
+    out = ask(_req(r11, "8순에 버린 9통 위험했어?", hist), Script(tool("defense_info", turn=8), answer(A12)))
+    assert out["outcome"] == "verified" and out["retries"] == 0 and out["prompt_version"] == "a8"
+    clean = A12.split(" 이 차례에는")[0]
+    out = ask(_req(r11, "8순에 버린 9통 위험했어?"), Script(tool("defense_info", turn=8), answer(A12), answer(clean)))
+    assert out["outcome"] == "verified" and out["retry_violations"] == [[UNASKED_FOLD]] and out["answer"] == clean
+
+
+def test_a8_check13_unasked_score_disclaimer(r19):
+    ev = _ev(r19, ("game_summary", {}))
+    text = "이 판은 남4국이고 패효율은 93%다. 이 판에는 점수 기록이 없다."
+    assert verify_answer(text, ev, "이 판 총평 해 줘") == [UNASKED_SCORE]
+    assert verify_answer(text, ev, "등급은 어땠어?") == [UNASKED_SCORE]          # "등급" 의 "등" 은 점수 질문이 아니다
+    for q in ("이 판 시작할 때 점수 상황은 어땠어?", "내가 몇 등이었어?", "몇 점 차였어?", "1등이랑 점 차는?", "등수는?",
+              "순위는?", "몇 위였어?", "공탁은?", "리치봉 몇 개였어?"):
+        assert verify_answer(text, ev, q) == [], q
+    assert verify_answer(text, ev, "총평 해 줘", [{"q": "내 점수는?", "a": "이 판에는 점수 기록이 없다."}]) == []
+    for t in ("점수 기록은 없다.", "점수 기록도 없다.", "점수기록이 없다."):
+        assert ra.check_unasked_disclaimers(t, "총평 해 줘") == [UNASKED_SCORE], t
+
+
+@pytest.mark.parametrize("text,bad", [
+    ("8순에 버린 [9통]은 위험 순위 6위였다.", True),                    # ax4b 꼴
+    ("8순에 버린 [9통]은 6위의 위험도였다.", True),                     # fa2c 꼴
+    ("8순에 버린 [9통]은 6위로 위험했다.", True),
+    ("8순에 버린 [9통]은 안전한 순으로 13종 중 6위였다.", False),
+    ("8순에 버린 [9통]은 위험 단계 '높음'이었다.", False),
+])
+def test_a8_check14_risk_rank(r11, text, bad):
+    v = verify_answer(text, _ev(r11, ("defense_info", {"turn": 8})), "8순에 버린 9통 위험했어?")
+    assert v == ([RISK_RANK] if bad else []), v
+    assert ra.check_unasked_disclaimers("안전한 순으로 9종 중 3위였다.", "?") == []
+
+
+def test_a8_ai_word_with_fold_spot_rows_only(r11f, r19):
+    ev = _ev(r11f, ("find_turns", {"fold_spot": True}))
+    assert "AI" not in ra._evidence_texts(ev) and ra.evidence_has_fold_spot(ev)
+    text = "보통 접는 자리는 8순이고, 강한 AI 는 이런 자리의 약 94% 에서 접는다."
+    assert verify_answer(text, ev, "접는 자리 있었어?") == []
+    # fold_spot 객체도 "AI" 글도 없으면 그대로 위반.
+    assert "영어(한국어로 써야 함): AI" in verify_answer("강한 AI 는 모른다.", _ev(r19, ("find_turns", {})), "?")
+
+
+def test_a8_game_summary_no_score_note(r19, r19s):
+    for f in (r19, _v3(r19), _v1(r19)):
+        s = run_tool(f, "game_summary", {})
+        assert s["scores"] is None and "note" not in s
+        assert "점수 기록" not in json.dumps(s, ensure_ascii=False)
+    assert run_tool(r19s, "game_summary", {})["scores"]["basis"] == ra.SCORES_BASIS
+
+
+@pytest.mark.parametrize("name", GAMES)
+def test_a8_fallback_never_trips_new_checks(name):
+    # 대체 답(코드 글)은 검사 12 · 13 · 14 에 걸리는 말을 내지 않는다 — 판 2 견본과 판 3(점수 없음)으로.
+    for facts in (load(name), _v3(load(name))):
+        qs = [f"{t['turn']}순은 어땠어?" for t in facts["turns"]] + ["이 판 총평 해 줘"]
+        for q in qs:
+            text, ev = ra.fallback_answer(facts, q)
+            assert ra.check_unasked_disclaimers(text, q) == [], (name, q, text)
+            assert verify_answer(text, ev, q) == [], (name, q, text)
+
+
+def test_a8_prompt_rules():
+    p = ra.PROMPT_RULES
+    assert ra.PROMPT_VERSION == "a8"
+    assert ('접는 자리 · 밀기 · 접기를 물었을 때만 "이 차례에는 접는 자리 판정이 없다" 고 답한다. 묻지 않았으면 그 말을 붙이지 '
+            '않는다.') in p
+    assert '점수 · 순위를 물었을 때만 "이 판에는 점수 기록이 없다" 고 답한다. 묻지 않았으면 그 말을 붙이지 않는다.' in p
+    assert ('"안전한 순으로 손의 N종 중 R위" 처럼 그대로 쓴다. "위험 순위 R위 · R위의 위험도" 처럼\n  위험한 순으로 읽히게 쓰지 '
+            '않는다.') in p
+    assert "접는 자리였냐고 물으면" not in p and '"손의 N종 중 R위" 처럼 그대로 쓴다' not in p
+    # 지시문이 권하는 꼴("안전한 순으로 … R위")은 검사 14 에 안 걸린다.
+    assert ra.check_unasked_disclaimers("안전한 순으로 손의 9종 중 3위였다.", "?") == []

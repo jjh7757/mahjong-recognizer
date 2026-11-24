@@ -1,5 +1,7 @@
 """복기 질문 라우트(POST /v2/review/ask)를 노트북에서 띄우는 개발용 서버 — 운영에 쓰지 않는다.
 
+11-24: app/main.py 에서 /v2/review/ask 라우트를 뗐다(사용자 결정) — 지금 띄우면 그 경로는 404. 쓰려면 라우트부터 복구(커밋 9fe2d5e).
+
 python scripts/review_dev_server.py [--port 8321] [--host 127.0.0.1] [--api-key dev-key] [--fake] [--env-file PATH]
 
 진짜 `app.main:app` 을 그대로 띄운다 — 요청 검사 · 요청 제한 · 오류 코드가 운영과 같아서, 앱이 만든 요청이 서버 규격에

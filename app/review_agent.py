@@ -1,5 +1,7 @@
 """패보 복기 에이전트(POST /v2/review/ask) — 도구 · LangGraph 그래프 · 검증 · 대체 · 지시문.
 
+11-24 운영 라우트에서 뗌(사용자 결정 — 앱 질문 창도 접음). 다시 붙이려면 app/main.py 의 review_ask 라우트를 복구(커밋 9fe2d5e).
+
 설계: mahjong_calc/docs/paifu_review_agent_design_1121.md. 사용자가 패보 한 판을 보다가 질문하면 LLM 이 도구로 사실을 찾아
 한국어로 답한다. **도구는 계산하지 않고 찾기만 한다** — 숫자는 전부 앱(Dart 엔진)이 만든 "에이전트 사실표"에 있다.
 

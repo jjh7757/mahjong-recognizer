@@ -1,4 +1,4 @@
-"""패보 복기 에이전트(app/review_agent.py · /v2/review/ask). LLM 은 전부 대본대로 답하는 가짜(돈 · 네트워크 0).
+"""패보 복기 에이전트(app/review_agent.py — /v2/review/ask 라우트는 11-24 뗌). LLM 은 전부 대본대로 답하는 가짜(돈 · 네트워크 0).
 
 사실표 견본은 tests/fixtures/agent_facts/ — 앱의 `dart run tool/paifu_agent_facts.dart --compact` 로 예시 11판에서 만든 것.
 기대값은 설계서(mahjong_calc docs/paifu_review_agent_design_1121.md) · 사실표 파일 · 손으로 센 값에서 온다.
@@ -6,14 +6,12 @@
 
 import copy
 import json
-import logging
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from google.genai import errors
 
 from app import main as server
 from app import review_agent as ra
@@ -690,86 +688,21 @@ def test_validate_rejects(r19):
     validate_request({**ok, "history": None})
 
 
-# ---------------------------------------------------------------- 라우트
+# ---------------------------------------------------------------- 라우트(11-24 운영에서 뗌)
+#
+# POST /v2/review/ask 는 11-24 사용자 결정으로 app/main.py 에서 뗐다(앱 질문 창도 접음). 모듈 · 그래프 · 스크립트 시험은 그대로.
+# 다시 붙이면 이 시험을 커밋 9fe2d5e 의 라우트 시험(200 · 401 · 422 · 413 · 429 · 502/503)으로 되돌린다.
 
 
-@pytest.fixture
-def client(monkeypatch):
+def test_ask_route_removed_explain_kept(monkeypatch, r19):
     monkeypatch.setattr(server, "API_KEY", "")
-    monkeypatch.setattr(server, "review_generator", Script(*[tool("turn_info", turn=6), answer(GOOD_6)] * 5))
+    monkeypatch.setattr(server, "review_generator", Script(tool("turn_info", turn=6), answer(GOOD_6)))
     monkeypatch.setattr(server, "_review_limiter", server.RateLimiter(60, 10))
     with TestClient(server.app) as c:
-        yield c
-
-
-PATH = "/v2/review/ask"
-
-
-def test_route_200_and_shape(client, caplog, r19):
-    with caplog.at_level(logging.INFO, logger="recognizer"):
-        r = client.post(PATH, json=_req(r19, "6순에 왜 4만이 실수야?"))
-    assert r.status_code == 200
-    body = r.json()
-    assert set(body) == {"answer", "outcome", "tool_calls", "violations", "retries", "retry_violations",
-                         "prompt_version", "model", "elapsed_s", "usage"}
-    assert body["retry_violations"] == []
-    assert body["outcome"] == "verified" and body["answer"] == GOOD_6 and body["model"] == "fake-model"
-    assert body["tool_calls"] == [{"tool": "turn_info", "args": {"turn": 6}}]
-    logs = "\n".join(rec.getMessage() for rec in caplog.records)
-    assert "review/ask tools=1 outcome=verified retries=0 llm=2" in logs
-    assert "6순에 왜" not in logs and GOOD_6 not in logs and "남4국" not in logs   # 질문 · 답 · 사실표는 안 찍는다
-
-
-def test_route_is_listed_in_health(client):
-    eps = client.get("/").json()["endpoints"]
-    assert PATH in eps and "/v2/review/explain" in eps
-
-
-def test_route_401(client, monkeypatch, r19):
-    monkeypatch.setattr(server, "API_KEY", "secret")
-    assert client.post(PATH, json=_req(r19, "6순?")).status_code == 401
-    assert client.post(PATH, json=_req(r19, "6순?"), headers={"X-Api-Key": "secret"}).status_code == 200
-
-
-def test_route_422(client, r19):
-    r = client.post(PATH, json=_req(r19, ""))
-    assert r.status_code == 422 and "question" in r.json()["detail"]
-    assert client.post(PATH, content=b"{nope", headers={"Content-Type": "application/json"}).status_code == 422
-    assert client.post(PATH, json={"facts": {"version": 9}, "question": "a"}).status_code == 422
-
-
-def test_route_413_over_200kb(client):
-    big = b'{"question": "a", "pad": "' + b"x" * ra.MAX_REQUEST_BYTES + b'"}'
-    assert client.post(PATH, content=big, headers={"Content-Type": "application/json"}).status_code == 413
-
-
-def test_route_body_between_explain_and_ask_caps_is_read(client, r19):
-    # 해설 상한(128KiB)과 에이전트 상한(200KB) 사이 본문은 413 이 아니라 읽은 뒤 규격 검사(여기선 크기)로 간다.
-    req = copy.deepcopy(_req(r19, "6순?"))
-    req["history"] = [{"q": "a", "a": "b"}]
-    req["facts"]["pad"] = "x" * 150_000
-    r = client.post(PATH, json=req)
-    assert r.status_code == 200
-
-
-def test_route_429_shares_review_limiter(client, monkeypatch, r19):
-    monkeypatch.setattr(server, "_review_limiter", server.RateLimiter(per_min=1, burst=1))
-    assert client.post(PATH, json=_req(r19, "6순?")).status_code == 200
-    r = client.post(PATH, json=_req(r19, "6순?"))
-    assert r.status_code == 429 and int(r.headers["Retry-After"]) >= 1
-    assert client.post("/v2/review/explain", json={"version": 1}).status_code == 422  # 같은 제한기라도 422 가 먼저
-
-
-def test_route_502_429_503(client, monkeypatch, r19):
-    monkeypatch.setattr(server, "review_generator", Script(RuntimeError("empty response")))
-    r = client.post(PATH, json=_req(r19, "6순?"))
-    assert r.status_code == 502 and "RuntimeError" in r.json()["detail"]
-    monkeypatch.setattr(server, "review_generator", Script(tool("turn_info", turn=6),
-                                                           errors.ClientError(429, {"error": {"code": 429, "message": "x", "status": "X"}})))
-    r = client.post(PATH, json=_req(r19, "6순?"))
-    assert r.status_code == 429 and r.headers["Retry-After"] == str(server.UPSTREAM_429_RETRY_S)
-    monkeypatch.setattr(server, "review_generator", None)
-    assert client.post(PATH, json=_req(r19, "6순?")).status_code == 503
+        assert c.post("/v2/review/ask", json=_req(r19, "6순에 왜 4만이 실수야?")).status_code == 404
+        eps = c.get("/").json()["endpoints"]
+        assert "/v2/review/ask" not in eps and "/v2/review/explain" in eps
+        assert c.post("/v2/review/explain", json={"version": 1}).status_code == 422  # 해설 라우트는 그대로(규격 밖 → 422)
 
 
 # ---------------------------------------------------------------- 스크립트(--fake)

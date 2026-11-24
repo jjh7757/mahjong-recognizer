@@ -15,7 +15,6 @@ POST /v1/table      테이블 중앙 크롭(강 4개 + 왕패)
      "last_discards":{"bottom":"7s","top":null,...}, "last_discards_conf":{...}, ...}
 GET  /              헬스체크(+ 저장소 주소 `source`, AGPL §13).
 POST /v2/review/explain  패보 리뷰 사실표(JSON, 사진 아님) → 검증한 LLM 해설(app/review.py).
-POST /v2/review/ask      복기 에이전트 사실표 + 질문 → 도구로 찾아 검증한 답(app/review_agent.py, LangGraph).
 
 좌표는 0~1000 정규화, side 는 이미지 기준(bottom/right/top/left). 설계: mahjong_calc/docs/table_reading_design.md
 
@@ -41,7 +40,7 @@ from contextvars import ContextVar
 from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import review, review_agent
+from . import review
 from .observe import LAST_MULTI_MAX
 from .local_read import rss_mb
 from .recognizer import GeminiCall, GeminiRecognizer, prepare_image, rate_limited, retryable
@@ -704,7 +703,7 @@ async def observe_seat(image: UploadFile = File(...), x_api_key: str | None = He
 
 
 async def _read_review_body(request: Request, cap: int = review.MAX_REQUEST_BYTES) -> bytes:
-    """본문을 [cap](해설 review.MAX_REQUEST_BYTES · 에이전트 review_agent.MAX_REQUEST_BYTES)까지만 읽는다(넘으면 413).
+    """본문을 [cap](기본 해설 review.MAX_REQUEST_BYTES)까지만 읽는다(넘으면 413).
     전역 BodyLimit(사진 4MB 기준)보다 훨씬 작다."""
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > cap:
@@ -756,39 +755,5 @@ async def review_explain(request: Request, x_api_key: str | None = Header(defaul
     return out
 
 
-@app.post("/v2/review/ask")
-async def review_ask(request: Request, x_api_key: str | None = Header(default=None)) -> dict:
-    """패보 복기 에이전트: 앱이 만든 에이전트 사실표(JSON, 글뿐) + 질문 → LangGraph 그래프가 도구로 사실을 찾아 답하고,
-    답 속 패 · 숫자를 도구 결과와 대조해 검증한다(한 번 다시, 그래도 안 되면 코드가 만든 대체 답 — outcome "fallback").
-    인증 · 호출 제한 · LLM 은 해설 라우트와 같은 것(_review_limiter · review_generator)을 쓴다.
-    오류: 401 키 · 503 Gemini 키 없음 · 413 본문 과다(200KB) · 422 규격 밖 · 429 요청 제한 또는 Gemini 429 · 502 그 밖의 LLM 실패."""
-    _check_key(x_api_key)
-    if review_generator is None:
-        raise HTTPException(status_code=503, detail="review generator not configured")
-    body = await _read_review_body(request, review_agent.MAX_REQUEST_BYTES)
-    try:
-        req = json.loads(body)
-        review_agent.validate_request(req)
-    except ValueError as e:  # JSON 깨짐 · UTF-8 아님 · 규격 밖
-        raise HTTPException(status_code=422, detail=f"bad ask request: {e}") from None
-    wait_s = _review_limiter.take()
-    if wait_s:
-        retry = max(1, math.ceil(wait_s))
-        raise HTTPException(status_code=429, detail=f"too many review requests (retry after {retry}s)",
-                            headers={"Retry-After": str(retry)})
-    model = getattr(review_generator, "model", REVIEW_MODEL)
-    async with _sem:
-        try:
-            out = await _run(review_agent.ask, req, review_generator, model)
-        except Exception as e:  # noqa: BLE001
-            if rate_limited(e):
-                log.warning("review/ask: gemini 429 after retry -> 429 to client")
-                raise HTTPException(status_code=429, detail="upstream rate limited (gemini 429)",
-                                    headers={"Retry-After": str(UPSTREAM_429_RETRY_S)}) from e
-            log.warning("review/ask: llm call failed: %s", type(e).__name__)
-            raise HTTPException(status_code=502, detail=f"review ask failed: {type(e).__name__}") from e
-    # 질문 · 사실표 · 답 본문은 찍지 않는다(도구 수 · 결과 · 시간 · 토큰만).
-    log.info("review/ask tools=%d outcome=%s retries=%d llm=%d in %.1f s (tokens %d+%d) model=%s prompt=%s",
-             len(out["tool_calls"]), out["outcome"], out["retries"], out["usage"]["llm_calls"], out["elapsed_s"],
-             out["usage"]["input_tokens"], out["usage"]["output_tokens"], model, out["prompt_version"])
-    return out
+# POST /v2/review/ask(복기 에이전트 질문)는 11-24 사용자 결정으로 운영에서 뗐다(앱 질문 창도 접음).
+# app/review_agent.py · tests/test_review_agent.py 는 남겨 둔다 — 다시 붙이려면 커밋 9fe2d5e 의 review_ask 라우트를 되살린다.
